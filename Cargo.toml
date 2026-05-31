@@ -1,0 +1,3 @@
+[workspace]
+members = ["pdf_extractor"]
+resolver = "2"
