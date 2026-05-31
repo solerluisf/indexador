@@ -240,6 +240,47 @@ mod tests {
         assert!(result.text.contains("x=1+2*3"));
     }
 
+    fn make_empty_multipage_pdf(num_pages: usize) -> PathBuf {
+        let dir = unique_dir();
+        let path = dir.join("empty_multi.pdf");
+
+        let mut doc = Document::new();
+        doc.version = "1.4".to_string();
+
+        let catalog_id = doc.new_object_id();
+        let pages_id = doc.new_object_id();
+        let mut page_ids = Vec::new();
+
+        for _ in 0..num_pages {
+            let pid = doc.new_object_id();
+            doc.objects.insert(pid, Object::Dictionary(Dictionary::from_iter([
+                ("Type", Object::Name("Page".as_bytes().to_vec())),
+                ("Parent", Object::Reference(pages_id)),
+                ("MediaBox", Object::Array(vec![
+                    Object::Integer(0), Object::Integer(0),
+                    Object::Integer(612), Object::Integer(792),
+                ])),
+            ])));
+            page_ids.push(pid);
+        }
+
+        let kids: Vec<Object> = page_ids.iter().map(|&id| Object::Reference(id)).collect();
+        doc.objects.insert(pages_id, Object::Dictionary(Dictionary::from_iter([
+            ("Type", Object::Name("Pages".as_bytes().to_vec())),
+            ("Kids", Object::Array(kids)),
+            ("Count", Object::Integer(num_pages as i64)),
+        ])));
+
+        doc.objects.insert(catalog_id, Object::Dictionary(Dictionary::from_iter([
+            ("Type", Object::Name("Catalog".as_bytes().to_vec())),
+            ("Pages", Object::Reference(pages_id)),
+        ])));
+
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc.save(&path).unwrap();
+        path
+    }
+
     // --- extract_pdf: empty / OCR flow ---
 
     #[test]
@@ -256,6 +297,14 @@ mod tests {
         let result = extract_pdf(&path).unwrap();
         assert!(result.ocr_flag);
         assert_eq!(result.text, "");
+    }
+
+    #[test]
+    fn test_extract_pdf_multi_page_all_empty() {
+        let path = make_empty_multipage_pdf(3);
+        let result = extract_pdf(&path).unwrap();
+        assert!(result.ocr_flag, "Image-only multi-page PDF should set ocr_flag");
+        assert_eq!(result.text, "", "Text should be empty when all pages have no content");
     }
 
     // --- extract_pdf: error flows ---
