@@ -99,6 +99,7 @@ impl JobStore {
         Ok(count)
     }
 
+    #[allow(dead_code)]
     pub fn fetch_pending(&self, limit: i64) -> Result<Vec<(i64, String, String)>> {
         let conn = self.conn.lock().unwrap();
         let clamped = if limit < 0 { 0 } else { limit };
@@ -123,6 +124,94 @@ impl JobStore {
             result.push(row.context("Failed to read row")?);
         }
         Ok(result)
+    }
+
+    pub fn claim_pending(&self, limit: i64) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let clamped = if limit < 0 { 0 } else { limit };
+
+        let mut select = conn
+            .prepare("SELECT id, path, checksum FROM jobs WHERE status = 'pending' LIMIT ?1")
+            .context("Failed to prepare claim select")?;
+
+        let rows: Vec<(i64, String, String)> = select
+            .query_map(rusqlite::params![clamped], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .context("Failed to query pending jobs for claim")?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let id_list: Vec<String> = rows.iter().map(|(id, _, _)| id.to_string()).collect();
+        let placeholders = id_list.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "UPDATE jobs SET status = 'extracting' WHERE id IN ({})",
+            placeholders
+        );
+        conn.execute(&sql, rusqlite::params_from_iter(&id_list))
+            .context("Failed to mark jobs as extracting")?;
+
+        Ok(rows)
+    }
+
+    #[allow(dead_code)]
+    pub fn mark_extracted(&self, id: i64, ocr_flag: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET status = 'extracted', ocr_flag = ?1 WHERE id = ?2",
+            rusqlite::params![ocr_flag as i32, id],
+        )
+        .context("Failed to mark job extracted")?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn fetch_extracted(&self, limit: i64) -> Result<Vec<(i64, String, String, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let clamped = if limit < 0 { 0 } else { limit };
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, checksum, ocr_flag FROM jobs WHERE status = 'extracted' LIMIT ?1",
+            )
+            .context("Failed to prepare fetch extracted query")?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![clamped], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })
+            .context("Failed to query extracted jobs")?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.context("Failed to read row")?);
+        }
+        Ok(result)
+    }
+
+    #[allow(dead_code)]
+    pub fn count_by_status(&self, status: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = ?1",
+                rusqlite::params![status],
+                |row| row.get(0),
+            )
+            .context("Failed to count jobs by status")?;
+        Ok(count)
     }
 }
 
@@ -334,6 +423,182 @@ mod tests {
 
         let count = store.count_pending().unwrap();
         assert_eq!(count, 1);
+    }
+
+    // --- JobStore: claim_pending ---
+
+    #[test]
+    fn test_claim_pending_claims_and_changes_status() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        store.upsert_file("/b.pdf", "def").unwrap();
+
+        let claimed = store.claim_pending(10).unwrap();
+        assert_eq!(claimed.len(), 2);
+
+        let pending = store.count_pending().unwrap();
+        assert_eq!(pending, 0, "Claimed jobs should no longer be pending");
+
+        let extracting = store.count_by_status("extracting").unwrap();
+        assert_eq!(extracting, 2, "Claimed jobs should be 'extracting'");
+    }
+
+    #[test]
+    fn test_claim_pending_respects_limit() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        store.upsert_file("/b.pdf", "def").unwrap();
+        store.upsert_file("/c.pdf", "ghi").unwrap();
+
+        let claimed = store.claim_pending(2).unwrap();
+        assert_eq!(claimed.len(), 2);
+
+        let pending = store.count_pending().unwrap();
+        assert_eq!(pending, 1, "One should remain pending");
+    }
+
+    #[test]
+    fn test_claim_pending_empty_when_none_pending() {
+        let store = JobStore::open_in_memory().unwrap();
+        let claimed = store.claim_pending(10).unwrap();
+        assert!(claimed.is_empty());
+    }
+
+    #[test]
+    fn test_claim_pending_negative_limit() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let claimed = store.claim_pending(-1).unwrap();
+        assert!(claimed.is_empty(), "Negative limit should return empty");
+    }
+
+    #[test]
+    fn test_claim_pending_does_not_claim_done_or_error() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let batch = store.fetch_pending(10).unwrap();
+        store.mark_done(batch[0].0, false).unwrap();
+
+        store.upsert_file("/b.pdf", "def").unwrap();
+        let batch2 = store.fetch_pending(10).unwrap();
+        store.mark_error(batch2[0].0, "err").unwrap();
+
+        // Should not claim done or error jobs
+        let claimed = store.claim_pending(10).unwrap();
+        assert!(claimed.is_empty());
+    }
+
+    #[test]
+    fn test_claim_pending_only_once() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+
+        let first = store.claim_pending(10).unwrap();
+        assert_eq!(first.len(), 1);
+
+        let second = store.claim_pending(10).unwrap();
+        assert!(second.is_empty(), "Same job should not be claimable twice");
+    }
+
+    // --- JobStore: extracted status ---
+
+    #[test]
+    fn test_mark_extracted_sets_status() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+
+        let batch = store.claim_pending(10).unwrap();
+        assert_eq!(batch.len(), 1);
+        let id = batch[0].0;
+
+        store.mark_extracted(id, true).unwrap();
+
+        assert_eq!(store.count_by_status("extracting").unwrap(), 0);
+        assert_eq!(store.count_by_status("extracted").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_mark_extracted_nonexistent_id() {
+        let store = JobStore::open_in_memory().unwrap();
+        let result = store.mark_extracted(999, false);
+        assert!(result.is_ok(), "mark_extracted on nonexistent id should not error");
+    }
+
+    #[test]
+    fn test_fetch_extracted_returns_marked_jobs() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        store.upsert_file("/b.pdf", "def").unwrap();
+
+        let batch = store.claim_pending(10).unwrap();
+        assert_eq!(batch.len(), 2);
+
+        store.mark_extracted(batch[0].0, true).unwrap();
+        store.mark_extracted(batch[1].0, false).unwrap();
+
+        let extracted = store.fetch_extracted(10).unwrap();
+        assert_eq!(extracted.len(), 2);
+
+        let doc1 = extracted.iter().find(|(_, p, _, _)| p.contains("a.pdf")).unwrap();
+        assert!(doc1.3, "a.pdf should have ocr_flag=true");
+
+        let doc2 = extracted.iter().find(|(_, p, _, _)| p.contains("b.pdf")).unwrap();
+        assert!(!doc2.3, "b.pdf should have ocr_flag=false");
+    }
+
+    #[test]
+    fn test_fetch_extracted_empty_when_none() {
+        let store = JobStore::open_in_memory().unwrap();
+        let extracted = store.fetch_extracted(10).unwrap();
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_extracted_respects_limit() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "a").unwrap();
+        store.upsert_file("/b.pdf", "b").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_extracted(batch[0].0, false).unwrap();
+        store.mark_extracted(batch[1].0, false).unwrap();
+
+        let limited = store.fetch_extracted(1).unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn test_fetch_extracted_negative_limit() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "a").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_extracted(batch[0].0, false).unwrap();
+
+        let extracted = store.fetch_extracted(-1).unwrap();
+        assert!(extracted.is_empty(), "Negative limit should return empty");
+    }
+
+    // --- JobStore: count_by_status ---
+
+    #[test]
+    fn test_count_by_status_counts_only_matching() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "a").unwrap();  // status = pending
+        store.upsert_file("/b.pdf", "b").unwrap();
+        let batch = store.claim_pending(10).unwrap();  // status = extracting
+        store.mark_extracted(batch[0].0, false).unwrap();  // status = extracted
+        store.mark_done(batch[1].0, false).unwrap();  // status = done
+
+        assert_eq!(store.count_by_status("pending").unwrap(), 0);
+        assert_eq!(store.count_by_status("extracting").unwrap(), 0);
+        assert_eq!(store.count_by_status("extracted").unwrap(), 1);
+        assert_eq!(store.count_by_status("done").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_count_by_status_unknown_status_returns_zero() {
+        let store = JobStore::open_in_memory().unwrap();
+        let count = store.count_by_status("nonexistent").unwrap();
+        assert_eq!(count, 0);
     }
 
     // --- JobStore: error flows ---

@@ -151,16 +151,21 @@ fn test_full_pipeline_with_real_pdfs() {
     let lines: Vec<&str> = content.lines().collect();
     assert_eq!(lines.len(), 2);
 
-    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(first["ocr_flag"], false);
-    assert_eq!(first["language"], serde_json::Value::Null);
-    assert!(first["checksum"].as_str().unwrap().len() == 16);
-    assert!(first["path"].as_str().unwrap().contains("doc1.pdf"));
-    assert!(first["text"].as_str().unwrap().contains("Hello World"));
-
-    let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-    assert!(second["path"].as_str().unwrap().contains("doc2.pdf"));
-    assert!(second["text"].as_str().unwrap().contains("Second document"));
+    for line in &lines {
+        let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(rec["ocr_flag"], false);
+        assert_eq!(rec["language"], serde_json::Value::Null);
+        assert!(rec["checksum"].as_str().unwrap().len() == 16);
+        let path = rec["path"].as_str().unwrap();
+        let text = rec["text"].as_str().unwrap();
+        if path.contains("doc1.pdf") {
+            assert!(text.contains("Hello World"));
+        } else if path.contains("doc2.pdf") {
+            assert!(text.contains("Second document"));
+        } else {
+            panic!("Unexpected path: {}", path);
+        }
+    }
 
     let log_content = std::fs::read_to_string(&log_path).unwrap();
     assert!(log_content.contains("Extraction complete"));

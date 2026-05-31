@@ -3,11 +3,13 @@ mod extractor;
 mod normalizer;
 mod output;
 mod metrics;
+mod pipeline;
 
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
-use tracing::{info, error};
+use std::sync::Arc;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -46,22 +48,11 @@ fn main() -> Result<()> {
         "Starting pdf_extractor"
     );
 
-    let jobs = scanner::JobStore::open(&cli.db)?;
+    let jobs = Arc::new(scanner::JobStore::open(&cli.db)?);
     let writer = output::JsonlWriter::new(&cli.output)?;
-    let metrics = metrics::Metrics::new();
+    let metrics = Arc::new(metrics::Metrics::new());
 
-    let scanned = scanner::scan_directory(&jobs, &cli.input)?;
-    info!(scanned = scanned, "Directory scan complete");
-
-    let pending = jobs.count_pending()?;
-    info!(pending = pending, "Jobs pending extraction");
-
-    if pending == 0 {
-        info!("No pending jobs to process");
-        return Ok(());
-    }
-
-    process_pending(&jobs, &writer, &metrics)?;
+    pipeline::run_pipeline(Arc::clone(&jobs), &writer, Arc::clone(&metrics), &cli.input)?;
 
     metrics.log_summary();
     info!(
@@ -71,70 +62,6 @@ fn main() -> Result<()> {
         avg_throughput = format!("{:.2}", metrics.throughput()),
         "Extraction complete"
     );
-
-    Ok(())
-}
-
-fn process_pending(
-    jobs: &scanner::JobStore,
-    writer: &output::JsonlWriter,
-    metrics: &metrics::Metrics,
-) -> Result<()> {
-    loop {
-        let batch = jobs.fetch_pending(100)?;
-        if batch.is_empty() {
-            break;
-        }
-
-        for (id, path, checksum) in &batch {
-            let path_obj = PathBuf::from(path);
-            match extractor::extract_pdf(&path_obj) {
-                Ok(result) => {
-                    let normalized = if !result.ocr_flag {
-                        normalizer::normalize_text(&result.text)
-                    } else {
-                        String::new()
-                    };
-
-                    let record = output::DocumentRecord {
-                        id: *id,
-                        path: path.clone(),
-                        checksum: checksum.clone(),
-                        ocr_flag: result.ocr_flag,
-                        language: None,
-                        text: normalized,
-                    };
-
-                    if let Err(e) = writer.write_record(&record) {
-                        error!(id = id, path = %path, error = %e, "Failed to write record");
-                        metrics.increment_errored();
-                        continue;
-                    }
-
-                    if let Err(e) = jobs.mark_done(*id, result.ocr_flag) {
-                        error!(id = id, error = %e, "Failed to mark job done");
-                    }
-
-                    metrics.increment_processed();
-                    info!(
-                        id = id,
-                        path = %path,
-                        ocr = result.ocr_flag,
-                        "Document extracted"
-                    );
-                }
-                Err(e) => {
-                    error!(id = id, path = %path, error = %e, "Extraction failed");
-                    if let Err(me) = jobs.mark_error(*id, &format!("{}", e)) {
-                        error!(id = id, error = %me, "Failed to record job error");
-                    }
-                    metrics.increment_errored();
-                }
-            }
-
-            metrics.log_summary();
-        }
-    }
 
     Ok(())
 }

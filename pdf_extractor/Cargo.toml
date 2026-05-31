@@ -16,3 +16,6 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 unicode-normalization = "0.1"
 chrono = "0.4"
+crossbeam-channel = "0.5"
+rayon = "1"
+num_cpus = "1"

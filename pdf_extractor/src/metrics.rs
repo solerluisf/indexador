@@ -6,6 +6,8 @@ use std::time::Instant;
 pub struct Metrics {
     docs_processed: AtomicU64,
     docs_errored: AtomicU64,
+    task_queue_depth: AtomicU64,
+    result_queue_depth: AtomicU64,
     start: Instant,
     last_log: Mutex<Instant>,
 }
@@ -15,6 +17,8 @@ impl Metrics {
         Self {
             docs_processed: AtomicU64::new(0),
             docs_errored: AtomicU64::new(0),
+            task_queue_depth: AtomicU64::new(0),
+            result_queue_depth: AtomicU64::new(0),
             start: Instant::now(),
             last_log: Mutex::new(Instant::now()),
         }
@@ -34,6 +38,14 @@ impl Metrics {
 
     pub fn errored(&self) -> u64 {
         self.docs_errored.load(Ordering::Relaxed)
+    }
+
+    pub fn set_task_queue_depth(&self, depth: u64) {
+        self.task_queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    pub fn set_result_queue_depth(&self, depth: u64) {
+        self.result_queue_depth.store(depth, Ordering::Relaxed);
     }
 
     pub fn elapsed_secs(&self) -> f64 {
@@ -58,6 +70,8 @@ impl Metrics {
                 timestamp = %Local::now().format("%Y-%m-%dT%H:%M:%S"),
                 docs_processed = self.processed(),
                 docs_errored = self.errored(),
+                task_queue_depth = self.task_queue_depth.load(Ordering::Relaxed),
+                result_queue_depth = self.result_queue_depth.load(Ordering::Relaxed),
                 throughput_docs_per_sec = format!("{:.2}", self.throughput()),
                 elapsed_secs = format!("{:.1}", self.elapsed_secs()),
                 "Metrics snapshot"
@@ -107,6 +121,31 @@ mod tests {
         m.increment_processed();
         assert_eq!(m.processed(), 2);
         assert_eq!(m.errored(), 1);
+    }
+
+    // --- queue depth ---
+
+    #[test]
+    fn test_metrics_queue_depth_default_zero() {
+        let m = Metrics::new();
+        assert_eq!(m.task_queue_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(m.result_queue_depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_metrics_set_task_queue_depth() {
+        let m = Metrics::new();
+        m.set_task_queue_depth(42);
+        assert_eq!(m.task_queue_depth.load(Ordering::Relaxed), 42);
+        m.set_task_queue_depth(0);
+        assert_eq!(m.task_queue_depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_metrics_set_result_queue_depth() {
+        let m = Metrics::new();
+        m.set_result_queue_depth(7);
+        assert_eq!(m.result_queue_depth.load(Ordering::Relaxed), 7);
     }
 
     // --- throughput ---
