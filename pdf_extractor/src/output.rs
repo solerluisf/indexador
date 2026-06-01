@@ -12,6 +12,7 @@ pub struct DocumentRecord {
     pub checksum: String,
     pub ocr_flag: bool,
     pub language: Option<String>,
+    pub math_source: Option<String>,
     pub text: String,
 }
 
@@ -67,6 +68,7 @@ mod tests {
             checksum: "abcd1234".into(),
             ocr_flag: false,
             language: None,
+            math_source: None,
             text: "hello world".into(),
         };
         let json = serde_json::to_string(&record).unwrap();
@@ -85,6 +87,7 @@ mod tests {
             checksum: "x".into(),
             ocr_flag: true,
             language: Some("en".into()),
+            math_source: None,
             text: "".into(),
         };
         let json = serde_json::to_string(&record).unwrap();
@@ -100,6 +103,7 @@ mod tests {
             checksum: "c".into(),
             ocr_flag: false,
             language: None,
+            math_source: None,
             text: "line1\nline2\ttabbed \"quoted\" \\backslash".into(),
         };
         let json = serde_json::to_string(&record).unwrap();
@@ -115,6 +119,7 @@ mod tests {
             checksum: "d".into(),
             ocr_flag: false,
             language: Some("ja".into()),
+            math_source: None,
             text: "こんにちは世界 ∑∫".into(),
         };
         let json = serde_json::to_string(&record).unwrap();
@@ -126,7 +131,7 @@ mod tests {
     fn test_document_record_language_none_omitted() {
         let record = DocumentRecord {
             id: 5, path: "/n.pdf".into(), checksum: "e".into(),
-            ocr_flag: false, language: None, text: "x".into(),
+            ocr_flag: false, language: None, math_source: None, text: "x".into(),
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"language\":null"));
@@ -147,6 +152,7 @@ mod tests {
             checksum: "aaa".into(),
             ocr_flag: false,
             language: None,
+            math_source: None,
             text: "hello".into(),
         };
         writer.write_record(&record).unwrap();
@@ -168,11 +174,11 @@ mod tests {
         let writer = JsonlWriter::new(&path).unwrap();
         writer.write_record(&DocumentRecord {
             id: 1, path: "/a.pdf".into(), checksum: "a".into(),
-            ocr_flag: false, language: None, text: "one".into(),
+            ocr_flag: false,             language: None, math_source: None, text: "one".into(),
         }).unwrap();
         writer.write_record(&DocumentRecord {
             id: 2, path: "/b.pdf".into(), checksum: "b".into(),
-            ocr_flag: true, language: None, text: "two".into(),
+            ocr_flag: true, language: None, math_source: None, text: "two".into(),
         }).unwrap();
 
         let mut content = String::new();
@@ -193,7 +199,7 @@ mod tests {
 
         let rec = || DocumentRecord {
             id: 1, path: "/a.pdf".into(), checksum: "x".into(),
-            ocr_flag: false, language: None, text: "t".into(),
+            ocr_flag: false, language: None, math_source: None, text: "t".into(),
         };
         writer.write_record(&rec()).unwrap();
         assert_eq!(writer.count(), 1);
@@ -225,6 +231,7 @@ mod tests {
             checksum: "big".into(),
             ocr_flag: false,
             language: None,
+            math_source: None,
             text: "x".repeat(100_000),
         };
         writer.write_record(&record).unwrap();
@@ -246,14 +253,14 @@ mod tests {
         let w1 = JsonlWriter::new(&path).unwrap();
         w1.write_record(&DocumentRecord {
             id: 1, path: "/a.pdf".into(), checksum: "x".into(),
-            ocr_flag: false, language: None, text: "first".into(),
+            ocr_flag: false, language: None, math_source: None, text: "first".into(),
         }).unwrap();
         drop(w1);
 
         let w2 = JsonlWriter::new(&path).unwrap();
         w2.write_record(&DocumentRecord {
             id: 2, path: "/b.pdf".into(), checksum: "y".into(),
-            ocr_flag: true, language: None, text: "second".into(),
+            ocr_flag: true, language: None, math_source: None, text: "second".into(),
         }).unwrap();
         drop(w2);
 

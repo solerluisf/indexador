@@ -19,3 +19,26 @@ chrono = "0.4"
 crossbeam-channel = "0.5"
 rayon = "1"
 num_cpus = "1"
+tantivy = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tempfile = "3"
+regex = "1.12.3"
+imageproc = "0.25"
+whatlang = "0.18.0"
+lindera = { version = "3", default-features = false, features = ["embed-ipadic"] }
+
+[[bin]]
+name = "mock_mutool"
+path = "src/bin/mock_mutool.rs"
+
+[[bin]]
+name = "mock_tesseract"
+path = "src/bin/mock_tesseract.rs"
+
+[[bin]]
+name = "tesseract_worker"
+path = "src/bin/tesseract_worker.rs"
+
+[[bin]]
+name = "bench_pdfs"
+path = "src/bin/bench_pdfs.rs"

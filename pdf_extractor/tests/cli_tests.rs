@@ -124,6 +124,7 @@ fn test_full_pipeline_with_real_pdfs() {
 
     let status = Command::new(binary_path())
         .args([
+            "extract",
             "-i",
             pdf_dir.to_str().unwrap(),
             "-o",
@@ -154,7 +155,12 @@ fn test_full_pipeline_with_real_pdfs() {
     for line in &lines {
         let rec: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(rec["ocr_flag"], false);
-        assert_eq!(rec["language"], serde_json::Value::Null);
+        // Language detection: "Hello World from PDF one" (25 chars) may or may not
+        // meet whatlang's reliability threshold. Accept either "eng" or null.
+        let lang = rec["language"].as_str().map(|s| s.to_string());
+        if let Some(l) = &lang {
+            assert_eq!(l, "eng", "If language is detected, it should be 'eng', got: {}", l);
+        }
         assert!(rec["checksum"].as_str().unwrap().len() == 16);
         let path = rec["path"].as_str().unwrap();
         let text = rec["text"].as_str().unwrap();
@@ -194,6 +200,7 @@ fn test_resumable_skip_unchanged_files() {
     };
 
     let args: &[&str] = &[
+        "extract",
         "-i",
         pdf_dir.to_str().unwrap(),
         "-o",
@@ -235,6 +242,7 @@ fn test_empty_pdf_marked_ocr() {
 
     let status = Command::new(binary_path())
         .args([
+            "extract",
             "-i",
             pdf_dir.to_str().unwrap(),
             "-o",
@@ -276,6 +284,7 @@ fn test_mixed_valid_and_invalid_pdfs() {
 
     let out = Command::new(binary_path())
         .args([
+            "extract",
             "-i", pdf_dir.to_str().unwrap(),
             "-o", output_path.to_str().unwrap(),
             "-d", db_path.to_str().unwrap(),
@@ -310,6 +319,7 @@ fn test_all_pdfs_fail_extraction() {
 
     let out = Command::new(binary_path())
         .args([
+            "extract",
             "-i", pdf_dir.to_str().unwrap(),
             "-o", output_path.to_str().unwrap(),
             "-d", db_path.to_str().unwrap(),
@@ -343,6 +353,7 @@ fn test_no_pdf_files_in_directory() {
 
     let out = Command::new(binary_path())
         .args([
+            "extract",
             "-i", pdf_dir.to_str().unwrap(),
             "-o", output_path.to_str().unwrap(),
             "-d", db_path.to_str().unwrap(),
@@ -374,6 +385,7 @@ fn test_pdfs_in_subdirectories() {
 
     let out = Command::new(binary_path())
         .args([
+            "extract",
             "-i", pdf_dir.to_str().unwrap(),
             "-o", output_path.to_str().unwrap(),
             "-d", db_path.to_str().unwrap(),
@@ -405,6 +417,7 @@ fn test_unicode_content_preserved() {
 
     let out = Command::new(binary_path())
         .args([
+            "extract",
             "-i", pdf_dir.to_str().unwrap(),
             "-o", output_path.to_str().unwrap(),
             "-d", db_path.to_str().unwrap(),
@@ -435,6 +448,7 @@ fn test_resume_after_partial_failure() {
 
     let args = || -> Vec<String> {
         vec![
+            "extract".into(),
             "-i".into(), pdf_dir.to_str().unwrap().into(),
             "-o".into(), output_path.to_str().unwrap().into(),
             "-d".into(), db_path.to_str().unwrap().into(),
@@ -483,6 +497,7 @@ fn test_invalid_input_directory() {
 
     let out = Command::new(binary_path())
         .args([
+            "extract",
             "-i", r"C:\NONEXISTENT_DIR_FOR_TEST_99999",
             "-o", output_path.to_str().unwrap(),
             "-d", db_path.to_str().unwrap(),
@@ -513,6 +528,7 @@ fn test_input_is_file_not_directory() {
 
     let out = Command::new(binary_path())
         .args([
+            "extract",
             "-i", pdf_path.to_str().unwrap(),
             "-o", output_path.to_str().unwrap(),
             "-d", db_path.to_str().unwrap(),
@@ -522,6 +538,1994 @@ fn test_input_is_file_not_directory() {
         .unwrap();
 
     assert!(!out.status.success(), "Binary should fail when input is a file");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Search integration tests ---
+
+fn run_extract(pdf_dir: &PathBuf, output_path: &PathBuf, db_path: &PathBuf, log_path: &PathBuf, index_path: &PathBuf) {
+    let status = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i",
+            pdf_dir.to_str().unwrap(),
+            "-o",
+            output_path.to_str().unwrap(),
+            "-d",
+            db_path.to_str().unwrap(),
+            "-l",
+            log_path.to_str().unwrap(),
+            "--index-path",
+            index_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("Failed to run pdf_extractor extract");
+    assert!(status.success(), "Extract should succeed");
+    assert!(index_path.join("meta.json").exists(), "Index should be created");
+}
+
+fn run_search(index_path: &PathBuf, query: &str) -> std::process::Output {
+    Command::new(binary_path())
+        .args([
+            "search",
+            "-d",
+            "nonexistent.db",
+            "--index-path",
+            index_path.to_str().unwrap(),
+            query,
+        ])
+        .output()
+        .expect("Failed to run search")
+}
+
+fn run_search_with_filter(index_path: &PathBuf, query: &str, filter: &str) -> std::process::Output {
+    Command::new(binary_path())
+        .args([
+            "search",
+            "-d",
+            "nonexistent.db",
+            "--index-path",
+            index_path.to_str().unwrap(),
+            "--path-filter",
+            filter,
+            query,
+        ])
+        .output()
+        .expect("Failed to run search with path filter")
+}
+
+fn run_search_with_offset(index_path: &PathBuf, query: &str, limit: &str, offset: &str) -> std::process::Output {
+    Command::new(binary_path())
+        .args([
+            "search",
+            "-d",
+            "nonexistent.db",
+            "--index-path",
+            index_path.to_str().unwrap(),
+            "--limit",
+            limit,
+            "--offset",
+            offset,
+            query,
+        ])
+        .output()
+        .expect("Failed to run search with offset")
+}
+
+fn run_search_field(index_path: &PathBuf, query: &str, field: &str) -> std::process::Output {
+    Command::new(binary_path())
+        .args([
+            "search",
+            "-d",
+            "nonexistent.db",
+            "--index-path",
+            index_path.to_str().unwrap(),
+            "--field",
+            field,
+            query,
+        ])
+        .output()
+        .expect("Failed to run search with --field")
+}
+
+#[test]
+fn test_search_after_extract() {
+    let dir = test_dir("search_after_extract");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "Hello World from PDF one");
+    create_test_pdf(
+        &pdf_dir.join("doc2.pdf"),
+        "Second document with unique content",
+    );
+
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = run_search(&index_path, "Hello");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Expected 1 result for 'Hello'");
+
+    let out2 = run_search(&index_path, "Second");
+    assert!(out2.status.success());
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(stdout2.contains("Found 1 result(s)"), "Expected 1 result for 'Second'");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_no_results() {
+    let dir = test_dir("search_no_results");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "Rust programming language");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = run_search(&index_path, "nonexistentterm");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No results found"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_invalid_index_path() {
+    let dir = test_dir("search_invalid_index");
+    let index_path = dir.join("nonexistent_index_dir");
+
+    // Search auto-creates the index, so it should succeed with no results
+    let out = run_search(&index_path, "test");
+    assert!(out.status.success(), "Search should auto-create index and succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No results found"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Search with path filter integration tests ---
+
+#[test]
+fn test_search_with_path_filter() {
+    let dir = test_dir("search_path_filter");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    std::fs::create_dir_all(pdf_dir.join("reports")).unwrap();
+    std::fs::create_dir_all(pdf_dir.join("invoices")).unwrap();
+    create_test_pdf(&pdf_dir.join("reports").join("q1.pdf"), "quarterly report earnings");
+    create_test_pdf(&pdf_dir.join("invoices").join("inv1.pdf"), "invoice total earnings");
+
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Basic: path filter narrows results
+    let out_all = run_search(&index_path, "earnings");
+    assert!(out_all.status.success());
+    let stdout_all = String::from_utf8_lossy(&out_all.stdout);
+    assert!(stdout_all.contains("Found 2 result(s)"), "Unfiltered search should find both earnings docs");
+
+    let out = run_search_with_filter(&index_path, "earnings", ".*reports.*");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Path filter should narrow to 1 result");
+    assert!(stdout.contains("reports"), "Result path should contain 'reports'");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_path_filter_no_match() {
+    let dir = test_dir("search_path_filter_none");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "some content");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Alternative: filter matching nothing
+    let out = run_search_with_filter(&index_path, "content", "ZZZZNONEXISTENTZZZZ");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No results found"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_path_filter_invalid_regex() {
+    let dir = test_dir("search_path_filter_bad_regex");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "content");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Error flow: invalid regex pattern
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--path-filter", "[invalid",
+            "content",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Invalid path filter regex") || stderr.contains("error"),
+        "Invalid path-filter regex should return an error");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Pagination (offset) integration tests ---
+
+fn run_extract_multi(pdf_dir: &PathBuf, output_path: &PathBuf, db_path: &PathBuf, log_path: &PathBuf, index_path: &PathBuf, count: usize) {
+    for i in 0..count {
+        create_test_pdf(&pdf_dir.join(&format!("doc{}.pdf", i)), &format!("document number {}", i));
+    }
+    run_extract(pdf_dir, output_path, db_path, log_path, index_path);
+}
+
+#[test]
+fn test_search_with_offset() {
+    let dir = test_dir("search_offset");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    run_extract_multi(&pdf_dir, &output_path, &db_path, &log_path, &index_path, 10);
+
+    // Basic: offset 5 returns page 2
+    let out = run_search_with_offset(&index_path, "document", "5", "0");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 5 result(s)"), "Limit 5 should show 5 results");
+
+    // Pagination: offset 5 skips first 5 (equal scores = undefined ordering, just check count)
+    let out2 = run_search_with_offset(&index_path, "document", "5", "5");
+    assert!(out2.status.success());
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(stdout2.contains("Found 5 result(s)"), "Offset 5 should show 5 results");
+    // Total unique results across both pages should be 10
+    // (We can't assert exact paths due to equal-score ordering)
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_offset_beyond_total() {
+    let dir = test_dir("search_offset_beyond");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    run_extract_multi(&pdf_dir, &output_path, &db_path, &log_path, &index_path, 3);
+
+    // Offset past all results
+    let out = run_search_with_offset(&index_path, "document", "10", "10");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No results found"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_offset_with_path_filter() {
+    let dir = test_dir("search_offset_filter");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    std::fs::create_dir_all(pdf_dir.join("reports")).unwrap();
+    std::fs::create_dir_all(pdf_dir.join("invoices")).unwrap();
+    for i in 0..3 {
+        create_test_pdf(&pdf_dir.join("reports").join(&format!("r{}.pdf", i)), &format!("report {}", i));
+        create_test_pdf(&pdf_dir.join("invoices").join(&format!("i{}.pdf", i)), &format!("invoice {}", i));
+    }
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Combined: path filter + offset (3 reports, skip 1, limit 2 → 2 results)
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--path-filter", ".*reports.*",
+            "--limit", "2",
+            "--offset", "1",
+            "report",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 2 result(s)"), "Path filter + offset should return 2 results (3 reports, skip 1, limit 2)");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Phrase query integration tests ---
+
+#[test]
+fn test_search_phrase_query() {
+    let dir = test_dir("search_phrase");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "the quick brown fox jumps over the lazy dog");
+    create_test_pdf(&pdf_dir.join("doc2.pdf"), "quick brown fox jumps high");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Phrase query with quotes via CLI (inner quotes escaped for the shell)
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "\"quick brown fox\"",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 2 result(s)"), "Phrase 'quick brown fox' matches both");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_phrase_no_match_when_words_out_of_order() {
+    let dir = test_dir("search_phrase_order");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "\"world hello\"",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No results found"), "Out-of-order phrase should not match");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Fuzzy query integration tests ---
+
+#[test]
+fn test_search_fuzzy_query() {
+    let dir = test_dir("search_fuzzy");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--fuzzy", "1",
+            "hallo",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Fuzzy search with typo should match");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_fuzzy_no_match_when_edit_distance_too_low() {
+    let dir = test_dir("search_fuzzy_low");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--fuzzy", "1",
+            "zzzzz",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No results found"), "Fuzzy search with completely unrelated word should return nothing");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- JSON output integration tests ---
+
+#[test]
+fn test_search_json_output_has_results() {
+    let dir = test_dir("search_json");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "rust programming language");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--json",
+            "rust",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Should be valid JSON array with results
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed.is_array());
+    assert_eq!(parsed.as_array().unwrap().len(), 1);
+    assert!(parsed[0]["path"].as_str().unwrap().contains("doc.pdf"));
+    assert!(parsed[0]["score"].as_f64().unwrap() > 0.0);
+    assert!(parsed[0]["snippet"].as_str().unwrap().contains("rust"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_json_output_empty() {
+    let dir = test_dir("search_json_empty");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Search for non-matching term with --json
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--json",
+            "nonexistent",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Should be empty JSON array, not text message
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed.is_array());
+    assert!(parsed.as_array().unwrap().is_empty());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_json_with_path_filter() {
+    let dir = test_dir("search_json_filter");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    std::fs::create_dir_all(pdf_dir.join("reports")).unwrap();
+    create_test_pdf(&pdf_dir.join("reports").join("q1.pdf"), "quarterly earnings");
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "earnings report");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // --json + --path-filter
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--json",
+            "--path-filter", ".*reports.*",
+            "earnings",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed.is_array());
+    assert_eq!(parsed.as_array().unwrap().len(), 1);
+    assert!(parsed[0]["path"].as_str().unwrap().contains("reports"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Error flow: JSON output with invalid regex ---
+
+#[test]
+fn test_search_json_invalid_regex_errors() {
+    let dir = test_dir("search_json_bad_regex");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "content");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // --json with invalid regex should still error (not produce partial JSON)
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--json",
+            "--path-filter", "[invalid",
+            "content",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Invalid path filter regex") || stderr.contains("error"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Alternative: JSON output with offset ---
+
+#[test]
+fn test_search_json_with_offset() {
+    let dir = test_dir("search_json_offset");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    for i in 0..5 {
+        create_test_pdf(&pdf_dir.join(&format!("doc{}.pdf", i)), &format!("document {}", i));
+    }
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--json",
+            "--limit", "2",
+            "--offset", "2",
+            "document",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed.is_array());
+    assert_eq!(parsed.as_array().unwrap().len(), 2, "Offset 2 with limit 2 on 5 docs should return 2 results");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Index optimize integration tests ---
+
+#[test]
+fn test_index_optimize_reduces_segments() {
+    let dir = test_dir("index_optimize");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "index-optimize",
+            "--index-path", index_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("segments"), "Should report segment reduction");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Delete from index integration tests ---
+
+#[test]
+fn test_delete_from_index_by_path() {
+    let dir = test_dir("delete_by_path");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    std::fs::create_dir_all(pdf_dir.join("reports")).unwrap();
+    create_test_pdf(&pdf_dir.join("reports").join("doc1.pdf"), "hello");
+    create_test_pdf(&pdf_dir.join("doc2.pdf"), "hello");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "delete-from-index",
+            "--index-path", index_path.to_str().unwrap(),
+            "--path", ".*reports.*",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Deleted"), "Should report deletion");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_delete_from_index_by_id() {
+    let dir = test_dir("delete_by_id");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "delete-from-index",
+            "--index-path", index_path.to_str().unwrap(),
+            "--id", "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Deleted"), "Should report deletion");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Stem search integration tests ---
+
+#[test]
+fn test_search_stem_finds_stemmed_variants() {
+    let dir = test_dir("search_stem");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "running quickly");
+    create_test_pdf(&pdf_dir.join("doc2.pdf"), "the cat runs fast");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--stem",
+            "run",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 2 result(s)"), "Stemmed search should find 'running' and 'runs'");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_stem_with_fuzzy() {
+    let dir = test_dir("search_stem_fuzzy");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "algorithm");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--stem",
+            "--fuzzy", "1",
+            "algorith",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Stemmed + fuzzy search should match");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Error flow: index-stats with a file path instead of directory ---
+
+#[test]
+fn test_index_stats_path_is_file_fails() {
+    let dir = test_dir("index_stats_file_path");
+    let file_path = dir.join("not_a_dir");
+    std::fs::write(&file_path, "this is a file, not a directory").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "index-stats",
+            "--index-path", file_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "index-stats with file path should fail");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- index-stats integration tests ---
+
+#[test]
+fn test_index_stats_empty() {
+    let dir = test_dir("index_stats_empty");
+    let index_path = dir.join("index");
+
+    // Create empty index via search
+    let _ = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "test",
+        ])
+        .output()
+        .unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "index-stats",
+            "--index-path", index_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Documents:    0"), "Empty index should have 0 docs");
+    assert!(stdout.contains("Segments:"), "Should report segment count");
+    assert!(stdout.contains("Size on disk:"), "Should report size");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_index_stats_with_docs() {
+    let dir = test_dir("index_stats_with_docs");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "hello world");
+    create_test_pdf(&pdf_dir.join("doc2.pdf"), "foo bar");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "index-stats",
+            "--index-path", index_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Documents:    2"), "Index with 2 PDFs should have 2 docs");
+    assert!(stdout.contains("Segments:"), "Should report segment count");
+    assert!(stdout.contains("Size on disk:"), "Should report size");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_index_stats_nonexistent_path() {
+    let dir = test_dir("index_stats_nonexistent");
+    let index_path = dir.join("nonexistent");
+
+    // Auto-creates the index directory
+    let out = Command::new(binary_path())
+        .args([
+            "index-stats",
+            "--index-path", index_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Documents:    0"), "Auto-created empty index");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Stem search error flows ---
+
+#[test]
+fn test_search_stem_no_results() {
+    let dir = test_dir("search_stem_no_results");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--stem",
+            "nonexistent",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No results found"), "Stem search with no match should report no results");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Delete from index error flows ---
+
+#[test]
+fn test_delete_from_index_nonexistent_id() {
+    let dir = test_dir("delete_nonexistent_id");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "delete-from-index",
+            "--index-path", index_path.to_str().unwrap(),
+            "--id", "999",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Deleted"), "Should report deletion attempt");
+    // Verify the existing document is still searchable
+    let search_out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(search_out.status.success());
+    let search_stdout = String::from_utf8_lossy(&search_out.stdout);
+    assert!(search_stdout.contains("Found 1"), "Doc should remain after deleting non-existent id");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_delete_from_index_no_match_path() {
+    let dir = test_dir("delete_no_match_path");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "delete-from-index",
+            "--index-path", index_path.to_str().unwrap(),
+            "--path", ".*nonexistent.*",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Deleted 0 document(s)"), "Should report 0 deletions");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_delete_from_index_invalid_regex() {
+    let dir = test_dir("delete_invalid_regex");
+    let index_path = dir.join("index"); // doesn't need to exist; CLI creates it
+
+    let out = Command::new(binary_path())
+        .args([
+            "delete-from-index",
+            "--index-path", index_path.to_str().unwrap(),
+            "--path", "[invalid",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "Invalid regex should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid") || stderr.contains("regex"), "Should report invalid regex error");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Alternative: JSON output with non-existent index ---
+
+#[test]
+fn test_search_json_no_index_returns_empty_array() {
+    let dir = test_dir("search_json_no_index");
+    let index_path = dir.join("nonexistent");
+
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--json",
+            "test",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed.is_array());
+    assert!(parsed.as_array().unwrap().is_empty());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- OCR integration tests ---
+
+fn run_ocr(pdf_dir: &PathBuf, db_path: &PathBuf, log_path: &PathBuf) -> std::process::Output {
+    Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i",
+            pdf_dir.to_str().unwrap(),
+            "-d",
+            db_path.to_str().unwrap(),
+            "-l",
+            log_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run pdf_extractor ocr")
+}
+
+#[test]
+fn test_ocr_completes_gracefully_no_renderer() {
+    let dir = test_dir("ocr_no_renderer");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let ocr_log_path = dir.join("ocr.log");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "Hello World");
+    create_test_pdf(&pdf_dir.join("empty.pdf"), "");
+
+    // Extract first to populate the DB (empty PDF gets ocr_flag=true)
+    let extract = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i",
+            pdf_dir.to_str().unwrap(),
+            "-o",
+            output_path.to_str().unwrap(),
+            "-d",
+            db_path.to_str().unwrap(),
+            "-l",
+            log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(extract.status.success());
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    assert_eq!(content.lines().count(), 2);
+
+    // Run OCR — no Tesseract/renderer available, so gracefully processes 0
+    let out = run_ocr(&pdf_dir, &db_path, &ocr_log_path);
+    assert!(out.status.success(), "OCR should exit successfully even without renderer");
+
+    let ocr_log = std::fs::read_to_string(&ocr_log_path).unwrap();
+    assert!(ocr_log.contains("OCR processing complete"), "Log should indicate completion");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_no_pdfs_in_directory() {
+    let dir = test_dir("ocr_no_pdfs");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"not a pdf").unwrap();
+
+    let out = run_ocr(&pdf_dir, &db_path, &log_path);
+    assert!(out.status.success(), "OCR on dir with no PDFs should succeed");
+
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("OCR processing complete"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_nonexistent_input_directory_fails() {
+    let dir = test_dir("ocr_bad_input");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", r"C:\NONEXISTENT_OCR_TEST_DIR_99999",
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "OCR with nonexistent input dir should fail");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_tesseract_path_flag() {
+    let dir = test_dir("ocr_tesseract_flag");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let ocr_log_path = dir.join("ocr.log");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "");
+
+    // Extract to set ocr_flag
+    let extract = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(extract.status.success());
+
+    // Run with --tesseract-path pointing to nonexistent binary — should still complete gracefully
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", ocr_log_path.to_str().unwrap(),
+            "--tesseract-path", r"C:\nonexistent_tesseract.exe",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR should complete even with nonexistent tesseract path");
+
+    let log = std::fs::read_to_string(&ocr_log_path).unwrap();
+    assert!(log.contains("OCR processing complete"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_custom_workers_flag() {
+    let dir = test_dir("ocr_workers_flag");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--ocr-workers", "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR with --ocr-workers flag should succeed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_zero_workers_is_clamped() {
+    let dir = test_dir("ocr_zero_workers");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--ocr-workers", "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR with --ocr-workers 0 should be clamped to 1");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_large_workers_flag() {
+    let dir = test_dir("ocr_large_workers");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--ocr-workers", "50",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR with --ocr-workers 50 should succeed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_max_dim_flag() {
+    let dir = test_dir("ocr_max_dim");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--max-dim", "1000",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR with --max-dim flag should succeed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_max_dim_and_workers_flags() {
+    let dir = test_dir("ocr_max_dim_workers");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--max-dim", "2000",
+            "--ocr-workers", "4",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR with combined flags should succeed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_max_dim_minimum() {
+    let dir = test_dir("ocr_max_dim_min");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--max-dim", "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR with --max-dim 1 should succeed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_max_dim_large() {
+    let dir = test_dir("ocr_max_dim_large");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--max-dim", "99999",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR with --max-dim 99999 should succeed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_lang_flag() {
+    let dir = test_dir("ocr_lang");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--lang", "por",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR with --lang por should succeed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_lang_and_workers_flags() {
+    let dir = test_dir("ocr_lang_workers");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--lang", "spa+eng",
+            "--ocr-workers", "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR with --lang spa+eng and --ocr-workers 2 should succeed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_lang_and_max_dim_flags() {
+    let dir = test_dir("ocr_lang_maxdim");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--lang", "fra",
+            "--max-dim", "1500",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR with --lang fra and --max-dim 1500 should succeed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_default_lang() {
+    let dir = test_dir("ocr_default_lang");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("ocr.log");
+
+    std::fs::write(pdf_dir.join("readme.txt"), b"hello").unwrap();
+
+    let out = Command::new(binary_path())
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "OCR without --lang should succeed (default eng)");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Happy path OCR with mock executables ---
+
+fn mock_bin_dir() -> PathBuf {
+    let mut path = binary_path();
+    path.pop(); // remove pdf_extractor.exe name
+    path
+}
+
+#[test]
+fn test_ocr_happy_path_with_mocks() {
+    let dir = test_dir("ocr_happy_path");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let ocr_log_path = dir.join("ocr.log");
+    let ocr_output_path = dir.join("ocr_output.jsonl");
+    let mock_dir = dir.join("mocks");
+
+    std::fs::create_dir_all(&mock_dir).unwrap();
+
+    // Copy compiled mock binaries to mock dir with expected names
+    let bin_dir = mock_bin_dir();
+    std::fs::copy(bin_dir.join("mock_mutool.exe"), mock_dir.join("mutool.exe")).unwrap();
+    std::fs::copy(bin_dir.join("mock_tesseract.exe"), mock_dir.join("tesseract.exe")).unwrap();
+
+    // Empty PDF triggers ocr_flag=true during extraction
+    create_test_pdf(&pdf_dir.join("empty.pdf"), "");
+
+    // Extract to populate the DB
+    let extract = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(extract.status.success());
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    assert!(content.contains("\"ocr_flag\":true"), "Empty PDF should be marked for OCR");
+
+    // Run OCR with mocks on PATH and --output flag
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{};{}", mock_dir.to_str().unwrap(), original_path);
+
+    let ocr = Command::new(binary_path())
+        .env("PATH", &new_path)
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", ocr_output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", ocr_log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(ocr.status.success(), "OCR with mocks should succeed");
+
+    let ocr_log = std::fs::read_to_string(&ocr_log_path).unwrap();
+    assert!(
+        ocr_log.contains("\"ocr_processed\":1"),
+        "Log should show 1 OCR-processed document. Log contents:\n{}",
+        &ocr_log[..std::cmp::min(800, ocr_log.len())]
+    );
+
+    assert!(
+        ocr_log.contains("\"ocr_errored\":0"),
+        "Log should show 0 OCR errors"
+    );
+
+    // Verify JSONL output was written
+    assert!(ocr_output_path.exists(), "OCR output file should exist");
+    let ocr_content = std::fs::read_to_string(&ocr_output_path).unwrap();
+    let lines: Vec<&str> = ocr_content.lines().collect();
+    assert_eq!(lines.len(), 1, "Should have 1 OCR record");
+    let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(record["id"], 1, "Should have correct id");
+    assert!(record["path"].as_str().unwrap().contains("empty.pdf"), "Should reference the PDF path");
+    assert_eq!(record["ocr_flag"], false, "OCR flag should be false after OCR");
+    assert!(record["text"].as_str().unwrap().contains("Mock OCR text"), "Should contain OCR'd text");
+    assert!(record["checksum"].as_str().unwrap().len() == 16, "Should have valid checksum");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_multi_page_with_mocks() {
+    let dir = test_dir("ocr_multi_page");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let ocr_log_path = dir.join("ocr.log");
+    let ocr_output_path = dir.join("ocr_output.jsonl");
+    let mock_dir = dir.join("mocks");
+
+    std::fs::create_dir_all(&mock_dir).unwrap();
+
+    let bin_dir = mock_bin_dir();
+    std::fs::copy(bin_dir.join("mock_mutool.exe"), mock_dir.join("mutool.exe")).unwrap();
+    std::fs::copy(bin_dir.join("mock_tesseract.exe"), mock_dir.join("tesseract.exe")).unwrap();
+
+    create_test_pdf(&pdf_dir.join("empty.pdf"), "");
+
+    // Extract to populate the DB
+    let extract = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(extract.status.success());
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    assert!(content.contains("\"ocr_flag\":true"), "Empty PDF should be marked for OCR");
+
+    // Run OCR with mock reporting 3 pages
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{};{}", mock_dir.to_str().unwrap(), original_path);
+
+    let ocr = Command::new(binary_path())
+        .env("PATH", &new_path)
+        .env("MOCK_MUTOOL_PAGES", "3")
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", ocr_output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", ocr_log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(ocr.status.success(), "OCR with mocks should succeed");
+
+    let ocr_log = std::fs::read_to_string(&ocr_log_path).unwrap();
+    assert!(
+        ocr_log.contains("\"ocr_processed\":1"),
+        "Log should show 1 OCR-processed document. Log contents:\n{}",
+        &ocr_log[..std::cmp::min(800, ocr_log.len())]
+    );
+
+    assert!(
+        ocr_log.contains("\"ocr_errored\":0"),
+        "Log should show 0 OCR errors"
+    );
+
+    // Verify JSONL output — 1 record with text from all 3 pages joined
+    assert!(ocr_output_path.exists(), "OCR output file should exist");
+    let ocr_content = std::fs::read_to_string(&ocr_output_path).unwrap();
+    let lines: Vec<&str> = ocr_content.lines().collect();
+    assert_eq!(lines.len(), 1, "Should have 1 OCR record for 1 document");
+
+    let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(record["id"], 1);
+    assert!(record["path"].as_str().unwrap().contains("empty.pdf"));
+
+    let ocr_text = record["text"].as_str().unwrap();
+    let count = ocr_text.matches("Mock OCR text").count();
+    assert_eq!(count, 3, "OCR text should contain output from all 3 pages, got {} matches", count);
+
+    assert_eq!(record["ocr_flag"], false, "OCR flag should be false after OCR");
+    assert!(record["checksum"].as_str().unwrap().len() == 16, "Should have valid checksum");
+
+    // Verify OMP env vars were set on Tesseract subprocess
+    let ocr_text = record["text"].as_str().unwrap();
+    assert!(
+        ocr_text.contains("OMP_THREAD_LIMIT=1"),
+        "Tesseract should receive OMP_THREAD_LIMIT=1"
+    );
+    assert!(
+        ocr_text.contains("OMP_NUM_THREADS=1"),
+        "Tesseract should receive OMP_NUM_THREADS=1"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_with_single_worker_pool() {
+    let dir = test_dir("ocr_single_worker");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let ocr_log_path = dir.join("ocr.log");
+    let ocr_output_path = dir.join("ocr_output.jsonl");
+    let mock_dir = dir.join("mocks");
+
+    std::fs::create_dir_all(&mock_dir).unwrap();
+
+    let bin_dir = mock_bin_dir();
+    std::fs::copy(bin_dir.join("mock_mutool.exe"), mock_dir.join("mutool.exe")).unwrap();
+    std::fs::copy(bin_dir.join("mock_tesseract.exe"), mock_dir.join("tesseract.exe")).unwrap();
+
+    create_test_pdf(&pdf_dir.join("empty.pdf"), "");
+
+    let extract = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(extract.status.success());
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{};{}", mock_dir.to_str().unwrap(), original_path);
+
+    let ocr = Command::new(binary_path())
+        .env("PATH", &new_path)
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", ocr_output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", ocr_log_path.to_str().unwrap(),
+            "--ocr-workers", "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(ocr.status.success(), "OCR with single-worker pool should succeed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_pool_handles_tesseract_failure() {
+    let dir = test_dir("ocr_pool_fail");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let ocr_log_path = dir.join("ocr.log");
+    let ocr_output_path = dir.join("ocr_output.jsonl");
+    let mock_dir = dir.join("mocks");
+
+    std::fs::create_dir_all(&mock_dir).unwrap();
+
+    // Copy only mock_mutool (not mock_tesseract) so OCR will fail
+    let bin_dir = mock_bin_dir();
+    std::fs::copy(bin_dir.join("mock_mutool.exe"), mock_dir.join("mutool.exe")).unwrap();
+    // Create a tesseract mock that always fails
+    let fail_script = mock_dir.join("tesseract.exe");
+    std::fs::write(&fail_script, "@echo off\nexit /b 1\n").unwrap();
+
+    create_test_pdf(&pdf_dir.join("empty.pdf"), "");
+
+    let extract = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(extract.status.success());
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{};{}", mock_dir.to_str().unwrap(), original_path);
+
+    let ocr = Command::new(binary_path())
+        .env("PATH", &new_path)
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", ocr_output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", ocr_log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    // OCR should not crash — tesseract failures per page are logged as warnings
+    assert!(ocr.status.success(), "OCR should succeed even with tesseract failures");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_list_failed_ocr_empty() {
+    let dir = test_dir("list_failed_empty");
+    let db_path = dir.join("jobs.db");
+
+    let out = Command::new(binary_path())
+        .args(["list-failed-ocr", "-d", db_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "list-failed-ocr on empty DB should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No permanently failed OCR"), "Should report no failures");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_list_failed_ocr_shows_failures() {
+    let dir = test_dir("list_failed_shows");
+    let pdf_dir = dir.join("pdfs");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let output_path = dir.join("documents.jsonl");
+    let mock_dir = dir.join("mocks");
+
+    std::fs::create_dir_all(&mock_dir).unwrap();
+    std::fs::create_dir_all(&pdf_dir).unwrap();
+
+    // Use failing tesseract so OCR permanently fails
+    let bin_dir = mock_bin_dir();
+    std::fs::copy(bin_dir.join("mock_mutool.exe"), mock_dir.join("mutool.exe")).unwrap();
+    std::fs::write(mock_dir.join("tesseract.exe"), "@echo off\nexit /b 1\n").unwrap();
+
+    create_test_pdf(&pdf_dir.join("fail.pdf"), "");
+
+    // Extract
+    let extract = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(extract.status.success());
+
+    // Run OCR — will fail. Need 2 runs to exhaust max_retries=2
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{};{}", mock_dir.to_str().unwrap(), original_path);
+
+    let ocr1 = Command::new(binary_path())
+        .env("PATH", &new_path)
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--ocr-workers", "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(ocr1.status.success(), "First OCR run should succeed");
+
+    // Second run exhausts retries → marks as permanently failed
+    let ocr2 = Command::new(binary_path())
+        .env("PATH", &new_path)
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--ocr-workers", "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(ocr2.status.success(), "Second OCR run should succeed");
+
+    // Now list failed
+    let list = Command::new(binary_path())
+        .args(["list-failed-ocr", "-d", db_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "list-failed-ocr should succeed");
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(stdout.contains("fail.pdf"), "Should list the failed document");
+    assert!(stdout.contains("OCR returned empty text") || stdout.contains("Worker error"),
+        "Should include error message, got: {}", stdout);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_extract_language_detected_in_jsonl() {
+    let dir = test_dir("extract_lang_detected");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "This is a sufficiently long English text for reliable language detection by the whatlang library.");
+
+    let status = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    let rec: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+    assert_eq!(rec["language"], "eng", "Long English text should be detected as 'eng', got: {}", rec["language"]);
+    assert!(rec["text"].as_str().unwrap().contains("sufficiently long English text"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_language_in_jsonl() {
+    let dir = test_dir("ocr_lang_jsonl");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let ocr_log_path = dir.join("ocr.log");
+    let ocr_output_path = dir.join("ocr_output.jsonl");
+    let mock_dir = dir.join("mocks");
+
+    std::fs::create_dir_all(&mock_dir).unwrap();
+
+    let bin_dir = mock_bin_dir();
+    std::fs::copy(bin_dir.join("mock_mutool.exe"), mock_dir.join("mutool.exe")).unwrap();
+    std::fs::copy(bin_dir.join("mock_tesseract.exe"), mock_dir.join("tesseract.exe")).unwrap();
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "");
+
+    let extract = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(extract.status.success());
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{};{}", mock_dir.to_str().unwrap(), original_path);
+
+    let ocr = Command::new(binary_path())
+        .env("PATH", &new_path)
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", ocr_output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", ocr_log_path.to_str().unwrap(),
+            "--lang", "por",
+        ])
+        .output()
+        .unwrap();
+    assert!(ocr.status.success(), "OCR with --lang por should succeed");
+
+    let ocr_content = std::fs::read_to_string(&ocr_output_path).unwrap();
+    let rec: serde_json::Value = serde_json::from_str(ocr_content.trim()).unwrap();
+    assert_eq!(rec["language"], "por", "OCR JSONL should contain 'por' language, got: {}", rec["language"]);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_ocr_language_default_eng_in_jsonl() {
+    let dir = test_dir("ocr_lang_eng_default");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let ocr_log_path = dir.join("ocr.log");
+    let ocr_output_path = dir.join("ocr_output.jsonl");
+    let mock_dir = dir.join("mocks");
+
+    std::fs::create_dir_all(&mock_dir).unwrap();
+
+    let bin_dir = mock_bin_dir();
+    std::fs::copy(bin_dir.join("mock_mutool.exe"), mock_dir.join("mutool.exe")).unwrap();
+    std::fs::copy(bin_dir.join("mock_tesseract.exe"), mock_dir.join("tesseract.exe")).unwrap();
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "");
+
+    let extract = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(extract.status.success());
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{};{}", mock_dir.to_str().unwrap(), original_path);
+
+    let ocr = Command::new(binary_path())
+        .env("PATH", &new_path)
+        .args([
+            "ocr",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", ocr_output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", ocr_log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(ocr.status.success(), "OCR without --lang should succeed");
+
+    let ocr_content = std::fs::read_to_string(&ocr_output_path).unwrap();
+    let rec: serde_json::Value = serde_json::from_str(ocr_content.trim()).unwrap();
+    assert_eq!(rec["language"], "eng", "OCR without --lang should default to 'eng', got: {}", rec["language"]);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_field_normalized_text() {
+    let dir = test_dir("search_field_normalized");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "Hello World from PDF one");
+    create_test_pdf(&pdf_dir.join("doc2.pdf"), "Second document with unique content");
+
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Search normalized_text field — English docs should be found.
+    let out = run_search_field(&index_path, "Hello", "normalized_text");
+    assert!(out.status.success(), "Search with --field normalized_text should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Expected 1 result in normalized_text for 'Hello', got: {}", stdout);
+
+    // Search normalized_text for non-existent term.
+    let out2 = run_search_field(&index_path, "nonexistent", "normalized_text");
+    assert!(out2.status.success());
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(stdout2.contains("No results found"), "Expected no results for non-existent term");
+
+    // Invalid field name should produce an error.
+    let out3 = run_search_field(&index_path, "Hello", "nonexistent_field");
+    assert!(!out3.status.success(), "Invalid field name should fail");
+    let stderr3 = String::from_utf8_lossy(&out3.stderr);
+    assert!(stderr3.contains("not found in schema"), "Error should mention missing field");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

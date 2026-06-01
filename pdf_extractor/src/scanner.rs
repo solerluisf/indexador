@@ -29,11 +29,34 @@ impl JobStore {
                 checksum TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 ocr_flag INTEGER NOT NULL DEFAULT 0,
-                error TEXT
+                error TEXT,
+                ocr_attempts INTEGER NOT NULL DEFAULT 0,
+                ocr_error TEXT,
+                failed_ocr TEXT,
+                language TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);",
         )
         .context("Failed to create jobs table")?;
+
+        // Add OCR columns for databases created before Phase 4
+        conn.execute_batch(
+            "ALTER TABLE jobs ADD COLUMN ocr_attempts INTEGER NOT NULL DEFAULT 0;",
+        )
+        .ok();
+        conn.execute_batch(
+            "ALTER TABLE jobs ADD COLUMN ocr_error TEXT;",
+        )
+        .ok();
+        conn.execute_batch(
+            "ALTER TABLE jobs ADD COLUMN failed_ocr TEXT;",
+        )
+        .ok();
+        conn.execute_batch(
+            "ALTER TABLE jobs ADD COLUMN language TEXT;",
+        )
+        .ok();
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -212,6 +235,99 @@ impl JobStore {
             )
             .context("Failed to count jobs by status")?;
         Ok(count)
+    }
+
+    pub fn fetch_ocr_needed(&self, limit: i64, max_retries: u32) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let clamped = if limit < 0 { 0 } else { limit };
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, checksum FROM jobs WHERE status = 'done' AND ocr_flag = 1 AND ocr_attempts < ?1 LIMIT ?2",
+            )
+            .context("Failed to prepare fetch_ocr_needed query")?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![max_retries, clamped], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .context("Failed to query OCR-needed jobs")?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.context("Failed to read row")?);
+        }
+        Ok(result)
+    }
+
+    pub fn mark_ocr_attempt(&self, id: i64, success: bool, ocr_error: Option<&str>, max_retries: u32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if success {
+            conn.execute(
+                "UPDATE jobs SET ocr_attempts = ocr_attempts + 1, ocr_flag = 0, ocr_error = NULL, failed_ocr = NULL WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE jobs SET ocr_attempts = ocr_attempts + 1, ocr_error = ?1,
+                 failed_ocr = CASE WHEN ocr_attempts + 1 >= ?3 THEN datetime('now') ELSE NULL END
+                 WHERE id = ?2",
+                rusqlite::params![ocr_error, id, max_retries],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn fetch_failed_ocr(&self) -> Result<Vec<(i64, String, String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, checksum, ocr_error FROM jobs WHERE failed_ocr IS NOT NULL ORDER BY failed_ocr DESC",
+            )
+            .context("Failed to prepare fetch_failed_ocr query")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .context("Failed to query failed OCR jobs")?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.context("Failed to read row")?);
+        }
+        Ok(result)
+    }
+
+    pub fn count_ocr_pending(&self, max_retries: u32) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'done' AND ocr_flag = 1 AND ocr_attempts < ?1",
+                rusqlite::params![max_retries],
+                |row| row.get(0),
+            )
+            .context("Failed to count OCR-pending jobs")?;
+        Ok(count)
+    }
+
+    #[cfg(test)]
+    pub fn get_job_language(&self, id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT language FROM jobs WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .context("Failed to query job language")
     }
 }
 
@@ -841,6 +957,195 @@ mod tests {
         let count = scan_directory(&store, &dir).unwrap();
         assert_eq!(count, 0);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- OCR tracking: basic flows ---
+
+    #[test]
+    fn test_ocr_mark_success_clears_flag() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_done(batch[0].0, true).unwrap();  // done with ocr_flag=true
+
+        let needed = store.fetch_ocr_needed(10, 2).unwrap();
+        assert_eq!(needed.len(), 1, "Should find OCR-needed doc");
+
+        store.mark_ocr_attempt(needed[0].0, true, None, 2).unwrap();
+        let after = store.fetch_ocr_needed(10, 2).unwrap();
+        assert!(after.is_empty(), "After successful OCR, flag should be cleared");
+    }
+
+    #[test]
+    fn test_ocr_mark_failure_increments_attempts() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_done(batch[0].0, true).unwrap();
+
+        store.mark_ocr_attempt(batch[0].0, false, Some("ocr failed"), 2).unwrap();
+        let needed = store.fetch_ocr_needed(10, 2).unwrap();
+        assert_eq!(needed.len(), 1, "Should still be needed (attempts < max_retries)");
+
+        store.mark_ocr_attempt(batch[0].0, false, Some("still failing"), 2).unwrap();
+        let after = store.fetch_ocr_needed(10, 2).unwrap();
+        assert!(after.is_empty(), "Should stop retrying after max_retries");
+    }
+
+    // --- OCR tracking: alternative flows ---
+
+    #[test]
+    fn test_ocr_needed_only_matches_ocr_flag() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "a").unwrap();
+        store.upsert_file("/b.pdf", "b").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+
+        // a.pdf: done with ocr_flag=true, b.pdf: done with ocr_flag=false
+        store.mark_done(batch[0].0, true).unwrap();
+        store.mark_done(batch[1].0, false).unwrap();
+
+        let needed = store.fetch_ocr_needed(10, 2).unwrap();
+        assert_eq!(needed.len(), 1, "Only ocr_flag=true should match");
+        assert!(needed[0].1.contains("a.pdf"), "Should be the OCR-needed doc");
+    }
+
+    #[test]
+    fn test_ocr_needed_respects_limit() {
+        let store = JobStore::open_in_memory().unwrap();
+        for i in 0..5 {
+            store.upsert_file(&format!("/{}.pdf", i), &format!("cs{}", i)).unwrap();
+        }
+        let batch = store.claim_pending(10).unwrap();
+        for (id, _, _) in &batch {
+            store.mark_done(*id, true).unwrap();
+        }
+
+        let needed = store.fetch_ocr_needed(2, 2).unwrap();
+        assert_eq!(needed.len(), 2, "Should respect limit");
+    }
+
+    // --- OCR tracking: error flows ---
+
+    #[test]
+    fn test_ocr_needed_empty_when_none() {
+        let store = JobStore::open_in_memory().unwrap();
+        let needed = store.fetch_ocr_needed(10, 2).unwrap();
+        assert!(needed.is_empty(), "No jobs → no OCR needed");
+    }
+
+    #[test]
+    fn test_ocr_needed_negative_limit() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_done(batch[0].0, true).unwrap();
+
+        let needed = store.fetch_ocr_needed(-1, 2).unwrap();
+        assert!(needed.is_empty(), "Negative limit should return empty");
+    }
+
+    #[test]
+    fn test_ocr_count_pending() {
+        let store = JobStore::open_in_memory().unwrap();
+        assert_eq!(store.count_ocr_pending(2).unwrap(), 0);
+
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_done(batch[0].0, true).unwrap();
+
+        assert_eq!(store.count_ocr_pending(2).unwrap(), 1);
+    }
+
+    // --- failed_ocr queue ---
+
+    #[test]
+    fn test_failed_ocr_not_set_on_success() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_done(batch[0].0, true).unwrap();
+
+        store.mark_ocr_attempt(batch[0].0, true, None, 2).unwrap();
+        let failed = store.fetch_failed_ocr().unwrap();
+        assert!(failed.is_empty(), "Successful OCR should not create failed_ocr entry");
+    }
+
+    #[test]
+    fn test_failed_ocr_set_after_max_retries() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_done(batch[0].0, true).unwrap();
+
+        // First failure: attempts=1, max_retries=2 → not yet failed
+        store.mark_ocr_attempt(batch[0].0, false, Some("first fail"), 2).unwrap();
+        let failed = store.fetch_failed_ocr().unwrap();
+        assert!(failed.is_empty(), "Should not fail after 1 attempt with max_retries=2");
+
+        // Second failure: attempts=2 >= max_retries=2 → marked failed
+        store.mark_ocr_attempt(batch[0].0, false, Some("second fail"), 2).unwrap();
+        let failed = store.fetch_failed_ocr().unwrap();
+        assert_eq!(failed.len(), 1, "Should be in failed_ocr after exhausting retries");
+        assert_eq!(failed[0].0, batch[0].0, "ID should match");
+        assert!(failed[0].1.contains("a.pdf"), "Path should match");
+        assert_eq!(failed[0].3.as_deref(), Some("second fail"), "Should have latest error");
+    }
+
+    #[test]
+    fn test_failed_ocr_cleared_on_retry_success() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_done(batch[0].0, true).unwrap();
+
+        // Exhaust retries
+        store.mark_ocr_attempt(batch[0].0, false, Some("fail 1"), 1).unwrap();
+        let failed = store.fetch_failed_ocr().unwrap();
+        assert_eq!(failed.len(), 1, "Should be failed after 1 attempt with max_retries=1");
+
+        // If OCR subsequently succeeds (e.g. user retried), failed_ocr should clear
+        store.mark_ocr_attempt(batch[0].0, true, None, 1).unwrap();
+        let failed = store.fetch_failed_ocr().unwrap();
+        assert!(failed.is_empty(), "Successful OCR should clear failed_ocr and ocr_error");
+    }
+
+    #[test]
+    fn test_fetch_failed_ocr_empty_when_none() {
+        let store = JobStore::open_in_memory().unwrap();
+        let failed = store.fetch_failed_ocr().unwrap();
+        assert!(failed.is_empty(), "No jobs → no failed OCR entries");
+    }
+
+    // --- language column ---
+
+    #[test]
+    fn test_language_default_null() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_done(batch[0].0, true).unwrap();
+
+        let lang = store.get_job_language(batch[0].0).unwrap();
+        assert_eq!(lang, None, "New job should have NULL language");
+    }
+
+    #[test]
+    fn test_language_stored_and_retrieved() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/b.pdf", "def").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+
+        // Direct SQL update to set language (as the pipeline would)
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET language = ?1 WHERE id = ?2",
+            rusqlite::params!["eng", batch[0].0],
+        ).unwrap();
+        drop(conn);
+
+        let lang = store.get_job_language(batch[0].0).unwrap();
+        assert_eq!(lang.as_deref(), Some("eng"), "Should retrieve stored language");
     }
 }
 

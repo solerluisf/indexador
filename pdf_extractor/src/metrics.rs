@@ -8,6 +8,9 @@ pub struct Metrics {
     docs_errored: AtomicU64,
     task_queue_depth: AtomicU64,
     result_queue_depth: AtomicU64,
+    indexer_docs_indexed: AtomicU64,
+    indexer_last_commit_age: AtomicU64,
+    indexer_writer_mem: AtomicU64,
     start: Instant,
     last_log: Mutex<Instant>,
 }
@@ -19,6 +22,9 @@ impl Metrics {
             docs_errored: AtomicU64::new(0),
             task_queue_depth: AtomicU64::new(0),
             result_queue_depth: AtomicU64::new(0),
+            indexer_docs_indexed: AtomicU64::new(0),
+            indexer_last_commit_age: AtomicU64::new(0),
+            indexer_writer_mem: AtomicU64::new(0),
             start: Instant::now(),
             last_log: Mutex::new(Instant::now()),
         }
@@ -48,6 +54,19 @@ impl Metrics {
         self.result_queue_depth.store(depth, Ordering::Relaxed);
     }
 
+    pub fn set_indexer_docs_indexed(&self, val: u64) {
+        self.indexer_docs_indexed.store(val, Ordering::Relaxed);
+    }
+
+    pub fn set_indexer_last_commit_age(&self, secs: u64) {
+        self.indexer_last_commit_age.store(secs, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_indexer_writer_mem(&self, bytes: u64) {
+        self.indexer_writer_mem.store(bytes, Ordering::Relaxed);
+    }
+
     pub fn elapsed_secs(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
     }
@@ -72,6 +91,9 @@ impl Metrics {
                 docs_errored = self.errored(),
                 task_queue_depth = self.task_queue_depth.load(Ordering::Relaxed),
                 result_queue_depth = self.result_queue_depth.load(Ordering::Relaxed),
+                indexer_docs_indexed = self.indexer_docs_indexed.load(Ordering::Relaxed),
+                indexer_last_commit_age_secs = self.indexer_last_commit_age.load(Ordering::Relaxed),
+                indexer_writer_mem_bytes = self.indexer_writer_mem.load(Ordering::Relaxed),
                 throughput_docs_per_sec = format!("{:.2}", self.throughput()),
                 elapsed_secs = format!("{:.1}", self.elapsed_secs()),
                 "Metrics snapshot"
@@ -146,6 +168,25 @@ mod tests {
         let m = Metrics::new();
         m.set_result_queue_depth(7);
         assert_eq!(m.result_queue_depth.load(Ordering::Relaxed), 7);
+    }
+
+    // --- indexer metrics ---
+
+    #[test]
+    fn test_metrics_indexer_defaults() {
+        let m = Metrics::new();
+        assert_eq!(m.indexer_docs_indexed.load(Ordering::Relaxed), 0);
+        assert_eq!(m.indexer_last_commit_age.load(Ordering::Relaxed), 0);
+        assert_eq!(m.indexer_writer_mem.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_metrics_set_indexer_docs_indexed() {
+        let m = Metrics::new();
+        m.set_indexer_docs_indexed(100);
+        assert_eq!(m.indexer_docs_indexed.load(Ordering::Relaxed), 100);
+        m.set_indexer_docs_indexed(200);
+        assert_eq!(m.indexer_docs_indexed.load(Ordering::Relaxed), 200);
     }
 
     // --- throughput ---
