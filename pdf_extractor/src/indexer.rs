@@ -5,7 +5,9 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tantivy::collector::TopDocs;
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery, TermQuery};
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery};
+#[cfg(test)]
+use tantivy::query::TermQuery;
 use tantivy::schema::*;
 use tantivy::tokenizer::{Stemmer, StopWordFilter, TextAnalyzer};
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDocument, Term};
@@ -344,6 +346,91 @@ impl SearchIndex {
                 clauses.push((Occur::Must, fuzzy_clauses.into_iter().next().unwrap().1));
             } else if fuzzy_clauses.len() > 1 {
                 clauses.push((Occur::Must, Box::new(BooleanQuery::new(fuzzy_clauses))));
+            }
+        }
+
+        if let Some(pattern) = path_filter {
+            if !pattern.is_empty() {
+                let re_query = RegexQuery::from_pattern(pattern, self.path_field)
+                    .context("Invalid path filter regex")?;
+                clauses.push((Occur::Must, Box::new(re_query)));
+            }
+        }
+
+        if clauses.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query: Box<dyn Query> = if clauses.len() == 1 {
+            clauses.into_iter().next().unwrap().1
+        } else {
+            Box::new(BooleanQuery::new(clauses))
+        };
+
+        let fetch_count = limit.checked_add(offset).unwrap_or(limit);
+        let top_docs = searcher
+            .search(&*query, &TopDocs::with_limit(fetch_count))
+            .context("Search failed")?;
+
+        let mut results = Vec::new();
+        for (score, doc_addr) in top_docs.iter().skip(offset) {
+            let doc = searcher.doc::<TantivyDocument>(*doc_addr)?;
+            results.push((*score, doc));
+            if results.len() >= limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Search on a specific named field, optionally with fuzzy matching.
+    /// When fuzzy_distance is 0, uses the QueryParser for the target field.
+    /// When fuzzy_distance > 0, builds per-token FuzzyTermQuery clauses.
+    /// The `stem` parameter is ignored when `field_name` is provided
+    /// (each field has its own fixed tokenizer).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn search_in_field_fuzzy_stem(
+        &self,
+        query_str: &str,
+        field_name: &str,
+        limit: usize,
+        path_filter: Option<&str>,
+        offset: usize,
+        fuzzy_distance: u8,
+        _stem: bool,
+    ) -> Result<Vec<(f32, TantivyDocument)>> {
+        let field = self
+            .schema
+            .get_field(field_name)
+            .with_context(|| format!("Field '{}' not found in schema", field_name))?;
+        let reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let searcher = reader.searcher();
+
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+        if !query_str.trim().is_empty() {
+            if fuzzy_distance > 0 {
+                let mut fuzzy_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+                for token in query_str.split_whitespace() {
+                    let term = Term::from_field_text(field, token);
+                    let fuzzy_query = FuzzyTermQuery::new(term, fuzzy_distance, true);
+                    fuzzy_clauses.push((Occur::Should, Box::new(fuzzy_query)));
+                }
+                if fuzzy_clauses.len() == 1 {
+                    clauses.push((Occur::Must, fuzzy_clauses.into_iter().next().unwrap().1));
+                } else if fuzzy_clauses.len() > 1 {
+                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(fuzzy_clauses))));
+                }
+            } else {
+                let query_parser = QueryParser::for_index(&self.index, vec![field]);
+                let boxed = query_parser
+                    .parse_query(query_str)
+                    .context("Failed to parse search query")?;
+                clauses.push((Occur::Must, boxed));
             }
         }
 
@@ -742,6 +829,91 @@ mod tests {
         assert!(tokenizers.get("english").is_some(), "english tokenizer should be registered");
         assert!(tokenizers.get("ja").is_some(), "ja tokenizer should be registered");
         assert!(tokenizers.get("zh").is_some(), "zh tokenizer should be registered");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- search_in_field_fuzzy_stem: basic + alternative flows ---
+
+    #[test]
+    fn test_search_in_field_fuzzy_stem_exact() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        // fuzzy=0, stem=false -> exact search via QueryParser
+        let results = idx.search_in_field_fuzzy_stem("hello", "normalized_text", 10, None, 0, 0, false).unwrap();
+        assert_eq!(results.len(), 1, "Exact search via fuzzy_stem should find match");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_fuzzy_stem_fuzzy() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        // fuzzy=2 should match "hxllo" -> "hello"
+        let results = idx.search_in_field_fuzzy_stem("hxllo", "normalized_text", 10, None, 0, 2, false).unwrap();
+        assert_eq!(results.len(), 1, "Fuzzy search (distance 2) should find match");
+
+        // fuzzy=0 should NOT match
+        let results2 = idx.search_in_field_fuzzy_stem("hxllo", "normalized_text", 10, None, 0, 0, false).unwrap();
+        assert_eq!(results2.len(), 0, "Exact search should not find typo");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_fuzzy_stem_empty_query() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_in_field_fuzzy_stem("", "normalized_text", 10, None, 0, 2, false).unwrap();
+        assert_eq!(results.len(), 0, "Empty query should return empty results");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_fuzzy_stem_nonexistent_field() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let result = idx.search_in_field_fuzzy_stem("hello", "bad_field", 10, None, 0, 2, false);
+        assert!(result.is_err(), "Non-existent field should error");
+        assert!(result.unwrap_err().to_string().contains("not found in schema"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_fuzzy_stem_path_filter() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_in_field_fuzzy_stem("hello", "normalized_text", 10, Some("/a.pdf"), 0, 0, false).unwrap();
+        assert_eq!(results.len(), 1, "Path filter + field fuzzy_stem should find only the matching doc");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

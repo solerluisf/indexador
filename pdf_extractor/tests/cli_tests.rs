@@ -2721,6 +2721,97 @@ fn test_search_field_nonexistent_field_messages() {
     assert!(!out2.status.success());
     let stderr2 = String::from_utf8_lossy(&out2.stderr);
     assert!(stderr2.contains("not found in schema"), "Error should mention missing field, got: {}", stderr2);
+    // Error should also list valid field names
+    assert!(stderr2.contains("Valid fields:"), "Error should suggest valid fields, got: {}", stderr2);
+    assert!(stderr2.contains("normalized_text"), "Error should include 'normalized_text' in valid fields, got: {}", stderr2);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_field_with_fuzzy() {
+    let dir = test_dir("search_field_fuzzy");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "quantum computing machine learning");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Fuzzy search on a field should match with typo
+    let out = Command::new(binary_path())
+        .args([
+            "search", "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--field", "normalized_text",
+            "--fuzzy", "2",
+            "quantum",
+        ])
+        .output()
+        .expect("Search with --field and --fuzzy");
+    assert!(out.status.success(), "Field + fuzzy search should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Expected 1 result with fuzzy, got: {}", stdout);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_field_fuzzy_no_match() {
+    let dir = test_dir("search_field_fuzzy_none");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Fuzzy search with very small edit distance should not match
+    let out = Command::new(binary_path())
+        .args([
+            "search", "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--field", "normalized_text",
+            "--fuzzy", "1",
+            "zzzzz",
+        ])
+        .output()
+        .expect("Search with --field and --fuzzy no match");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No results found"), "Expected no results for non-matching fuzzy query");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_list_fields() {
+    let dir = test_dir("list_fields");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args(["list-fields", "--index-path", index_path.to_str().unwrap()])
+        .output()
+        .expect("list-fields should succeed");
+    assert!(out.status.success(), "list-fields command should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("normalized_text"), "list-fields should show normalized_text, got: {}", stdout);
+    assert!(stdout.contains("content_norm"), "list-fields should show content_norm, got: {}", stdout);
+    assert!(stdout.contains("content_stem"), "list-fields should show content_stem, got: {}", stdout);
+    assert!(stdout.contains("content_jp"), "list-fields should show content_jp, got: {}", stdout);
+    assert!(stdout.contains("content_zh"), "list-fields should show content_zh, got: {}", stdout);
+    assert!(stdout.contains("math_tokens"), "list-fields should show math_tokens, got: {}", stdout);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -125,6 +125,10 @@ enum Commands {
         #[arg(short = 'd', long = "db", default_value = "jobs.db", help = "SQLite database path")]
         db: PathBuf,
     },
+    ListFields {
+        #[arg(long = "index-path", help = "Path to Tantivy search index directory")]
+        index_path: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -165,6 +169,7 @@ fn main() -> Result<()> {
             language,
         } => run_ocr(input, output, db, log, index_path, tesseract_path, ocr_workers, max_dim, language),
         Commands::ListFailedOcr { db } => run_list_failed_ocr(db),
+        Commands::ListFields { index_path } => run_list_fields(index_path),
     }
 }
 
@@ -230,7 +235,18 @@ fn run_search(index_path: PathBuf, query: String, limit: usize, offset: usize, p
     let indexer = Indexer::new(&index_path)?;
 
     let results = if let Some(field_name) = field {
-        indexer.search_index().search_in_field(&query, &field_name, limit, path_filter.as_deref(), offset)?
+        let si = indexer.search_index();
+        // Validate early: provide helpful error with valid fields.
+        if si.schema.get_field(&field_name).is_err() {
+            let valid: Vec<&str> = si.schema.fields().filter_map(|(_, f)| Some(f.name())).collect();
+            anyhow::bail!(
+                "Field '{}' not found in schema. Valid fields: {}",
+                field_name, valid.join(", ")
+            );
+        }
+        si.search_in_field_fuzzy_stem(
+            &query, &field_name, limit, path_filter.as_deref(), offset, fuzzy_distance, stem,
+        )?
     } else if fuzzy_distance > 0 {
         indexer.search_index().search_fuzzy_stem(&query, limit, path_filter.as_deref(), offset, fuzzy_distance, stem)?
     } else {
@@ -280,6 +296,27 @@ fn run_search(index_path: PathBuf, query: String, limit: usize, offset: usize, p
         println!("   ...{}...\n", snippet);
     }
 
+    Ok(())
+}
+
+fn run_list_fields(index_path: PathBuf) -> Result<()> {
+    let indexer = Indexer::new(&index_path)?;
+    let si = indexer.search_index();
+    println!("Index fields for: {}", index_path.display());
+    println!("{:-<60}", "");
+    for (_, field) in si.schema.fields() {
+        let field_type = match field.field_type() {
+            tantivy::schema::FieldType::U64(_) => "u64",
+            tantivy::schema::FieldType::I64(_) => "i64",
+            tantivy::schema::FieldType::F64(_) => "f64",
+            tantivy::schema::FieldType::Str(_) => "string",
+            tantivy::schema::FieldType::Bytes(_) => "bytes",
+            _ => "other",
+        };
+        let is_indexed = field.is_indexed();
+        let is_stored = field.is_stored();
+        println!("  {:<20}  {:<8}  indexed={} stored={}", field.name(), field_type, is_indexed, is_stored);
+    }
     Ok(())
 }
 
