@@ -383,6 +383,7 @@ impl SearchIndex {
 
     /// Search on a specific named field in the schema.
     /// Returns an error if the field does not exist or is not indexed.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn search_in_field(
         &self,
         query_str: &str,
@@ -1971,5 +1972,276 @@ fn test_search_fuzzy_with_path_filter() {
         // Search via content_norm should still work.
         let results = idx.search("hello", 10, None, 0).unwrap();
         assert_eq!(results.len(), 1, "English doc should remain searchable via content_norm");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- search_in_field: basic flows ---
+
+    #[test]
+    fn test_search_in_field_normalized_text() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/en.pdf", "en1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_in_field("hello", "normalized_text", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Should find Latin text in normalized_text");
+
+        let path = results[0].1.get_first(idx.path_field).and_then(|v| v.as_str()).unwrap();
+        assert_eq!(path, "/en.pdf");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_content_norm() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/doc.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_in_field("world", "content_norm", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Should find text in content_norm");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_content_jp() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/jp.pdf", "jp1", "私は猫です", "raw", "jpn", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_in_field("猫", "content_jp", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Should find Japanese text in content_jp");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_content_zh() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/zh.pdf", "zh1", "中文测试", "raw", "cmn", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_in_field("中文", "content_zh", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Should find Chinese text in content_zh");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_stem() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "running quickly", "raw", "", "").unwrap();
+        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "the cat runs fast", "raw", "", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_in_field("run", "content_stem", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 2, "Stemmed search should find both 'running' and 'runs'");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_math_tokens() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(
+            &mut writer, 1, "/sum.pdf", "m1",
+            "The sum $$\\sum_{i=1}^{n} i$$ is computed.",
+            "raw", "",
+            r"display:\sum_{i=1}^{n} i",
+        ).unwrap();
+        writer.commit().unwrap();
+
+        // MathAwareTokenizer splits "math_sum_limits" at '_', so query for
+        // individual sub-tokens like "sum" or "display" that appear in the
+        // token stream alongside the composed MATH_SUM_LIMITS construct.
+        let results = idx.search_in_field("display", "math_tokens", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Individual token 'display' should be searchable in math_tokens");
+
+        let results2 = idx.search_in_field("sum", "math_tokens", 10, None, 0).unwrap();
+        assert_eq!(results2.len(), 1, "Sub-token 'sum' should be searchable in math_tokens");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_with_path_filter() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        // With matching path filter
+        let results = idx.search_in_field("hello", "normalized_text", 10, Some("/a.pdf"), 0).unwrap();
+        assert_eq!(results.len(), 1, "Should find only the doc matching path filter");
+
+        // With non-matching path filter
+        let results2 = idx.search_in_field("hello", "normalized_text", 10, Some("/nope.pdf"), 0).unwrap();
+        assert_eq!(results2.len(), 0, "Path filter excluding all docs should return empty");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_with_limit_offset() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
+        idx.add_document(&mut writer, 3, "/c.pdf", "cs3", "hello again", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        // Limit
+        let results = idx.search_in_field("hello", "normalized_text", 1, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Limit should restrict results");
+
+        // Offset
+        let results2 = idx.search_in_field("hello", "normalized_text", 10, None, 2).unwrap();
+        assert_eq!(results2.len(), 1, "Offset 2 should skip first 2 results");
+
+        // Offset beyond total
+        let results3 = idx.search_in_field("hello", "normalized_text", 10, None, 10).unwrap();
+        assert_eq!(results3.len(), 0, "Offset beyond total should return empty");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- search_in_field: alternative flows ---
+
+    #[test]
+    fn test_search_in_field_no_match() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_in_field("nonexistent", "normalized_text", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 0, "Non-matching query should return empty");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_empty_query() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_in_field("", "normalized_text", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 0, "Empty query should return empty results");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_stored_only() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        // content_raw is stored-only, not indexed. QueryParser requires an
+        // indexed text field, so this should return an error.
+        let result = idx.search_in_field("hello", "content_raw", 10, None, 0);
+        assert!(result.is_err(), "Search on stored-only field should fail with an error");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_string_field() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/my-path.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        // path is a STRING field (indexed as raw). Search must match the full string.
+        let results = idx.search_in_field("/my-path.pdf", "path", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Should find doc by exact path string");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- search_in_field: error flows ---
+
+    #[test]
+    fn test_search_in_field_nonexistent_field() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let result = idx.search_in_field("hello", "nonexistent_field", 10, None, 0);
+        assert!(result.is_err(), "Non-existent field should return an error");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found in schema"), "Error should mention missing field, got: {}", err);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_empty_field_name() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let result = idx.search_in_field("hello", "", 10, None, 0);
+        assert!(result.is_err(), "Empty field name should return an error");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_in_field_numeric_field() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 42, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        // id is a u64 field; QueryParser should fail to parse a text query against it.
+        let result = idx.search_in_field("hello", "id", 10, None, 0);
+        assert!(result.is_err(), "Text search against numeric field should fail");
+        let err = result.unwrap_err().to_string();
+        assert!(!err.is_empty(), "Should contain a meaningful error message");
+
         std::fs::remove_dir_all(&dir).ok();
     }

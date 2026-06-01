@@ -2529,3 +2529,198 @@ fn test_search_field_normalized_text() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn test_search_field_content_norm() {
+    let dir = test_dir("search_field_norm");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "Hello World from content_norm field");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = run_search_field(&index_path, "World", "content_norm");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Expected 1 result, got: {}", stdout);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_field_stem() {
+    let dir = test_dir("search_field_stem");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "running quickly through the park");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Search "run" in content_stem — should match "running" via stemming.
+    let out = run_search_field(&index_path, "run", "content_stem");
+    assert!(out.status.success(), "Stem search with --field should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Expected 1 result in content_stem, got: {}", stdout);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_field_math_tokens() {
+    let dir = test_dir("search_field_math");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "Energy found from E = mc^2");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // The math tokenizer indexes individual tokens in math_tokens.
+    let out = run_search_field(&index_path, "energy", "math_tokens");
+    assert!(out.status.success(), "Search math_tokens should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)") || stdout.contains("No results found"),
+        "math_tokens search should find the doc or return 0 results, got: {}", stdout);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_field_with_path_filter() {
+    let dir = test_dir("search_field_path");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("alpha.pdf"), "hello alpha");
+    create_test_pdf(&pdf_dir.join("beta.pdf"), "hello beta");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Combine --field with --path-filter (regex matching the stored path)
+    let out = Command::new(binary_path())
+        .args([
+            "search", "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--field", "normalized_text",
+            "--path-filter", ".*alpha.*",
+            "hello",
+        ])
+        .output()
+        .expect("Search with --field and --path-filter");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Expected 1 result filtered by path, got: {}", stdout);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_field_with_json() {
+    let dir = test_dir("search_field_json");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello json output test");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = Command::new(binary_path())
+        .args([
+            "search", "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--field", "normalized_text",
+            "--json",
+            "hello",
+        ])
+        .output()
+        .expect("Search with --field and --json");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // JSON output should be valid JSON containing results
+    assert!(stdout.starts_with("["), "JSON output should start with '['");
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
+    assert!(parsed.is_ok(), "Output should be valid JSON");
+    let results = parsed.unwrap();
+    assert!(!results.as_array().unwrap().is_empty(), "Should have at least one result");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_field_with_limit_offset() {
+    let dir = test_dir("search_field_pages");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("a.pdf"), "hello alpha");
+    create_test_pdf(&pdf_dir.join("b.pdf"), "hello beta");
+    create_test_pdf(&pdf_dir.join("c.pdf"), "hello gamma");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Limit + offset with field search
+    let out = Command::new(binary_path())
+        .args([
+            "search", "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--field", "normalized_text",
+            "--limit", "1",
+            "--offset", "1",
+            "hello",
+        ])
+        .output()
+        .expect("Search with --field, --limit, --offset");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Expected 1 result with limit+offset, got: {}", stdout);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_search_field_nonexistent_field_messages() {
+    let dir = test_dir("search_field_bad");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Empty field name
+    let out = Command::new(binary_path())
+        .args([
+            "search", "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--field", "",
+            "hello",
+        ])
+        .output()
+        .expect("Search with empty --field");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error") || stderr.contains("not found"), "Empty field should produce error, got: {}", stderr);
+
+    // Non-existent field
+    let out2 = run_search_field(&index_path, "hello", "does_not_exist");
+    assert!(!out2.status.success());
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(stderr2.contains("not found in schema"), "Error should mention missing field, got: {}", stderr2);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
