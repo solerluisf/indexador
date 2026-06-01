@@ -11,6 +11,8 @@ pub struct Metrics {
     indexer_docs_indexed: AtomicU64,
     indexer_last_commit_age: AtomicU64,
     indexer_writer_mem: AtomicU64,
+    search_count: AtomicU64,
+    search_time_ns: AtomicU64,
     start: Instant,
     last_log: Mutex<Instant>,
 }
@@ -25,6 +27,8 @@ impl Metrics {
             indexer_docs_indexed: AtomicU64::new(0),
             indexer_last_commit_age: AtomicU64::new(0),
             indexer_writer_mem: AtomicU64::new(0),
+            search_count: AtomicU64::new(0),
+            search_time_ns: AtomicU64::new(0),
             start: Instant::now(),
             last_log: Mutex::new(Instant::now()),
         }
@@ -67,6 +71,22 @@ impl Metrics {
         self.indexer_writer_mem.store(bytes, Ordering::Relaxed);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn record_search(&self, elapsed_ns: u64) {
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        self.search_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub fn search_count(&self) -> u64 {
+        self.search_count.load(Ordering::Relaxed)
+    }
+
+    pub fn avg_search_latency_ns(&self) -> u64 {
+        let count = self.search_count();
+        if count == 0 { return 0; }
+        self.search_time_ns.load(Ordering::Relaxed) / count
+    }
+
     pub fn elapsed_secs(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
     }
@@ -94,6 +114,8 @@ impl Metrics {
                 indexer_docs_indexed = self.indexer_docs_indexed.load(Ordering::Relaxed),
                 indexer_last_commit_age_secs = self.indexer_last_commit_age.load(Ordering::Relaxed),
                 indexer_writer_mem_bytes = self.indexer_writer_mem.load(Ordering::Relaxed),
+                search_count = self.search_count.load(Ordering::Relaxed),
+                avg_search_latency_us = self.avg_search_latency_ns() / 1000,
                 throughput_docs_per_sec = format!("{:.2}", self.throughput()),
                 elapsed_secs = format!("{:.1}", self.elapsed_secs()),
                 "Metrics snapshot"
@@ -253,5 +275,32 @@ mod tests {
         m.log_summary();
         // Wait a tiny bit and call again — still shouldn't log
         m.log_summary();
+    }
+
+    // --- search latency ---
+
+    #[test]
+    fn test_search_latency_starts_zero() {
+        let m = Metrics::new();
+        assert_eq!(m.search_count(), 0);
+        assert_eq!(m.avg_search_latency_ns(), 0);
+    }
+
+    #[test]
+    fn test_search_latency_record_single() {
+        let m = Metrics::new();
+        m.record_search(1_000_000);
+        assert_eq!(m.search_count(), 1);
+        assert_eq!(m.avg_search_latency_ns(), 1_000_000);
+    }
+
+    #[test]
+    fn test_search_latency_record_multiple() {
+        let m = Metrics::new();
+        m.record_search(1_000_000);
+        m.record_search(3_000_000);
+        assert_eq!(m.search_count(), 2);
+        // total = 4,000,000 ns → avg = 2,000,000 ns
+        assert_eq!(m.avg_search_latency_ns(), 2_000_000);
     }
 }

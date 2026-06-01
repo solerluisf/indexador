@@ -43,6 +43,21 @@ enum Commands {
 
         #[arg(long = "index-path", help = "Path to Tantivy search index directory")]
         index_path: Option<PathBuf>,
+
+        #[arg(long = "ram-buffer", default_value = "500000000", help = "IndexWriter RAM buffer in bytes (default: 500MB)")]
+        ram_buffer: u64,
+
+        #[arg(long = "extract-workers", help = "Number of extractor worker threads (default: cores - 2)")]
+        extract_workers: Option<usize>,
+
+        #[arg(long = "indexer-batch-size", default_value = "500", help = "Documents per indexer batch before flush")]
+        indexer_batch_size: usize,
+
+        #[arg(long = "commit-interval", default_value = "5000", help = "Documents between index commits")]
+        commit_interval: u64,
+
+        #[arg(long = "commit-timeout", default_value = "30", help = "Max seconds before forced commit")]
+        commit_timeout: u64,
     },
     Search {
         #[arg(short = 'd', long = "db", default_value = "jobs.db", help = "SQLite database path")]
@@ -141,7 +156,12 @@ fn main() -> Result<()> {
             db,
             log,
             index_path,
-        } => run_extract(input, output, db, log, index_path),
+            ram_buffer,
+            extract_workers,
+            indexer_batch_size,
+            commit_interval,
+            commit_timeout,
+        } => run_extract(input, output, db, log, index_path, ram_buffer, extract_workers, indexer_batch_size, commit_interval, commit_timeout),
         Commands::Search {
             db: _,
             index_path,
@@ -179,6 +199,11 @@ fn run_extract(
     db: PathBuf,
     log: PathBuf,
     index_path: Option<PathBuf>,
+    ram_buffer: u64,
+    extract_workers: Option<usize>,
+    indexer_batch_size: usize,
+    commit_interval: u64,
+    commit_timeout: u64,
 ) -> Result<()> {
     let log_file = std::fs::File::create(&log)
         .expect("Failed to create log file");
@@ -194,6 +219,11 @@ fn run_extract(
         input = %input.display(),
         output = %output.display(),
         db = %db.display(),
+        ram_buffer = ram_buffer,
+        extract_workers = extract_workers,
+        indexer_batch_size = indexer_batch_size,
+        commit_interval = commit_interval,
+        commit_timeout = commit_timeout,
         "Starting pdf_extractor"
     );
 
@@ -204,11 +234,18 @@ fn run_extract(
     let indexer = match &index_path {
         Some(path) => {
             std::fs::create_dir_all(path).ok();
-            let idx = Indexer::new(path)?;
-            info!(index_path = %path.display(), "Search index initialized");
+            let idx = Indexer::with_ram_buffer(path, ram_buffer)?;
+            info!(index_path = %path.display(), ram_buffer = ram_buffer, "Search index initialized");
             Some(Arc::new(idx))
         }
         None => None,
+    };
+
+    let pipeline_config = pipeline::PipelineConfig {
+        num_extract_workers: extract_workers,
+        indexer_batch_size: Some(indexer_batch_size),
+        commit_interval: Some(commit_interval),
+        commit_timeout: Some(commit_timeout),
     };
 
     pipeline::run_pipeline(
@@ -217,6 +254,7 @@ fn run_extract(
         Arc::clone(&metrics),
         &input,
         indexer,
+        &pipeline_config,
     )?;
 
     metrics.log_summary();

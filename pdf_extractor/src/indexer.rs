@@ -31,6 +31,7 @@ pub struct SearchIndex {
     pub math_tokens_field: Option<Field>,
     pub normalized_text_field: Option<Field>,
     pub language_field: Field,
+    ram_buffer: u64,
 }
 
 #[allow(dead_code)]
@@ -148,12 +149,29 @@ impl SearchIndex {
             math_tokens_field,
             normalized_text_field,
             language_field,
+            ram_buffer: 500_000_000,
         })
+    }
+
+    pub fn with_ram_buffer(index_path: &Path, ram_buffer: u64) -> Result<Self> {
+        let mut si = Self::new(index_path)?;
+        si.ram_buffer = ram_buffer;
+        Ok(si)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_ram_buffer(&mut self, bytes: u64) {
+        self.ram_buffer = bytes;
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ram_buffer(&self) -> u64 {
+        self.ram_buffer
     }
 
     pub fn writer(&self) -> Result<IndexWriter> {
         self.index
-            .writer(500_000_000)
+            .writer(self.ram_buffer as usize)
             .context("Failed to create index writer")
     }
 
@@ -751,6 +769,14 @@ impl Indexer {
         })
     }
 
+    pub fn with_ram_buffer(index_path: &Path, ram_buffer: u64) -> Result<Self> {
+        let search_index = SearchIndex::with_ram_buffer(index_path, ram_buffer)?;
+        Ok(Self {
+            search_index,
+            metrics: IndexerMetrics::new(),
+        })
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn index_document(&self, id: i64, path: &str, text: &str) -> Result<()> {
         let mut writer = self.search_index.writer()?;
@@ -916,7 +942,6 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
-}
 
 
     #[test]
@@ -2417,3 +2442,36 @@ fn test_search_fuzzy_with_path_filter() {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // --- ram_buffer ---
+
+    #[test]
+    fn test_search_index_default_ram_buffer() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        assert_eq!(idx.ram_buffer(), 500_000_000, "Default ram_buffer should be 500MB");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_index_with_ram_buffer() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::with_ram_buffer(&dir, 1_000_000_000).unwrap();
+        assert_eq!(idx.ram_buffer(), 1_000_000_000, "Custom ram_buffer should be 1GB");
+        // Verify the writer uses the custom value (doesn't crash)
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_index_set_ram_buffer() {
+        let dir = unique_index_dir();
+        let mut idx = SearchIndex::new(&dir).unwrap();
+        assert_eq!(idx.ram_buffer(), 500_000_000);
+        idx.set_ram_buffer(128_000_000);
+        assert_eq!(idx.ram_buffer(), 128_000_000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

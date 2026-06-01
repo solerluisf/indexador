@@ -17,9 +17,53 @@ use crate::scanner::{scan_directory, JobStore};
 
 const CHANNEL_CAPACITY: usize = 5000;
 const BATCH_SIZE: i64 = 100;
-const INDEXER_BATCH_SIZE: usize = 500;
-const INDEXER_COMMIT_INTERVAL: u64 = 5000;
-const INDEXER_COMMIT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_INDEXER_BATCH_SIZE: usize = 500;
+const DEFAULT_COMMIT_INTERVAL: u64 = 5000;
+const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 30;
+
+pub struct PipelineConfig {
+    pub num_extract_workers: Option<usize>,
+    pub indexer_batch_size: Option<usize>,
+    pub commit_interval: Option<u64>,
+    pub commit_timeout: Option<u64>,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            num_extract_workers: None,
+            indexer_batch_size: None,
+            commit_interval: None,
+            commit_timeout: None,
+        }
+    }
+}
+
+impl PipelineConfig {
+    pub fn extract_workers(&self) -> usize {
+        self.num_extract_workers
+            .map(|v| std::cmp::max(1, v))
+            .unwrap_or_else(|| std::cmp::max(1, num_cpus::get() - 2))
+    }
+
+    pub fn indexer_batch(&self) -> usize {
+        self.indexer_batch_size
+            .map(|v| if v == 0 { 1 } else { v })
+            .unwrap_or(DEFAULT_INDEXER_BATCH_SIZE)
+    }
+
+    pub fn commit_int(&self) -> u64 {
+        self.commit_interval
+            .map(|v| if v == 0 { 1 } else { v })
+            .unwrap_or(DEFAULT_COMMIT_INTERVAL)
+    }
+
+    pub fn commit_to(&self) -> u64 {
+        self.commit_timeout
+            .map(|v| if v == 0 { 1 } else { v })
+            .unwrap_or(DEFAULT_COMMIT_TIMEOUT_SECS)
+    }
+}
 
 struct ExtractorTask {
     id: i64,
@@ -52,6 +96,7 @@ pub fn run_pipeline(
     metrics: Arc<Metrics>,
     input: &PathBuf,
     indexer: Option<Arc<Indexer>>,
+    config: &PipelineConfig,
 ) -> Result<()> {
     let scanned = scan_directory(&jobs, input)?;
     tracing::info!(scanned = scanned, "Directory scan complete");
@@ -66,8 +111,11 @@ pub fn run_pipeline(
     let (task_tx, task_rx) = bounded::<ExtractorTask>(CHANNEL_CAPACITY);
     let (result_tx, result_rx) = bounded::<DocumentRecord>(CHANNEL_CAPACITY);
 
-    let num_workers = std::cmp::max(1, num_cpus::get() - 2);
-    tracing::info!(num_workers = num_workers, "Starting extractor pool");
+    let num_workers = config.extract_workers();
+    let indexer_batch_size = config.indexer_batch();
+    let commit_interval = config.commit_int();
+    let commit_timeout = config.commit_to();
+    tracing::info!(num_workers = num_workers, indexer_batch = indexer_batch_size, commit_interval = commit_interval, "Starting extractor pool");
 
     // Producer: claim pending jobs from DB and send to task channel
     let producer_jobs = Arc::clone(&jobs);
@@ -166,7 +214,7 @@ pub fn run_pipeline(
             let handle = thread::Builder::new()
                 .name("indexer".into())
                 .spawn(move || {
-                    indexer_thread(&*idx, index_rx, &metrics_for_indexer);
+                    indexer_thread(&*idx, index_rx, &metrics_for_indexer, indexer_batch_size, commit_interval, commit_timeout);
                 })
                 .expect("Failed to spawn indexer thread");
             Some(handle)
@@ -218,6 +266,9 @@ fn indexer_thread(
     indexer: &Indexer,
     rx: crossbeam_channel::Receiver<DocumentRecord>,
     metrics: &Metrics,
+    batch_size: usize,
+    commit_interval: u64,
+    commit_timeout: u64,
 ) {
     let index_writer = match indexer.search_index().writer() {
         Ok(w) => w,
@@ -227,18 +278,18 @@ fn indexer_thread(
         }
     };
 
-    let mut buf: Vec<DocumentRecord> = Vec::with_capacity(INDEXER_BATCH_SIZE);
+    let mut buf: Vec<DocumentRecord> = Vec::with_capacity(batch_size);
     let mut doc_count: u64 = 0;
     let mut last_commit = Instant::now();
     let writer = std::sync::Mutex::new(index_writer);
 
     loop {
-        let timeout = Duration::from_secs(INDEXER_COMMIT_TIMEOUT_SECS);
+        let timeout = Duration::from_secs(commit_timeout);
         let result = rx.recv_timeout(timeout);
         match result {
             Ok(record) => {
                 buf.push(record);
-                if buf.len() >= INDEXER_BATCH_SIZE {
+                if buf.len() >= batch_size {
                     let batch: Vec<DocumentRecord> = buf.drain(..).collect();
                     flush_batch(&writer, indexer, &batch);
                     doc_count += batch.len() as u64;
@@ -255,8 +306,8 @@ fn indexer_thread(
         }
 
         let should_commit = !buf.is_empty()
-            && (doc_count >= INDEXER_COMMIT_INTERVAL
-                || last_commit.elapsed() > Duration::from_secs(INDEXER_COMMIT_TIMEOUT_SECS));
+            && (doc_count >= commit_interval
+                || last_commit.elapsed() > Duration::from_secs(commit_timeout));
         if should_commit {
             if let Ok(mut w) = writer.lock() {
                 if w.commit().is_ok() {
@@ -808,5 +859,104 @@ mod tests {
         // None → auto-detect; even on a 1-core machine the result should be ≥1
         let result = resolve_ocr_workers(None);
         assert!(result >= 1, "Auto-detect should yield at least 1 worker, got {}", result);
+    }
+
+    // --- PipelineConfig ---
+
+    #[test]
+    fn test_pipeline_config_default_extract_workers() {
+        let cfg = PipelineConfig::default();
+        let workers = cfg.extract_workers();
+        assert!(workers >= 1, "Default workers should be ≥1, got {}", workers);
+    }
+
+    #[test]
+    fn test_pipeline_config_custom_extract_workers() {
+        let cfg = PipelineConfig {
+            num_extract_workers: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(cfg.extract_workers(), 4);
+    }
+
+    #[test]
+    fn test_pipeline_config_extract_workers_clamps_zero() {
+        let cfg = PipelineConfig {
+            num_extract_workers: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(cfg.extract_workers(), 1, "Zero workers should clamp to 1");
+    }
+
+    #[test]
+    fn test_pipeline_config_default_indexer_batch() {
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.indexer_batch(), DEFAULT_INDEXER_BATCH_SIZE);
+    }
+
+    #[test]
+    fn test_pipeline_config_custom_indexer_batch() {
+        let cfg = PipelineConfig {
+            indexer_batch_size: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(cfg.indexer_batch(), 100);
+    }
+
+    #[test]
+    fn test_pipeline_config_indexer_batch_clamps_zero() {
+        let cfg = PipelineConfig {
+            indexer_batch_size: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(cfg.indexer_batch(), 1, "Zero batch should clamp to 1");
+    }
+
+    #[test]
+    fn test_pipeline_config_default_commit_interval() {
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.commit_int(), DEFAULT_COMMIT_INTERVAL);
+    }
+
+    #[test]
+    fn test_pipeline_config_custom_commit_interval() {
+        let cfg = PipelineConfig {
+            commit_interval: Some(1000),
+            ..Default::default()
+        };
+        assert_eq!(cfg.commit_int(), 1000);
+    }
+
+    #[test]
+    fn test_pipeline_config_commit_interval_clamps_zero() {
+        let cfg = PipelineConfig {
+            commit_interval: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(cfg.commit_int(), 1, "Zero interval should clamp to 1");
+    }
+
+    #[test]
+    fn test_pipeline_config_default_commit_timeout() {
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.commit_to(), DEFAULT_COMMIT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_pipeline_config_custom_commit_timeout() {
+        let cfg = PipelineConfig {
+            commit_timeout: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(cfg.commit_to(), 60);
+    }
+
+    #[test]
+    fn test_pipeline_config_commit_timeout_clamps_zero() {
+        let cfg = PipelineConfig {
+            commit_timeout: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(cfg.commit_to(), 1, "Zero timeout should clamp to 1");
     }
 }

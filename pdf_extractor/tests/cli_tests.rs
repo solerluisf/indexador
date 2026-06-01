@@ -2815,3 +2815,171 @@ fn test_list_fields() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// --- Phase 7: configurable performance parameters ---
+
+#[test]
+fn test_extract_with_custom_ram_buffer() {
+    let dir = test_dir("extract_ram_buffer");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+
+    let status = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--index-path", index_path.to_str().unwrap(),
+            "--ram-buffer", "256000000",
+        ])
+        .status()
+        .expect("Failed to run pdf_extractor extract with custom ram buffer");
+    assert!(status.success(), "Extract with custom ram buffer should succeed");
+    assert!(index_path.join("meta.json").exists(), "Index should be created");
+    assert!(output_path.exists(), "Output JSONL should exist");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_extract_with_custom_extract_workers() {
+    let dir = test_dir("extract_workers");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+
+    let status = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--index-path", index_path.to_str().unwrap(),
+            "--extract-workers", "2",
+        ])
+        .status()
+        .expect("Failed to run pdf_extractor extract with custom extract workers");
+    assert!(status.success(), "Extract with custom extract workers should succeed");
+    assert!(index_path.join("meta.json").exists(), "Index should be created");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_extract_with_custom_indexer_config() {
+    let dir = test_dir("extract_indexer_config");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+
+    let status = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--index-path", index_path.to_str().unwrap(),
+            "--indexer-batch-size", "100",
+            "--commit-interval", "1000",
+            "--commit-timeout", "10",
+        ])
+        .status()
+        .expect("Failed to run pdf_extractor extract with custom indexer config");
+    assert!(status.success(), "Extract with custom indexer config should succeed");
+    assert!(index_path.join("meta.json").exists(), "Index should be created");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_extract_with_zero_extract_workers() {
+    let dir = test_dir("extract_workers_zero");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc.pdf"), "hello world");
+
+    // --extract-workers 0 should be clamped to 1, so the command should still succeed
+    let status = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--index-path", index_path.to_str().unwrap(),
+            "--extract-workers", "0",
+        ])
+        .status()
+        .expect("Failed to run pdf_extractor extract with zero workers");
+    assert!(status.success(), "Extract with --extract-workers 0 should succeed (clamped to 1)");
+    assert!(index_path.join("meta.json").exists(), "Index should be created");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_extract_with_all_tuning_flags() {
+    let dir = test_dir("extract_all_tuning");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    // Use multiple PDFs to exercise the pipeline
+    for i in 0..5 {
+        create_test_pdf(&pdf_dir.join(format!("doc{}.pdf", i)), &format!("document number {}", i));
+    }
+
+    let status = Command::new(binary_path())
+        .args([
+            "extract",
+            "-i", pdf_dir.to_str().unwrap(),
+            "-o", output_path.to_str().unwrap(),
+            "-d", db_path.to_str().unwrap(),
+            "-l", log_path.to_str().unwrap(),
+            "--index-path", index_path.to_str().unwrap(),
+            "--ram-buffer", "128000000",
+            "--extract-workers", "3",
+            "--indexer-batch-size", "50",
+            "--commit-interval", "500",
+            "--commit-timeout", "5",
+        ])
+        .status()
+        .expect("Failed to run pdf_extractor extract with all tuning flags");
+    assert!(status.success(), "Extract with all tuning flags should succeed");
+    assert!(index_path.join("meta.json").exists(), "Index should be created");
+    assert!(output_path.exists(), "Output JSONL should exist");
+
+    // Verify all docs were indexed by searching
+    let out = Command::new(binary_path())
+        .args(["search", "-d", "nonexistent.db", "--index-path", index_path.to_str().unwrap(), "document"])
+        .output()
+        .expect("Search after tuned extract should succeed");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found"), "Search should find results after tuned extract");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
