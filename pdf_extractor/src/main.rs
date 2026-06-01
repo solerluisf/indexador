@@ -89,6 +89,12 @@ enum Commands {
 
         #[arg(long = "field", help = "Search in a specific indexed field (e.g. normalized_text, content_jp, content_zh)")]
         field: Option<String>,
+
+        #[arg(long = "boost-field", help = "Field boost in format 'name:weight' (e.g. 'normalized_text:2.0'). Can be specified multiple times. When used, searches across supplied fields with per-field weights via BoostQuery.")]
+        boost_field: Vec<String>,
+
+        #[arg(long = "recency-weight", default_value = "0.0", help = "Recency boost weight (0.0-1.0). Multiplies score by recency factor based on ingested_at timestamp.")]
+        recency_weight: f32,
     },
     IndexStats {
         #[arg(long = "index-path", help = "Path to Tantivy search index directory")]
@@ -173,7 +179,9 @@ fn main() -> Result<()> {
             fuzzy_distance,
             stem,
             field,
-        } => run_search(index_path, query, limit, offset, path_filter, json, fuzzy_distance, stem, field),
+            boost_field,
+            recency_weight,
+        } => run_search(index_path, query, limit, offset, path_filter, json, fuzzy_distance, stem, field, boost_field, recency_weight),
         Commands::IndexStats { index_path } => run_index_stats(index_path),
         Commands::IndexOptimize { index_path } => run_index_optimize(index_path),
         Commands::DeleteFromIndex { index_path, path, id } => run_delete_from_index(index_path, path, id),
@@ -269,10 +277,24 @@ fn run_extract(
     Ok(())
 }
 
-fn run_search(index_path: PathBuf, query: String, limit: usize, offset: usize, path_filter: Option<String>, json: bool, fuzzy_distance: u8, stem: bool, field: Option<String>) -> Result<()> {
+fn run_search(index_path: PathBuf, query: String, limit: usize, offset: usize, path_filter: Option<String>, json: bool, fuzzy_distance: u8, stem: bool, field: Option<String>, boost_field: Vec<String>, recency_weight: f32) -> Result<()> {
     let indexer = Indexer::new(&index_path)?;
 
-    let results = if let Some(field_name) = field {
+    let results = if !boost_field.is_empty() {
+        // Parse boost-field args as "name:weight"
+        let mut fields: Vec<(&str, f32)> = Vec::new();
+        for bf in &boost_field {
+            if let Some((name, weight_str)) = bf.split_once(':') {
+                let weight: f32 = weight_str.parse().unwrap_or(1.0);
+                fields.push((name, weight));
+            } else {
+                fields.push((bf.as_str(), 1.0));
+            }
+        }
+        indexer.search_index().search_weighted_fields(
+            &query, &fields, limit, path_filter.as_deref(), offset,
+        )?
+    } else if let Some(field_name) = field {
         let si = indexer.search_index();
         // Validate early: provide helpful error with valid fields.
         if si.schema.get_field(&field_name).is_err() {
@@ -286,9 +308,20 @@ fn run_search(index_path: PathBuf, query: String, limit: usize, offset: usize, p
             &query, &field_name, limit, path_filter.as_deref(), offset, fuzzy_distance, stem,
         )?
     } else if fuzzy_distance > 0 {
-        indexer.search_index().search_fuzzy_stem(&query, limit, path_filter.as_deref(), offset, fuzzy_distance, stem)?
+        indexer.search_index().search_fuzzy_stem(
+            &query, limit, path_filter.as_deref(), offset, fuzzy_distance, stem,
+        )?
     } else {
-        indexer.search_index().search_stem(&query, limit, path_filter.as_deref(), offset, stem)?
+        indexer.search_index().search_stem(
+            &query, limit, path_filter.as_deref(), offset, stem,
+        )?
+    };
+
+    // Apply recency boost if weight > 0
+    let results = if recency_weight > 0.0 {
+        indexer.search_index().apply_recency_boost(results, recency_weight, 365)
+    } else {
+        results
     };
 
     if json {

@@ -2983,3 +2983,351 @@ fn test_extract_with_all_tuning_flags() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// --- Phase 8: Boost field integration tests ---
+
+fn run_search_boost(index_path: &PathBuf, query: &str, boosts: &[&str]) -> std::process::Output {
+    let mut args: Vec<String> = vec![
+        "search".into(),
+        "-d".into(), "nonexistent.db".into(),
+        "--index-path".into(), index_path.to_str().unwrap().into(),
+    ];
+    for b in boosts {
+        args.push("--boost-field".into());
+        args.push(b.to_string());
+    }
+    args.push(query.to_string());
+    Command::new(binary_path())
+        .args(&args)
+        .output()
+        .expect("Failed to run search with --boost-field")
+}
+
+#[test]
+fn test_boost_field_single() {
+    let dir = test_dir("boost_single");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "rust programming language");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Single boost field
+    let out = run_search_boost(&index_path, "rust", &["content_norm:2.0"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Boost search should find results");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_boost_field_multiple() {
+    let dir = test_dir("boost_multi");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "rust programming language");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Multiple boost fields
+    let out = run_search_boost(&index_path, "rust", &["content_norm:1.5", "content_raw:1.0"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Multi-boost search should find results");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_boost_field_no_results() {
+    let dir = test_dir("boost_no_results");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = run_search_boost(&index_path, "nonexistent", &["content_norm:2.0"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No results found"), "Boost search with no match should report no results");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_boost_field_json_output() {
+    let dir = test_dir("boost_json");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "test document");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let args: Vec<String> = vec![
+        "search".into(),
+        "-d".into(), "nonexistent.db".into(),
+        "--index-path".into(), index_path.to_str().unwrap().into(),
+        "--json".into(),
+        "--boost-field".into(), "content_norm:2.0".into(),
+        "test".into(),
+    ];
+    let out = Command::new(binary_path())
+        .args(&args)
+        .output()
+        .expect("Failed to run boost search with JSON");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed.is_array());
+    assert_eq!(parsed.as_array().unwrap().len(), 1);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Phase 8: Recency weight integration tests ---
+
+fn run_search_recency(index_path: &PathBuf, query: &str, recency_weight: &str) -> std::process::Output {
+    Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--recency-weight", recency_weight,
+            query,
+        ])
+        .output()
+        .expect("Failed to run search with --recency-weight")
+}
+
+#[test]
+fn test_recency_weight_flag() {
+    let dir = test_dir("recency_weight");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "test content");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = run_search_recency(&index_path, "test", "0.5");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Recency-boosted search should find results");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_recency_weight_zero() {
+    let dir = test_dir("recency_zero");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "test content");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = run_search_recency(&index_path, "test", "0.0");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Zero recency weight should work same as default");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_recency_weight_max() {
+    let dir = test_dir("recency_max");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "test content");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    let out = run_search_recency(&index_path, "test", "1.0");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Max recency weight should still work");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_recency_weight_with_boost_field() {
+    let dir = test_dir("recency_boost_combined");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "test content");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Combined: --boost-field + --recency-weight
+    let args: Vec<String> = vec![
+        "search".into(),
+        "-d".into(), "nonexistent.db".into(),
+        "--index-path".into(), index_path.to_str().unwrap().into(),
+        "--boost-field".into(), "content_norm:2.0".into(),
+        "--recency-weight".into(), "0.5".into(),
+        "test".into(),
+    ];
+    let out = Command::new(binary_path())
+        .args(&args)
+        .output()
+        .expect("Failed to run combined boost + recency search");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Combined boost + recency should find results");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Phase 8 error flow integration tests ---
+
+#[test]
+fn test_boost_field_invalid_format_defaults_to_one() {
+    let dir = test_dir("boost_invalid");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Bad weight format: silently defaults to 1.0, search should succeed
+    let out = run_search_boost(&index_path, "hello", &["content_norm:abc"]);
+    assert!(out.status.success(), "Invalid weight should silently default to 1.0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Boost with invalid weight should still find results");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_boost_field_without_colon_uses_default_weight() {
+    let dir = test_dir("boost_no_colon");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // No colon → treated as field name with default weight 1.0
+    let out = run_search_boost(&index_path, "hello", &["content_norm"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Boost with only field name (no colon) should use default weight");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_boost_field_nonexistent_field_returns_no_results() {
+    let dir = test_dir("boost_nonexistent");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Nonexistent field → silently skipped → no query clauses → no results
+    let out = run_search_boost(&index_path, "hello", &["nonexistent_field:2.0"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No results found"), "Nonexistent boost field should silently produce no results");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_recency_weight_negative() {
+    let dir = test_dir("recency_negative");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // Use --recency-weight=-0.5 (equals sign) to avoid clap parsing -0 as a flag
+    let out = Command::new(binary_path())
+        .args([
+            "search",
+            "-d", "nonexistent.db",
+            "--index-path", index_path.to_str().unwrap(),
+            "--recency-weight=-0.5",
+            "hello",
+        ])
+        .output()
+        .expect("Failed to run search with negative recency weight");
+    assert!(out.status.success(), "Negative recency weight should not error");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "Negative recency weight should still return results unchanged");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_boost_field_with_field_flag_boost_takes_priority() {
+    let dir = test_dir("boost_with_field");
+    let pdf_dir = dir.join("pdfs");
+    let output_path = dir.join("documents.jsonl");
+    let db_path = dir.join("jobs.db");
+    let log_path = dir.join("extractor.log");
+    let index_path = dir.join("index");
+
+    create_test_pdf(&pdf_dir.join("doc1.pdf"), "hello world");
+    run_extract(&pdf_dir, &output_path, &db_path, &log_path, &index_path);
+
+    // --boost-field takes priority over --field; should succeed either way
+    let args: Vec<String> = vec![
+        "search".into(),
+        "-d".into(), "nonexistent.db".into(),
+        "--index-path".into(), index_path.to_str().unwrap().into(),
+        "--boost-field".into(), "content_norm:2.0".into(),
+        "--field".into(), "content_norm".into(),
+        "hello".into(),
+    ];
+    let out = Command::new(binary_path())
+        .args(&args)
+        .output()
+        .expect("Failed to run boost-field with --field");
+    assert!(out.status.success(), "boost-field with --field should still succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Found 1 result(s)"), "boost-field should take priority, finding 1 result");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

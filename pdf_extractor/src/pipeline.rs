@@ -343,9 +343,13 @@ fn flush_batch(
         Ok(w) => w,
         Err(_) => return,
     };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     for record in batch {
         let math_source = record.math_source.as_deref().unwrap_or("");
-        if let Err(e) = indexer.search_index().add_document(
+        if let Err(e) = indexer.search_index().add_document_with_ts(
             &mut w,
             record.id,
             &record.path,
@@ -354,6 +358,7 @@ fn flush_batch(
             &record.text,
             record.language.as_deref().unwrap_or(""),
             math_source,
+            now,
         ) {
             tracing::error!(id = record.id, error = %e, "Failed to index document");
         }

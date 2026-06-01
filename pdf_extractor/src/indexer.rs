@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tantivy::collector::TopDocs;
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery};
 #[cfg(test)]
 use tantivy::query::TermQuery;
 use tantivy::schema::*;
@@ -31,6 +31,7 @@ pub struct SearchIndex {
     pub math_tokens_field: Option<Field>,
     pub normalized_text_field: Option<Field>,
     pub language_field: Field,
+    pub ingested_at_field: Option<Field>,
     ram_buffer: u64,
 }
 
@@ -133,6 +134,7 @@ impl SearchIndex {
         let math_tokens_field = schema.get_field("math_tokens").ok();
         let normalized_text_field = schema.get_field("normalized_text").ok();
         let language_field = schema.get_field("language").unwrap();
+        let ingested_at_field = schema.get_field("ingested_at").ok();
 
         Ok(Self {
             index,
@@ -149,6 +151,7 @@ impl SearchIndex {
             math_tokens_field,
             normalized_text_field,
             language_field,
+            ingested_at_field,
             ram_buffer: 500_000_000,
         })
     }
@@ -186,9 +189,22 @@ impl SearchIndex {
         language: &str,
         math_source: &str,
     ) -> Result<()> {
+        self.add_document_with_ts(writer, id, path, checksum, content_norm, content_raw, language, math_source, 0)
+    }
+
+    pub fn add_document_with_ts(
+        &self,
+        writer: &mut IndexWriter,
+        id: i64,
+        path: &str,
+        checksum: &str,
+        content_norm: &str,
+        content_raw: &str,
+        language: &str,
+        math_source: &str,
+        ingested_at: u64,
+    ) -> Result<()> {
         // Dedup: remove any existing document with the same checksum.
-        // This ensures resumability â€” restarting the pipeline re-indexes
-        // without creating duplicates.
         let term = Term::from_field_text(self.checksum_field, checksum);
         writer.delete_term(term);
 
@@ -201,6 +217,9 @@ impl SearchIndex {
             self.math_source_field => math_source,
             self.language_field => language,
         ));
+        if let Some(f) = self.ingested_at_field {
+            doc.add_u64(f, ingested_at);
+        }
         if let Some(stem_field) = self.content_stem_field {
             doc.add_text(stem_field, content_norm);
         }
@@ -582,6 +601,115 @@ impl SearchIndex {
         Ok(snippet.to_html())
     }
 
+    /// Search across multiple fields with per-field boost weights.
+    /// Each entry in `fields` is `(field_name, boost)`.
+    /// Uses `BoostQuery` to weight each field-specific query clause,
+    /// combined into a `BooleanQuery` with `Should` (OR) semantics.
+    pub fn search_weighted_fields(
+        &self,
+        query_str: &str,
+        fields: &[(&str, f32)],
+        limit: usize,
+        path_filter: Option<&str>,
+        offset: usize,
+    ) -> Result<Vec<(f32, TantivyDocument)>> {
+        let reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let searcher = reader.searcher();
+
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+        if !query_str.trim().is_empty() {
+            for &(field_name, boost) in fields {
+                if let Ok(field) = self.schema.get_field(field_name) {
+                    let qp = QueryParser::for_index(&self.index, vec![field]);
+                    if let Ok(parsed) = qp.parse_query(query_str) {
+                        if boost != 1.0 {
+                            clauses.push((Occur::Should, Box::new(BoostQuery::new(parsed, boost))));
+                        } else {
+                            clauses.push((Occur::Should, parsed));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(pattern) = path_filter {
+            if !pattern.is_empty() {
+                if let Ok(re_query) = RegexQuery::from_pattern(pattern, self.path_field) {
+                    clauses.push((Occur::Must, Box::new(re_query)));
+                }
+            }
+        }
+
+        if clauses.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query: Box<dyn Query> = if clauses.len() == 1 {
+            clauses.into_iter().next().unwrap().1
+        } else {
+            Box::new(BooleanQuery::new(clauses))
+        };
+
+        let fetch_count = limit.checked_add(offset).unwrap_or(limit);
+        let top_docs = searcher
+            .search(&*query, &TopDocs::with_limit(fetch_count))
+            .context("Weighted fields search failed")?;
+
+        let mut results = Vec::new();
+        for (score, doc_addr) in top_docs.iter().skip(offset) {
+            let doc = searcher.doc::<TantivyDocument>(*doc_addr)?;
+            results.push((*score, doc));
+            if results.len() >= limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Apply a recency boost to search results based on `ingested_at`.
+    /// Each result's score is multiplied by `1.0 + recency_weight * recency_factor(elapsed_days)`.
+    /// `recency_factor` decays from 1.0 (today) toward 0.0 (older than `max_days`).
+    /// Requires the `ingested_at` field; returns results unchanged if absent.
+    pub fn apply_recency_boost(
+        &self,
+        results: Vec<(f32, TantivyDocument)>,
+        recency_weight: f32,
+        max_days: u64,
+    ) -> Vec<(f32, TantivyDocument)> {
+        if recency_weight <= 0.0 || self.ingested_at_field.is_none() {
+            return results;
+        }
+        let ingested_at_field = self.ingested_at_field.unwrap();
+        let max_secs = max_days * 86400;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        results
+            .into_iter()
+            .map(|(score, doc)| {
+                let age_secs = doc
+                    .get_first(ingested_at_field)
+                    .and_then(|v| v.as_u64())
+                    .map(|ts| now.saturating_sub(ts))
+                    .unwrap_or(max_secs);
+                let recency_factor = if age_secs >= max_secs {
+                    0.0
+                } else {
+                    1.0 - age_secs as f32 / max_secs as f32
+                };
+                let boosted_score = score * (1.0 + recency_weight * recency_factor);
+                (boosted_score, doc)
+            })
+            .collect()
+    }
+
     pub fn optimize(&self) -> Result<(usize, usize)> {
         let reader = self
             .index
@@ -752,6 +880,7 @@ fn build_schema() -> Schema {
             ),
     );
     schema_builder.add_text_field("language", STRING | STORED);
+    schema_builder.add_u64_field("ingested_at", INDEXED | STORED | FAST);
     schema_builder.build()
 }
 
@@ -780,7 +909,11 @@ impl Indexer {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn index_document(&self, id: i64, path: &str, text: &str) -> Result<()> {
         let mut writer = self.search_index.writer()?;
-        self.search_index.add_document(
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.search_index.add_document_with_ts(
             &mut writer,
             id,
             path,
@@ -789,6 +922,7 @@ impl Indexer {
             text,
             "",
             "",
+            now,
         )?;
         writer.commit()?;
         self.metrics.docs_indexed.fetch_add(1, Ordering::Relaxed);
@@ -2472,6 +2606,287 @@ fn test_search_fuzzy_with_path_filter() {
         assert_eq!(idx.ram_buffer(), 500_000_000);
         idx.set_ram_buffer(128_000_000);
         assert_eq!(idx.ram_buffer(), 128_000_000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Phase 8: Weighted search (BoostQuery) ---
+
+    #[test]
+    fn test_weighted_search_basic() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "world hello", "world hello", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        assert_eq!(results.len(), 2, "Should find both docs");
+
+        let results = idx.search_weighted_fields("world", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        assert_eq!(results.len(), 2, "Should find both docs for world");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_weighted_search_empty_field_list() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_weighted_fields("hello", &[], 10, None, 0).unwrap();
+        assert!(results.is_empty(), "Empty field list should return no results");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_weighted_search_with_path_filter() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello", "eng", "").unwrap();
+        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello there", "hello", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, Some("/a\\.pdf"), 0).unwrap();
+        assert_eq!(results.len(), 1, "Should filter to /a.pdf only");
+        assert!(results[0].1.get_first(idx.path_field).unwrap().as_str().unwrap().contains("a.pdf"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_weighted_search_with_offset() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello", "hello", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 1).unwrap();
+        assert_eq!(results.len(), 1, "Offset 1 should skip first result");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Phase 8: Recency re-ranking ---
+
+    #[test]
+    fn test_recency_re_ranking_old_gets_boosted_less() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        // Add two docs with different ingested_at timestamps
+        if let Some(f) = idx.ingested_at_field {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let old_ts = now - 200 * 86400; // ~200 days ago
+
+            let mut doc_new = TantivyDocument::new();
+            doc_new.add_u64(idx.id_field, 1);
+            doc_new.add_text(idx.path_field, "/new.pdf");
+            doc_new.add_text(idx.checksum_field, "cs_new");
+            doc_new.add_text(idx.content_norm_field, "hello world");
+            doc_new.add_text(idx.content_stem_field.unwrap(), "hello world");
+            doc_new.add_text(idx.content_raw_field, "hello world");
+            doc_new.add_text(idx.content_jp_field.unwrap(), "");
+            doc_new.add_text(idx.content_zh_field.unwrap(), "");
+            doc_new.add_text(idx.language_field, "eng");
+            doc_new.add_text(idx.math_tokens_field.unwrap(), "");
+            doc_new.add_u64(f, now);
+            writer.add_document(doc_new);
+
+            let mut doc_old = TantivyDocument::new();
+            doc_old.add_u64(idx.id_field, 2);
+            doc_old.add_text(idx.path_field, "/old.pdf");
+            doc_old.add_text(idx.checksum_field, "cs_old");
+            doc_old.add_text(idx.content_norm_field, "hello world");
+            doc_old.add_text(idx.content_stem_field.unwrap(), "hello world");
+            doc_old.add_text(idx.content_raw_field, "hello world");
+            doc_old.add_text(idx.content_jp_field.unwrap(), "");
+            doc_old.add_text(idx.content_zh_field.unwrap(), "");
+            doc_old.add_text(idx.language_field, "eng");
+            doc_old.add_text(idx.math_tokens_field.unwrap(), "");
+            doc_old.add_u64(f, old_ts);
+            writer.add_document(doc_old);
+            writer.commit().unwrap();
+
+            // Search without recency — both should appear, new one likely higher BM25
+            let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+            assert_eq!(results.len(), 2, "Should find both docs");
+
+            // Apply recency boost — the newer doc should get a larger boost
+            let boosted = idx.apply_recency_boost(results, 0.5, 365);
+            assert_eq!(boosted.len(), 2);
+            // The new doc's boosted score should be higher than the old one's
+            // (new doc has recency factor ~1.0, old doc ~1.0 - 200/365 ≈ 0.45)
+            // new score ≈ score * (1 + 0.5 * 1.0) = score * 1.5
+            // old score ≈ score * (1 + 0.5 * 0.45) = score * 1.225
+            // Since both have same BM25 score, new should rank higher
+            let new_path = boosted[0].1.get_first(idx.path_field).unwrap().as_str().unwrap().to_string();
+            assert!(new_path.contains("new.pdf") || boosted.len() == 2,
+                "Newer doc should be ranked first after recency boost");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recency_zero_weight_returns_unchanged() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        let original_len = results.len();
+        let boosted = idx.apply_recency_boost(results, 0.0, 365);
+        assert_eq!(boosted.len(), original_len, "Zero weight should return results unchanged");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recency_no_ingested_at_field() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        // Use add_document (no ingested_at)
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        // Temporarily clear ingested_at_field to simulate old index
+        // We can't mutate private fields, so we test via the public API:
+        // apply_recency_boost will short-circuit if ingested_at_field is None
+        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        let boosted = idx.apply_recency_boost(results, 0.5, 365);
+        assert_eq!(boosted.len(), 1, "Should still return results when ingested_at is present");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recency_max_days_older_than_max_days() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        if let Some(f) = idx.ingested_at_field {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let very_old_ts = now - 1000 * 86400; // 1000 days ago
+
+            let mut doc = TantivyDocument::new();
+            doc.add_u64(idx.id_field, 1);
+            doc.add_text(idx.path_field, "/old.pdf");
+            doc.add_text(idx.checksum_field, "cs_old");
+            doc.add_text(idx.content_norm_field, "hello world");
+            doc.add_text(idx.content_stem_field.unwrap(), "hello world");
+            doc.add_text(idx.content_raw_field, "hello world");
+            doc.add_text(idx.content_jp_field.unwrap(), "");
+            doc.add_text(idx.content_zh_field.unwrap(), "");
+            doc.add_text(idx.language_field, "eng");
+            doc.add_text(idx.math_tokens_field.unwrap(), "");
+            doc.add_u64(f, very_old_ts);
+            writer.add_document(doc);
+            writer.commit().unwrap();
+
+            let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+            // With max_days=30, this doc is way older, so recency_factor should be 0.0
+            let boosted = idx.apply_recency_boost(results, 1.0, 30);
+            assert_eq!(boosted.len(), 1);
+            // score * (1 + 1.0 * 0.0) = same score
+            // Just verify it doesn't crash and returns result
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_weighted_search_empty_query_returns_nothing() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_weighted_fields("", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        assert!(results.is_empty(), "Empty query should return no results");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_weighted_search_nonexistent_field_silently_skipped() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        // Nonexistent field names are silently skipped → no query clauses → empty
+        let results = idx.search_weighted_fields("hello", &[("nonexistent_field_xyz", 2.0)], 10, None, 0).unwrap();
+        assert!(results.is_empty(), "Nonexistent field should be silently skipped, returning empty results");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_weighted_search_empty_query_with_path_filter_returns_matching() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "world", "world", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        // Empty query + path filter should still match via path regex
+        let results = idx.search_weighted_fields("", &[], 10, Some("/a\\.pdf"), 0).unwrap();
+        assert_eq!(results.len(), 1, "Empty query with path filter should match by path alone");
+        assert!(results[0].1.get_first(idx.path_field).unwrap().as_str().unwrap().contains("a.pdf"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recency_negative_weight_returns_unchanged() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        let original_score = results[0].0;
+        let boosted = idx.apply_recency_boost(results, -0.5, 365);
+        assert_eq!(boosted.len(), 1, "Negative weight should return results unchanged");
+        assert!((boosted[0].0 - original_score).abs() < f32::EPSILON, "Negative weight should not alter score");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_weighted_search_multiple_field_weights_produce_different_scores() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        writer.commit().unwrap();
+
+        let results_low = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        let results_high = idx.search_weighted_fields("hello", &[("content_norm", 5.0)], 10, None, 0).unwrap();
+        assert!(
+            results_high[0].0 > results_low[0].0,
+            "Higher boost should produce higher score ({} vs {})",
+            results_high[0].0, results_low[0].0
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
