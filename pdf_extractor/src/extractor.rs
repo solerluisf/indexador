@@ -3,7 +3,6 @@ use lopdf::content::Operation;
 use lopdf::{Document, Object};
 use regex::Regex;
 use std::path::Path;
-use tracing::warn;
 
 /// Lazily-initialized regex for cleaning word text to match Tantivy's
 /// `[\p{L}\p{N}\p{S}]+` tokenizer pattern.
@@ -399,7 +398,6 @@ pub fn extract_pdf(path: &Path) -> Result<ExtractionResult> {
 
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        warn!(path = %path.display(), "No text extracted, marking for OCR");
         return Ok(ExtractionResult {
             text: String::new(),
             ocr_flag: true,

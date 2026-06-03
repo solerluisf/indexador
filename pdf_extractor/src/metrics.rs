@@ -1,6 +1,4 @@
-use chrono::Local;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::Instant;
 
 pub struct Metrics {
@@ -13,7 +11,6 @@ pub struct Metrics {
     search_count: AtomicU64,
     search_time_ns: AtomicU64,
     start: Instant,
-    last_log: Mutex<Instant>,
 }
 
 impl Metrics {
@@ -28,7 +25,6 @@ impl Metrics {
             search_count: AtomicU64::new(0),
             search_time_ns: AtomicU64::new(0),
             start: Instant::now(),
-            last_log: Mutex::new(Instant::now()),
         }
     }
 
@@ -94,25 +90,6 @@ impl Metrics {
     }
 
     pub fn log_summary(&self) {
-        let now = Instant::now();
-        let since_last = now.duration_since(*self.last_log.lock().unwrap()).as_secs_f64();
-        if since_last >= 5.0 {
-            *self.last_log.lock().unwrap() = now;
-            tracing::info!(
-                timestamp = %Local::now().format("%Y-%m-%dT%H:%M:%S"),
-                docs_processed = self.processed(),
-                docs_errored = self.errored(),
-                task_queue_depth = self.task_queue_depth.load(Ordering::Relaxed),
-                result_queue_depth = self.result_queue_depth.load(Ordering::Relaxed),
-                indexer_docs_indexed = self.indexer_docs_indexed.load(Ordering::Relaxed),
-                indexer_last_commit_age_secs = self.indexer_last_commit_age.load(Ordering::Relaxed),
-                search_count = self.search_count.load(Ordering::Relaxed),
-                avg_search_latency_us = self.avg_search_latency_ns() / 1000,
-                throughput_docs_per_sec = format!("{:.2}", self.throughput()),
-                elapsed_secs = format!("{:.1}", self.elapsed_secs()),
-                "Metrics snapshot"
-            );
-        }
     }
 
 }

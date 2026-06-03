@@ -9,8 +9,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 anyhow = "1"
 unicode-normalization = "0.1"
 chrono = "0.4"
@@ -24,6 +22,22 @@ regex = "1.12.3"
 imageproc = "0.25"
 whatlang = "0.18.0"
 lindera = { version = "3", default-features = false, features = ["embed-ipadic"] }
+tracing = "0.1"
+windows = { version = "0.58", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Data_Pdf",
+    "Storage",
+    "Storage_Streams",
+] }
+lru = { version = "0.12", optional = true }
+
+[features]
+default = []
+pdf_viewer = ["dep:windows", "dep:lru"]
 
 [lib]
 name = "pdf_extractor"
@@ -32,4 +46,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "tesseract_worker"
 path = "src/bin/tesseract_worker.rs"
+
+[[bin]]
+name = "pdf_viewer"
+path = "src/bin/pdf_viewer.rs"
+required-features = ["pdf_viewer"]
 

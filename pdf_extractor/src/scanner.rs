@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tracing::{info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 pub struct JobStore {
@@ -83,7 +82,6 @@ impl JobStore {
             .context("Failed to upsert file")?;
 
         if changed > 0 {
-            info!(path, "New or changed file registered");
             Ok(true)
         } else {
             Ok(false)
@@ -361,9 +359,8 @@ pub fn scan_directory(jobs: &JobStore, dir: &Path) -> Result<u64> {
                     scanned += 1;
                 }
             }
-            Err(e) => {
-                warn!(path = %path_str, error = %e, "Failed to compute checksum, skipping");
-            }
+            Err(_e) => {}
+
         }
     }
 

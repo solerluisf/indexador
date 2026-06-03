@@ -100,133 +100,6 @@ fn reset_state() {
 }
 
 // ---------------------------------------------------------------------------
-// Logging bridge
-// ---------------------------------------------------------------------------
-
-type LogCallback = extern "C" fn(message: *const c_char, level: u32);
-
-static LOG_CB: OnceLock<Mutex<Option<LogCallback>>> = OnceLock::new();
-
-fn log_cb() -> &'static Mutex<Option<LogCallback>> {
-    LOG_CB.get_or_init(|| Mutex::new(None))
-}
-
-// ── Direct file logging (always works, no tracing subscriber dependency) ──
-
-static API_LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-
-fn api_log_file() -> &'static Mutex<std::fs::File> {
-    API_LOG.get_or_init(|| {
-        let log_dir = std::env::temp_dir().join("PdfExplorer");
-        let _ = std::fs::create_dir_all(&log_dir);
-        let log_path = log_dir.join("api.log");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .expect("Failed to open api.log");
-        Mutex::new(file)
-    })
-}
-
-macro_rules! log_api {
-    ($($args:tt)*) => {{
-        use std::io::Write;
-        if let Ok(mut guard) = api_log_file().lock() {
-            let _ = writeln!(guard, $($args)*);
-            let _ = guard.flush();
-        }
-    }};
-}
-
-/// Helper to log an API function's return code and return it.
-fn log_ret(name: &str, rc: i32) -> i32 {
-    log_api!("[api] {} → {}", name, rc);
-    rc
-}
-
-/// Initialise a global tracing subscriber with a layer that forwards
-/// events to the C callback registered via `pdf_set_log_callback` (if any).
-fn init_tracing() {
-    static INIT: OnceLock<()> = OnceLock::new();
-    let _ = INIT.get_or_init(|| {
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::Registry;
-
-        // ── C callback layer ────────────────────────────────────────
-        struct CCallbackLayer;
-
-        struct EventFormatter<'a>(&'a mut String);
-
-        impl tracing::field::Visit for EventFormatter<'_> {
-            fn record_debug(
-                &mut self,
-                field: &tracing::field::Field,
-                value: &dyn std::fmt::Debug,
-            ) {
-                use std::fmt::Write;
-                if self.0.is_empty() {
-                    write!(self.0, "{} = {:?}", field.name(), value).ok();
-                } else {
-                    write!(self.0, " {} = {:?}", field.name(), value).ok();
-                }
-            }
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for CCallbackLayer {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let cb = match log_cb().lock() {
-                    Ok(g) => *g,
-                    Err(_) => return,
-                };
-                let callback = match cb {
-                    Some(cb) => cb,
-                    None => return,
-                };
-
-                thread_local! {
-                    static IN_CALLBACK: std::cell::Cell<bool> = std::cell::Cell::new(false);
-                }
-
-                IN_CALLBACK.with(|in_cb| {
-                    if in_cb.get() {
-                        return;
-                    }
-                    in_cb.set(true);
-
-                    let mut msg = String::new();
-                    let mut visitor = EventFormatter(&mut msg);
-                    event.record(&mut visitor);
-
-                    let level = match *event.metadata().level() {
-                        tracing::Level::ERROR => 0,
-                        tracing::Level::WARN => 1,
-                        tracing::Level::INFO => 2,
-                        tracing::Level::DEBUG => 3,
-                        tracing::Level::TRACE => 4,
-                    };
-
-                    if let Ok(c_msg) = std::ffi::CString::new(msg) {
-                        callback(c_msg.as_ptr(), level);
-                    }
-
-                    in_cb.set(false);
-                });
-            }
-        }
-
-        let subscriber = Registry::default().with(CCallbackLayer);
-        let _ = tracing::subscriber::set_global_default(subscriber);
-
-        log_api!("[init] Tracing subscriber initialised");
-    });
-}
-
-// ---------------------------------------------------------------------------
 // Helper: caller-allocated buffer write
 // ---------------------------------------------------------------------------
 
@@ -262,7 +135,6 @@ unsafe fn cstr_to_str(ptr: *const c_char) -> Result<&'static str, i32> {
 #[no_mangle]
 pub unsafe extern "C" fn pdf_api_version() -> u32 {
     let ver = PDF_EXTRACTOR_API_VERSION;
-    log_api!("[api] pdf_api_version → {}", ver);
     ver
 }
 
@@ -275,15 +147,13 @@ pub unsafe extern "C" fn pdf_init(
     db_path: *const c_char,
     index_path: *const c_char,
 ) -> i32 {
-    log_api!("[api] pdf_init");
-    init_tracing();
     let db = match unsafe { cstr_to_str(db_path) } {
         Ok(s) => s,
-        Err(e) => { log_api!("[api] pdf_init → {}", e); return e; }
+        Err(e) => { return e; }
     };
     let idx = match unsafe { cstr_to_str(index_path) } {
         Ok(s) => s,
-        Err(e) => { log_api!("[api] pdf_init → {}", e); return e; }
+        Err(e) => { return e; }
     };
 
     let rc = with_app(|app| {
@@ -313,7 +183,6 @@ pub unsafe extern "C" fn pdf_init(
         0
     })
     .unwrap_or(-1);
-    log_api!("[api] pdf_init → {}", rc);
     rc
 }
 
@@ -331,10 +200,8 @@ pub unsafe extern "C" fn pdf_search(
 ) -> i32 {
     let query_str = match unsafe { cstr_to_str(query) } {
         Ok(s) => s,
-        Err(e) => { log_api!("[api] pdf_search → {}", e); return e; }
+        Err(e) => { return e; }
     };
-
-    log_api!("[api] pdf_search query={} limit={} offset={}", query_str, limit, offset);
 
     let index_path = with_app(|app| {
         if app.indexer.is_some() {
@@ -349,7 +216,6 @@ pub unsafe extern "C" fn pdf_search(
         Some(p) => p,
         None => {
             set_error("pdf_init not called".into());
-            log_api!("[api] pdf_search → -2");
             return -2;
         }
     };
@@ -358,7 +224,6 @@ pub unsafe extern "C" fn pdf_search(
         Ok(si) => si,
         Err(e) => {
             set_error(format!("Failed to open index: {}", e));
-            log_api!("[api] pdf_search → -1");
             return -1;
         }
     };
@@ -367,7 +232,7 @@ pub unsafe extern "C" fn pdf_search(
 
     let (results_json, result_count) = match do_search_with_index(&search_index, query_str, limit, offset, None, &settings) {
         Ok(t) => t,
-        Err(e) => { log_api!("[api] pdf_search → {}", e); return e; }
+        Err(e) => { return e; }
     };
 
     let _total = result_count as u64;
@@ -383,7 +248,6 @@ pub unsafe extern "C" fn pdf_search(
     });
     let json_str = serde_json::to_string(&wrapped).unwrap_or_else(|_| "{}".into());
     let rc = unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) };
-    log_api!("[api] pdf_search → {}, out_len={}", rc, json_str.len());
     rc
 }
 
@@ -398,13 +262,11 @@ pub unsafe extern "C" fn pdf_snippet(
     out: *mut c_char,
     out_len: *mut u32,
 ) -> i32 {
-    log_ret("pdf_snippet", (|| -> i32 {
+    (|| -> i32 {
     let query_str = match unsafe { cstr_to_str(query) } {
         Ok(s) => s,
         Err(e) => return e,
     };
-
-    log_api!("[api] pdf_snippet doc_id={} query={}", doc_id, query_str);
 
     let index_path = with_app(|app| app.index_path.clone()).unwrap_or(None);
     let index_path = match index_path {
@@ -477,7 +339,7 @@ pub unsafe extern "C" fn pdf_snippet(
             -1
         }
     }
-    })())
+    })()
 }
 
 // ---------------------------------------------------------------------------
@@ -609,8 +471,6 @@ pub unsafe extern "C" fn pdf_get_term_positions(
             Err(e) => return e,
         };
 
-        log_api!("[api] pdf_get_term_positions coll_id={} doc_id={} term={}", coll_id, doc_id, term_str);
-
         let index_path = if coll_id == 0 {
             with_app(|app| app.index_path.clone()).unwrap_or(None)
         } else {
@@ -643,13 +503,10 @@ pub unsafe extern "C" fn pdf_get_term_positions(
 
         let stripped: String = term_str.trim_matches('"').to_string();
         let words: Vec<&str> = stripped.split_whitespace().collect();
-        log_api!("[pdf_get_term_positions] coll_id={} doc_id={} term='{}' words={:?}", coll_id, doc_id, term_str, words);
-
         let mut seen = HashSet::new();
         let mut all_positions: Vec<pdf_extractor::positions::StoredPosition> = Vec::new();
         for word in words.iter().filter(|w| !w.is_empty()) {
             if let Ok(positions) = position_store.get_positions_by_term(doc_id, word) {
-                log_api!("[pdf_get_term_positions] word='{}' count={}", word, positions.len());
                 for pos in &positions {
                     let key = (pos.page, (pos.x_min * 100.0) as i32, (pos.y_min * 100.0) as i32);
                     if seen.insert(key) {
@@ -668,12 +525,6 @@ pub unsafe extern "C" fn pdf_get_term_positions(
                 .or_else(|| detect_phrase_pages_sqlite(doc_id, &words, &position_store));
 
             if let Some(pages) = matching_pages {
-                log_api!(
-                    "[pdf_get_term_positions] phrase: {} pages → {} phrase-matching pages: {:?}",
-                    all_positions.iter().map(|p| p.page).collect::<HashSet<_>>().len(),
-                    pages.len(),
-                    pages
-                );
                 all_positions.retain(|p| pages.contains(&p.page));
             }
         }
@@ -691,7 +542,6 @@ pub unsafe extern "C" fn pdf_get_term_positions(
         let json_str = serde_json::to_string(&json_entries).unwrap_or_else(|_| "[]".into());
         unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
     })();
-    log_api!("[api] pdf_get_term_positions → {}", rc);
     rc
 }
 
@@ -716,8 +566,6 @@ pub unsafe extern "C" fn pdf_search_term_offsets(
             Ok(s) => s,
             Err(e) => return e,
         };
-
-        log_api!("[api] pdf_search_term_offsets coll_id={} doc_id={} term={}", coll_id, doc_id, term_str);
 
         let index_path = if coll_id == 0 {
             with_app(|app| app.index_path.clone()).unwrap_or(None)
@@ -757,7 +605,6 @@ pub unsafe extern "C" fn pdf_search_term_offsets(
         let json_str = serde_json::to_string(&offsets).unwrap_or_else(|_| "[]".into());
         unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
     })();
-    log_api!("[api] pdf_search_term_offsets → {}", rc);
     rc
 }
 
@@ -772,8 +619,6 @@ pub unsafe extern "C" fn pdf_page_count(path: *const c_char) -> i32 {
         Err(_) => return -3,
     };
 
-    log_api!("[api] pdf_page_count path={}", p);
-
     let rc = (|| -> i32 {
         let clean = p.strip_prefix(r"\\?\").unwrap_or(p);
         match lopdf::Document::load(clean) {
@@ -787,7 +632,6 @@ pub unsafe extern "C" fn pdf_page_count(path: *const c_char) -> i32 {
             },
         }
     })();
-    log_api!("[api] pdf_page_count → {}", rc);
     rc
 }
 
@@ -803,13 +647,11 @@ pub unsafe extern "C" fn pdf_render_thumbnail(
     out_buf: *mut u8,
     out_len: *mut u32,
 ) -> i32 {
-    log_ret("pdf_render_thumbnail", (|| -> i32 {
+    (|| -> i32 {
     let p = match unsafe { cstr_to_str(path) } {
         Ok(s) => s,
         Err(e) => return e,
     };
-
-    log_api!("[api] pdf_render_thumbnail path={} page={} max_w={}", p, page, max_w);
 
     if out_len.is_null() {
         return -3;
@@ -916,7 +758,7 @@ pub unsafe extern "C" fn pdf_render_thumbnail(
     std::ptr::copy_nonoverlapping(img_data.as_ptr(), out_buf, needed as usize);
     *out_len = needed;
     0
-    })())
+    })()
 }
 
 // ---------------------------------------------------------------------------
@@ -925,7 +767,6 @@ pub unsafe extern "C" fn pdf_render_thumbnail(
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_free_string(_ptr: *mut c_char) {
-    log_api!("[api] pdf_free_string");
     // No-op: caller-allocated buffers are freed by the caller.
 }
 
@@ -935,11 +776,10 @@ pub unsafe extern "C" fn pdf_free_string(_ptr: *mut c_char) {
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_last_error(out: *mut c_char, out_len: *mut u32) -> i32 {
-    log_ret("pdf_last_error", (|| -> i32 {
-    log_api!("[api] pdf_last_error");
+    (|| -> i32 {
     let msg = with_app(|app| app.last_error.clone().unwrap_or_default()).unwrap_or_default();
     unsafe { write_to_buffer(msg.as_bytes(), out, out_len) }
-    })())
+    })()
 }
 
 // ---------------------------------------------------------------------------
@@ -948,8 +788,7 @@ pub unsafe extern "C" fn pdf_last_error(out: *mut c_char, out_len: *mut u32) -> 
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_find_tesseract(out: *mut c_char, out_len: *mut u32) -> i32 {
-    log_ret("pdf_find_tesseract", (|| -> i32 {
-    log_api!("[api] pdf_find_tesseract");
+    (|| -> i32 {
     match find_tesseract() {
         Some(path) => {
             let path_str = path.to_string_lossy().to_string();
@@ -960,22 +799,7 @@ pub unsafe extern "C" fn pdf_find_tesseract(out: *mut c_char, out_len: *mut u32)
             -1
         }
     }
-    })())
-}
-
-// ---------------------------------------------------------------------------
-// pdf_set_log_callback
-// ---------------------------------------------------------------------------
-
-#[no_mangle]
-pub unsafe extern "C" fn pdf_set_log_callback(
-    callback: Option<extern "C" fn(*const c_char, u32)>,
-) {
-    log_api!("[api] pdf_set_log_callback callback={}", callback.is_some());
-    init_tracing();
-    if let Ok(mut cb) = log_cb().lock() {
-        *cb = callback;
-    }
+    })()
 }
 
 // ---------------------------------------------------------------------------
@@ -984,8 +808,7 @@ pub unsafe extern "C" fn pdf_set_log_callback(
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_set_channel_capacity(capacity: u32) -> i32 {
-    log_ret("pdf_set_channel_capacity", (|| -> i32 {
-    log_api!("[api] pdf_set_channel_capacity capacity={}", capacity);
+    (|| -> i32 {
     if capacity == 0 {
         set_error("Channel capacity must be > 0".into());
         return -3;
@@ -997,7 +820,7 @@ pub unsafe extern "C" fn pdf_set_channel_capacity(capacity: u32) -> i32 {
         Ok(_) => 0,
         Err(e) => e,
     }
-    })())
+    })()
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,12 +832,11 @@ pub unsafe extern "C" fn pdf_extract(
     input_dir: *const c_char,
     progress: Option<extern "C" fn(u64, u64)>,
 ) -> i32 {
-    log_ret("pdf_extract", (|| -> i32 {
+    (|| -> i32 {
     let dir = match unsafe { cstr_to_str(input_dir) } {
         Ok(s) => s,
         Err(e) => return e,
     };
-    log_api!("[api] pdf_extract input_dir={}", dir);
     let input_path = PathBuf::from(dir);
     if !input_path.is_dir() {
         set_error("Input path is not a directory".into());
@@ -1084,7 +906,7 @@ pub unsafe extern "C" fn pdf_extract(
             -1
         }
     }
-    })())
+    })()
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,8 +915,7 @@ pub unsafe extern "C" fn pdf_extract(
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_stats(out_json: *mut c_char, out_len: *mut u32) -> i32 {
-    log_ret("pdf_stats", (|| -> i32 {
-    log_api!("[api] pdf_stats");
+    (|| -> i32 {
     let index_path = with_app(|app| app.index_path.clone()).unwrap_or(None);
     let index_path = match index_path {
         Some(p) => p,
@@ -1127,7 +948,7 @@ pub unsafe extern "C" fn pdf_stats(out_json: *mut c_char, out_len: *mut u32) -> 
             -1
         }
     }
-    })())
+    })()
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,8 +975,7 @@ where
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_create_registry(registry_dir: *const c_char) -> i32 {
-    log_ret("pdf_create_registry", (|| -> i32 {
-    init_tracing();
+    (|| -> i32 {
     let dir = match unsafe { cstr_to_str(registry_dir) } {
         Ok(s) => s,
         Err(e) => return e,
@@ -1175,7 +995,7 @@ pub unsafe extern "C" fn pdf_create_registry(registry_dir: *const c_char) -> i32
             -1
         }
     }
-    })())
+    })()
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,13 +1007,12 @@ macro_rules! define_u32_setter {
     ($name:ident, $field:ident) => {
         #[no_mangle]
         pub unsafe extern "C" fn $name(value: u32) -> i32 {
-            log_ret(stringify!($name), (|| -> i32 {
-            log_api!("[api] {} value={}", stringify!($name), value);
+            (|| -> i32 {
             match with_app(|app| { app.$field = Some(value); Ok::<_, i32>(()) }) {
                 Ok(_) => 0,
                 Err(e) => e,
             }
-            })())
+            })()
         }
     };
 }
@@ -1202,13 +1021,12 @@ macro_rules! define_u32_direct_setter {
     ($name:ident, $field:ident) => {
         #[no_mangle]
         pub unsafe extern "C" fn $name(value: u32) -> i32 {
-            log_ret(stringify!($name), (|| -> i32 {
-            log_api!("[api] {} value={}", stringify!($name), value);
+            (|| -> i32 {
             match with_app(|app| { app.$field = value; Ok::<_, i32>(()) }) {
                 Ok(_) => 0,
                 Err(e) => e,
             }
-            })())
+            })()
         }
     };
 }
@@ -1217,9 +1035,8 @@ macro_rules! define_string_setter {
     ($name:ident, $field:ident) => {
         #[no_mangle]
         pub unsafe extern "C" fn $name(value: *const c_char) -> i32 {
-            log_ret(stringify!($name), (|| -> i32 {
+            (|| -> i32 {
             if value.is_null() {
-                log_api!("[api] {} value=null", stringify!($name));
                 match with_app(|app| { app.$field = None; Ok::<_, i32>(()) }) {
                     Ok(_) => 0,
                     Err(e) => e,
@@ -1229,13 +1046,12 @@ macro_rules! define_string_setter {
                     Ok(s) => s.to_string(),
                     Err(e) => return e,
                 };
-                log_api!("[api] {} value={}", stringify!($name), s);
                 match with_app(|app| { app.$field = Some(s); Ok::<_, i32>(()) }) {
                     Ok(_) => 0,
                     Err(e) => e,
                 }
             }
-            })())
+            })()
         }
     };
 }
@@ -1255,24 +1071,22 @@ define_string_setter!(pdf_set_path_filter, path_filter);
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_set_ram_buffer(value: u64) -> i32 {
-    log_ret("pdf_set_ram_buffer", (|| -> i32 {
-    log_api!("[api] pdf_set_ram_buffer value={}", value);
+    (|| -> i32 {
     match with_app(|app| { app.ram_buffer = Some(value); Ok::<_, i32>(()) }) {
         Ok(_) => 0,
         Err(e) => e,
     }
-    })())
+    })()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_set_recency_weight(value: f32) -> i32 {
-    log_ret("pdf_set_recency_weight", (|| -> i32 {
-    log_api!("[api] pdf_set_recency_weight value={}", value);
+    (|| -> i32 {
     match with_app(|app| { app.recency_weight = value; Ok::<_, i32>(()) }) {
         Ok(_) => 0,
         Err(e) => e,
     }
-    })())
+    })()
 }
 
 /// Set per-field weight boosts for ranked search.
@@ -1287,8 +1101,7 @@ pub unsafe extern "C" fn pdf_set_recency_weight(value: f32) -> i32 {
 /// normalized_text, content_stem, content_jp, content_zh, path.
 #[no_mangle]
 pub unsafe extern "C" fn pdf_set_field_weights(json: *const c_char) -> i32 {
-    log_ret("pdf_set_field_weights", (|| -> i32 {
-    log_api!("[api] pdf_set_field_weights");
+    (|| -> i32 {
     if json.is_null() {
         return match with_app(|app| { app.field_weights = None; Ok::<_, i32>(()) }) {
             Ok(_) => 0,
@@ -1325,7 +1138,7 @@ pub unsafe extern "C" fn pdf_set_field_weights(json: *const c_char) -> i32 {
         Ok(_) => 0,
         Err(e) => e,
     }
-    })())
+    })()
 }
 
 /// Set a boost multiplier for results coming from a specific collection.
@@ -1337,8 +1150,7 @@ pub unsafe extern "C" fn pdf_set_field_weights(json: *const c_char) -> i32 {
 /// 1.0 = no boost, 2.0 = double score, 0.5 = half score.
 #[no_mangle]
 pub unsafe extern "C" fn pdf_set_collection_boost(coll_id: u32, weight: f32) -> i32 {
-    log_ret("pdf_set_collection_boost", (|| -> i32 {
-    log_api!("[api] pdf_set_collection_boost coll_id={} weight={}", coll_id, weight);
+    (|| -> i32 {
     if weight <= 0.0 {
         set_error("Collection boost must be > 0.0".into());
         return -3;
@@ -1347,7 +1159,7 @@ pub unsafe extern "C" fn pdf_set_collection_boost(coll_id: u32, weight: f32) -> 
         Ok(_) => 0,
         Err(e) => e,
     }
-    })())
+    })()
 }
 
 /// Set a boolean (MUST / SHOULD / MUST_NOT) query for the next search.
@@ -1367,8 +1179,7 @@ pub unsafe extern "C" fn pdf_set_collection_boost(coll_id: u32, weight: f32) -> 
 /// Pass `null` to reset to simple (non-boolean) query mode.
 #[no_mangle]
 pub unsafe extern "C" fn pdf_set_boolean_query(json: *const c_char) -> i32 {
-    log_ret("pdf_set_boolean_query", (|| -> i32 {
-    log_api!("[api] pdf_set_boolean_query");
+    (|| -> i32 {
     if json.is_null() {
         return match with_app(|app| { app.boolean_query = None; Ok::<_, i32>(()) }) {
             Ok(_) => 0,
@@ -1414,41 +1225,38 @@ pub unsafe extern "C" fn pdf_set_boolean_query(json: *const c_char) -> i32 {
         Ok(_) => 0,
         Err(e) => e,
     }
-    })())
+    })()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_add_collection(books_folder: *const c_char) -> i32 {
-    log_ret("pdf_add_collection", (|| -> i32 {
+    (|| -> i32 {
     let path = match unsafe { cstr_to_str(books_folder) } {
         Ok(s) => s,
         Err(e) => return e,
     };
-    log_api!("[api] pdf_add_collection books_folder={}", path);
     match with_registry(|reg| reg.add_collection(Path::new(path))) {
         Ok(Ok(id)) => id as i32,
         Ok(Err(e)) => { set_error(format!("{}", e)); -1 }
         Err(e) => e,
     }
-    })())
+    })()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_remove_collection(coll_id: u32) -> i32 {
-    log_ret("pdf_remove_collection", (|| -> i32 {
-    log_api!("[api] pdf_remove_collection coll_id={}", coll_id);
+    (|| -> i32 {
     match with_registry(|reg| reg.remove_collection(coll_id as i64)) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) => { set_error(format!("{}", e)); -1 }
         Err(e) => e,
     }
-    })())
+    })()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_list_collections(out_json: *mut c_char, out_len: *mut u32) -> i32 {
-    log_ret("pdf_list_collections", (|| -> i32 {
-    log_api!("[api] pdf_list_collections");
+    (|| -> i32 {
     let collections = match with_registry(|reg| reg.list_collections()) {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => { set_error(format!("{}", e)); return -1; }
@@ -1470,7 +1278,7 @@ pub unsafe extern "C" fn pdf_list_collections(out_json: *mut c_char, out_len: *m
         .collect();
     let json_str = serde_json::to_string(&json_entries).unwrap_or_else(|_| "[]".into());
     unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
-    })())
+    })()
 }
 
 #[no_mangle]
@@ -1479,8 +1287,7 @@ pub unsafe extern "C" fn pdf_index_collection(
     flags: u32,
     progress_callback: Option<extern "C" fn(u64, u64)>,
 ) -> i32 {
-    log_ret("pdf_index_collection", (|| -> i32 {
-    log_api!("[api] pdf_index_collection coll_id={} flags={}", coll_id, flags);
+    (|| -> i32 {
     CANCEL_REQUESTED.store(false, Ordering::Relaxed);
 
     let collection = match with_registry(|reg| reg.get_collection(coll_id as i64)) {
@@ -1613,8 +1420,7 @@ pub unsafe extern "C" fn pdf_index_collection(
                     Some(output_path),
                     num_workers,
                 ) {
-                    Ok(ocr_count) => {
-                        tracing::info!(ocr_count = ocr_count, "OCR post-processing complete");
+                    Ok(_ocr_count) => {
                         processed as i32
                     }
                     Err(e) => {
@@ -1631,21 +1437,19 @@ pub unsafe extern "C" fn pdf_index_collection(
             -1
         }
     }
-    })())
+    })()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_cancel_indexing() {
-    log_api!("[api] pdf_cancel_indexing");
     CANCEL_REQUESTED.store(true, Ordering::Relaxed);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_is_cancel_requested() -> i32 {
-    log_ret("pdf_is_cancel_requested", (|| -> i32 {
-    log_api!("[api] pdf_is_cancel_requested");
+    (|| -> i32 {
     if CANCEL_REQUESTED.load(Ordering::Relaxed) { 1 } else { 0 }
-    })())
+    })()
 }
 
 /// Settings read from AppContext once, to avoid mutex contention in parallel search.
@@ -1768,13 +1572,11 @@ pub unsafe extern "C" fn pdf_search_collection(
     out_json: *mut c_char,
     out_len: *mut u32,
 ) -> i32 {
-    log_ret("pdf_search_collection", (|| -> i32 {
+    (|| -> i32 {
     let query_str = match unsafe { cstr_to_str(query) } {
         Ok(s) => s,
         Err(e) => return e,
     };
-
-    log_api!("[api] pdf_search_collection coll_id={} query={} limit={} offset={}", coll_id, query_str, limit, offset);
 
     let collection = match with_registry(|reg| reg.get_collection(coll_id as i64)) {
         Ok(Ok(c)) => c,
@@ -1812,7 +1614,7 @@ pub unsafe extern "C" fn pdf_search_collection(
     });
     let json_str = serde_json::to_string(&wrapped).unwrap_or_else(|_| "{}".into());
     unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
-    })())
+    })()
 }
 
 #[no_mangle]
@@ -1823,13 +1625,11 @@ pub unsafe extern "C" fn pdf_search_all(
     out_json: *mut c_char,
     out_len: *mut u32,
 ) -> i32 {
-    log_ret("pdf_search_all", (|| -> i32 {
+    (|| -> i32 {
     let query_str = match unsafe { cstr_to_str(query) } {
         Ok(s) => s,
         Err(e) => return e,
     };
-
-    log_api!("[api] pdf_search_all query={} limit={} offset={}", query_str, limit, offset);
 
     let collections = match with_registry(|reg| reg.list_collections()) {
         Ok(Ok(c)) => c,
@@ -1910,7 +1710,7 @@ pub unsafe extern "C" fn pdf_search_all(
     });
     let json_str = serde_json::to_string(&wrapped).unwrap_or_else(|_| "{}".into());
     unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
-    })())
+    })()
 }
 
 #[no_mangle]
@@ -1918,7 +1718,7 @@ pub unsafe extern "C" fn pdf_search_count(
     query: *const c_char,
     out_count: *mut u64,
 ) -> i32 {
-    log_ret("pdf_search_count", (|| -> i32 {
+    (|| -> i32 {
     if out_count.is_null() {
         return -3;
     }
@@ -1926,8 +1726,6 @@ pub unsafe extern "C" fn pdf_search_count(
         Ok(s) => s,
         Err(e) => return e,
     };
-    log_api!("[api] pdf_search_count query={}", query_str);
-
     let index_path = with_app(|app| {
         if app.indexer.is_some() {
             app.index_path.clone()
@@ -1963,7 +1761,7 @@ pub unsafe extern "C" fn pdf_search_count(
             -1
         }
     }
-    })())
+    })()
 }
 
 #[no_mangle]
@@ -1971,7 +1769,7 @@ pub unsafe extern "C" fn pdf_search_count_all(
     query: *const c_char,
     out_count: *mut u64,
 ) -> i32 {
-    log_ret("pdf_search_count_all", (|| -> i32 {
+    (|| -> i32 {
     if out_count.is_null() {
         return -3;
     }
@@ -1979,8 +1777,6 @@ pub unsafe extern "C" fn pdf_search_count_all(
         Ok(s) => s,
         Err(e) => return e,
     };
-    log_api!("[api] pdf_search_count_all query={}", query_str);
-
     let collections = match with_registry(|reg| reg.list_collections()) {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => { set_error(format!("{}", e)); return -1; }
@@ -2002,7 +1798,7 @@ pub unsafe extern "C" fn pdf_search_count_all(
 
     unsafe { *out_count = total; }
     0
-    })())
+    })()
 }
 
 #[no_mangle]
@@ -2011,8 +1807,7 @@ pub unsafe extern "C" fn pdf_collection_stats(
     out_json: *mut c_char,
     out_len: *mut u32,
 ) -> i32 {
-    log_ret("pdf_collection_stats", (|| -> i32 {
-    log_api!("[api] pdf_collection_stats coll_id={}", coll_id);
+    (|| -> i32 {
     let collection = match with_registry(|reg| reg.get_collection(coll_id as i64)) {
         Ok(Ok(c)) => c,
         Ok(Err(_)) => { set_error("Collection not found".into()); return -8; }
@@ -2043,7 +1838,7 @@ pub unsafe extern "C" fn pdf_collection_stats(
             -1
         }
     }
-    })())
+    })()
 }
 
 // ---------------------------------------------------------------------------
@@ -2135,27 +1930,6 @@ mod tests {
         let mut len = 512u32;
         let rc = unsafe { pdf_last_error(buf.as_mut_ptr() as *mut c_char, &mut len) };
         assert_eq!(rc, 0);
-    }
-
-    #[test]
-    fn test_set_log_callback_null() {
-        unsafe { pdf_set_log_callback(None) };
-    }
-
-    #[test]
-    fn test_logging_callback_receives_events() {
-        reset_state();
-        static LOG_HIT: AtomicU32 = AtomicU32::new(0);
-        extern "C" fn log_cb(_msg: *const c_char, _level: u32) {
-            LOG_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        LOG_HIT.store(0, std::sync::atomic::Ordering::Relaxed);
-        unsafe { pdf_set_log_callback(Some(log_cb)) };
-        tracing::info!("pdf_extractor_capi test log event");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let hit = LOG_HIT.load(std::sync::atomic::Ordering::Relaxed);
-        unsafe { pdf_set_log_callback(None) };
-        assert!(hit >= 1, "Log callback was not invoked (got {})", hit);
     }
 
     #[test]
@@ -3223,3 +2997,4 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         );
     }
 }
+

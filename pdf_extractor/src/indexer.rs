@@ -5,7 +5,6 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::collector::DocSetCollector;
 use tantivy::query::{BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser, RegexQuery};
 #[cfg(test)]
 use tantivy::query::TermQuery;
@@ -104,9 +103,8 @@ impl SearchIndex {
                     .build();
                 index.tokenizers().register("ja", jp_analyzer);
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to initialize Japanese tokenizer");
-            }
+            Err(_e) => {}
+
         }
 
         // Register Chinese bigram tokenizer.

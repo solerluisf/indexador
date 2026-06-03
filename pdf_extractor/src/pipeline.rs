@@ -113,15 +113,15 @@ pub fn run_pipeline(
     indexer: Option<Arc<Indexer>>,
     config: &PipelineConfig,
 ) -> Result<()> {
-    let scanned = scan_directory(&jobs, input)?;
-    tracing::info!(scanned = scanned, "Directory scan complete");
+    let _scanned = scan_directory(&jobs, input)?;
+
 
     let pending = jobs.count_pending()?;
     if pending == 0 {
-        tracing::info!("No pending jobs to process");
+
         return Ok(());
     }
-    tracing::info!(pending = pending, "Jobs pending extraction");
+
 
     let cap = config.channel_cap();
     let (task_tx, task_rx) = bounded::<ExtractorTask>(cap);
@@ -131,7 +131,7 @@ pub fn run_pipeline(
     let indexer_batch_size = config.indexer_batch();
     let commit_interval = config.commit_int();
     let commit_timeout = config.commit_to();
-    tracing::info!(num_workers = num_workers, indexer_batch = indexer_batch_size, commit_interval = commit_interval, "Starting extractor pool");
+
 
     // Producer: claim pending jobs from DB and send to task channel
     let producer_jobs = Arc::clone(&jobs);
@@ -141,7 +141,7 @@ pub fn run_pipeline(
         thread::spawn(move || {
             loop {
                 if producer_cancel.map_or(false, |f| f.load(Ordering::Relaxed)) {
-                    tracing::info!("Cancel requested, stopping producer");
+
                     break;
                 }
                 match producer_jobs.claim_pending(BATCH_SIZE) {
@@ -159,8 +159,7 @@ pub fn run_pipeline(
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Producer failed to claim jobs");
+                    Err(_e) => {
                         break;
                     }
                 }
@@ -210,12 +209,6 @@ pub fn run_pipeline(
                             }
                         }
                         Ok(Err(e)) => {
-                            tracing::error!(
-                                id = task_id,
-                                path = %task_path,
-                                error = %e,
-                                "Extraction failed"
-                            );
                             worker_jobs
                                 .mark_error(task_id, &format!("{}", e))
                                 .ok();
@@ -227,12 +220,6 @@ pub fn run_pipeline(
                                 .map(|s| s.to_string())
                                 .or_else(|| panic_payload.downcast_ref::<String>().cloned())
                                 .unwrap_or_else(|| "Unknown panic".to_string());
-                            tracing::error!(
-                                id = task_id,
-                                path = %task_path,
-                                error = msg,
-                                "Worker panicked during extraction"
-                            );
                             worker_jobs
                                 .mark_error(task_id, &format!("panic: {}", msg))
                                 .ok();
@@ -279,12 +266,6 @@ pub fn run_pipeline(
             let record = $record;
             metrics.set_result_queue_depth(result_rx.len() as u64);
             if let Err(e) = writer.write_record(&record) {
-                tracing::error!(
-                    id = record.id,
-                    path = %record.path,
-                    error = %e,
-                    "Failed to write record"
-                );
                 jobs.mark_error(record.id, &format!("write failed: {}", e))
                     .ok();
                 metrics.increment_errored();
@@ -294,7 +275,7 @@ pub fn run_pipeline(
             metrics.increment_processed();
 
             if may_index && index_tx.send(record).is_err() {
-                tracing::warn!("Indexer channel closed, dropping record");
+
             }
 
             if let Some(ref cb) = progress_cb {
@@ -307,7 +288,7 @@ pub fn run_pipeline(
     // Phase 1: normal blocking receive, check cancel between records
     for record in &result_rx {
         if is_cancelled() {
-            tracing::info!("Cancel requested — draining remaining extracted items");
+
             break;
         }
         process_record!(record);
@@ -366,8 +347,7 @@ fn indexer_thread(
 ) {
     let index_writer = match indexer.search_index().writer() {
         Ok(w) => w,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to create index writer in indexer thread");
+        Err(_e) => {
             return;
         }
     };
@@ -408,7 +388,7 @@ fn indexer_thread(
                     let total = indexer.metrics().docs_indexed();
                     metrics.set_indexer_docs_indexed(total);
                     metrics.set_indexer_last_commit_age(0);
-                    tracing::info!(docs_indexed = total, "Index committed");
+
                     last_commit = Instant::now();
                     doc_count = 0;
                 }
@@ -443,7 +423,7 @@ fn flush_batch(
         .as_secs();
     for record in batch {
         let math_source = record.math_source.as_deref().unwrap_or("");
-        if let Err(e) = indexer.search_index().add_document_with_ts(
+        if let Err(_e) = indexer.search_index().add_document_with_ts(
             &mut w,
             record.id,
             &record.path,
@@ -454,7 +434,7 @@ fn flush_batch(
             math_source,
             now,
         ) {
-            tracing::error!(id = record.id, error = %e, "Failed to index document");
+
         } else {
             indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -463,11 +443,9 @@ fn flush_batch(
         if !record.word_positions.is_empty() {
             let positions_with_offsets: Vec<(usize, crate::extractor::WordPosition)> =
                 align_offsets_to_tantivy(&record.text, &record.word_positions);
-            tracing::info!("[flush_batch] doc_id={}: {} word_positions → {} aligned positions",
-                record.id, record.word_positions.len(), positions_with_offsets.len());
+
             if let Ok(store) = indexer.position_store.lock() {
-                if let Err(e) = store.store_positions(record.id, &positions_with_offsets) {
-                    tracing::error!(id = record.id, error = %e, "Failed to store word positions");
+                if let Err(_e) = store.store_positions(record.id, &positions_with_offsets) {
                 }
             }
         }
@@ -495,14 +473,14 @@ pub fn run_ocr_post_processing(
 
     let pending = jobs.count_ocr_pending(max_retries)?;
     if pending == 0 {
-        tracing::info!("No documents pending OCR");
+
         return Ok(0);
     }
-    tracing::info!(pending = pending, ocr_workers = num_workers, "Starting OCR post-processing");
+
 
     // Open JSONL writer if output path provided
     let jsonl_writer = if let Some(ref out_path) = output_path {
-        tracing::info!(output = %out_path.display(), "OCR output will be written to JSONL");
+
         Some(Arc::new(JsonlWriter::new(out_path)?))
     } else {
         None
@@ -540,8 +518,7 @@ pub fn run_ocr_post_processing(
                     text: ocr_text.clone(),
                     word_positions: Vec::new(),
                 };
-                if let Err(e) = writer.write_record(&record) {
-                    tracing::error!(error = %e, id = id, "Failed to write OCR output record");
+                if let Err(_e) = writer.write_record(&record) {
                 }
             }
         }
@@ -565,8 +542,7 @@ pub fn run_ocr_post_processing(
                     }
                 }
             }
-            Err(e) => {
-                tracing::error!(error = %e, "OCR producer failed to fetch jobs");
+            Err(_e) => {
             }
         }
         drop(ocr_tx);
@@ -608,7 +584,7 @@ pub fn run_ocr_post_processing(
                             tx.send((id, path_str, checksum, text)).ok();
                         }
                         _ => {
-                            tracing::warn!(id = id, "OCR failed after retries");
+
                             tx.send((id, path_str, checksum, String::new())).ok();
                         }
                     }
@@ -632,9 +608,9 @@ pub fn run_ocr_post_processing(
     }
 
     // All workers done → all result_tx clones dropped → consumer exits
-    let (ocr_processed, ocr_errored) = consumer_handle.join().expect("OCR consumer panicked");
+    let (ocr_processed, _ocr_errored) = consumer_handle.join().expect("OCR consumer panicked");
 
-    tracing::info!(ocr_processed = ocr_processed, ocr_errored = ocr_errored, "OCR post-processing complete");
+
     Ok(ocr_processed)
 }
 
@@ -663,8 +639,7 @@ fn run_single_ocr(path: &Path, config: &ocr::OcrConfig, mut worker: Option<&mut 
             Ok(true) => {
                 let preprocessed = match ocr::preprocess_image(&image_path, config.max_dim) {
                     Ok(img) => img,
-                    Err(e) => {
-                        tracing::warn!(page = page_num, error = %e, "Failed to preprocess page");
+                    Err(_e) => {
                         continue;
                     }
                 };
@@ -674,8 +649,7 @@ fn run_single_ocr(path: &Path, config: &ocr::OcrConfig, mut worker: Option<&mut 
                 };
                 let text = match text {
                     Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(page = page_num, error = %e, "Tesseract failed on page");
+                    Err(_e) => {
                         continue;
                     }
                 };
@@ -687,11 +661,9 @@ fn run_single_ocr(path: &Path, config: &ocr::OcrConfig, mut worker: Option<&mut 
                 }
             }
             Ok(false) => {
-                tracing::warn!(page = page_num, "No renderer available for this page");
                 continue;
             }
-            Err(e) => {
-                tracing::warn!(page = page_num, error = %e, "Failed to render page");
+            Err(_e) => {
                 continue;
             }
         }

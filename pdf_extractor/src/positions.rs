@@ -83,36 +83,57 @@ impl PositionStore {
 
     /// Insert positions for a document. Replaces any existing entries
     /// for the given `doc_id`.
+    ///
+    /// All operations are wrapped in a single SQLite transaction to avoid
+    /// N individual autocommit fsyncs per document (improves I/O throughput
+    /// dramatically for large PDFs with tens of thousands of word positions).
     pub fn store_positions(
         &self,
         doc_id: i64,
         positions: &[(usize, crate::extractor::WordPosition)],
     ) -> Result<()> {
-        // Delete any existing positions for this doc (dedup / re-index)
+        // Wrap DELETE + INSERTs in a single transaction to avoid
+        // N individual autocommit fsyncs per document.
         self.conn
-            .execute("DELETE FROM word_positions WHERE doc_id = ?1", rusqlite::params![doc_id])
-            .context("Failed to delete existing positions")?;
+            .execute_batch("BEGIN")
+            .context("Failed to begin transaction")?;
 
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO word_positions (doc_id, word_offset, page, x_min, y_min, x_max, y_max, word_text)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-        ).context("Failed to prepare insert statement")?;
+        let result = (|| -> Result<()> {
+            self.conn
+                .execute("DELETE FROM word_positions WHERE doc_id = ?1", rusqlite::params![doc_id])
+                .context("Failed to delete existing positions")?;
 
-        for (offset, pos) in positions {
-            stmt.execute(rusqlite::params![
-                doc_id,
-                *offset as i64,
-                pos.page as i64,
-                pos.x_min as f64,
-                pos.y_min as f64,
-                pos.x_max as f64,
-                pos.y_max as f64,
-                pos.text,
-            ]).context("Failed to insert position")?;
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO word_positions (doc_id, word_offset, page, x_min, y_min, x_max, y_max, word_text)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            ).context("Failed to prepare insert statement")?;
+
+            for (offset, pos) in positions {
+                stmt.execute(rusqlite::params![
+                    doc_id,
+                    *offset as i64,
+                    pos.page as i64,
+                    pos.x_min as f64,
+                    pos.y_min as f64,
+                    pos.x_max as f64,
+                    pos.y_max as f64,
+                    pos.text,
+                ]).context("Failed to insert position")?;
+            }
+
+            drop(stmt);
+            Ok(())
+        })();
+
+        if result.is_ok() {
+            self.conn
+                .execute_batch("COMMIT")
+                .context("Failed to commit transaction")?;
+        } else {
+            let _ = self.conn.execute_batch("ROLLBACK");
         }
 
-        drop(stmt);
-        Ok(())
+        result
     }
 
     /// Get all positions for the given `doc_id` and `word_offsets`.
