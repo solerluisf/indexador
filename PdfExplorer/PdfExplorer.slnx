@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="PdfExplorer.csproj" />
+  <Project Path="PdfExplorer.Tests/PdfExplorer.Tests.csproj" />
+</Solution>

@@ -10,7 +10,6 @@ pub struct Metrics {
     result_queue_depth: AtomicU64,
     indexer_docs_indexed: AtomicU64,
     indexer_last_commit_age: AtomicU64,
-    indexer_writer_mem: AtomicU64,
     search_count: AtomicU64,
     search_time_ns: AtomicU64,
     start: Instant,
@@ -26,7 +25,6 @@ impl Metrics {
             result_queue_depth: AtomicU64::new(0),
             indexer_docs_indexed: AtomicU64::new(0),
             indexer_last_commit_age: AtomicU64::new(0),
-            indexer_writer_mem: AtomicU64::new(0),
             search_count: AtomicU64::new(0),
             search_time_ns: AtomicU64::new(0),
             start: Instant::now(),
@@ -64,11 +62,6 @@ impl Metrics {
 
     pub fn set_indexer_last_commit_age(&self, secs: u64) {
         self.indexer_last_commit_age.store(secs, Ordering::Relaxed);
-    }
-
-    #[allow(dead_code)]
-    pub fn set_indexer_writer_mem(&self, bytes: u64) {
-        self.indexer_writer_mem.store(bytes, Ordering::Relaxed);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -113,7 +106,6 @@ impl Metrics {
                 result_queue_depth = self.result_queue_depth.load(Ordering::Relaxed),
                 indexer_docs_indexed = self.indexer_docs_indexed.load(Ordering::Relaxed),
                 indexer_last_commit_age_secs = self.indexer_last_commit_age.load(Ordering::Relaxed),
-                indexer_writer_mem_bytes = self.indexer_writer_mem.load(Ordering::Relaxed),
                 search_count = self.search_count.load(Ordering::Relaxed),
                 avg_search_latency_us = self.avg_search_latency_ns() / 1000,
                 throughput_docs_per_sec = format!("{:.2}", self.throughput()),
@@ -199,7 +191,6 @@ mod tests {
         let m = Metrics::new();
         assert_eq!(m.indexer_docs_indexed.load(Ordering::Relaxed), 0);
         assert_eq!(m.indexer_last_commit_age.load(Ordering::Relaxed), 0);
-        assert_eq!(m.indexer_writer_mem.load(Ordering::Relaxed), 0);
     }
 
     #[test]

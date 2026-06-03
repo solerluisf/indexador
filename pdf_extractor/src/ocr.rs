@@ -38,7 +38,7 @@ fn find_worker_binary() -> Option<PathBuf> {
         }
     }
 
-    Some(PathBuf::from(exe_name))
+    None
 }
 
 #[derive(Clone)]
@@ -341,6 +341,9 @@ pub fn find_tesseract() -> Option<PathBuf> {
     let common_paths = [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        "/usr/bin/tesseract",
+        "/usr/local/bin/tesseract",
+        "/opt/homebrew/bin/tesseract",
     ];
     for path in &common_paths {
         if Path::new(path).exists() {

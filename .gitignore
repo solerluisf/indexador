@@ -25,3 +25,38 @@ Cargo.lock
 
 # End of https://www.toptal.com/developers/gitignore/api/rust
 .blackboxcli/
+
+## ---------- Visual Studio ----------
+# Carpetas de compilación
+[Bb]in/
+[Oo]bj/
+
+# Configuración de usuario y estado del IDE
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Caché de herramientas de diseño (XAML Designer)
+.XamlDetachedMSBuild/
+
+## ---------- Paquetes ----------
+# Directorio de paquetes antiguos de NuGet
+packages/
+# Archivos de restauración de paquetes
+project.lock.json
+project.fragment.lock.json
+
+## ---------- Pruebas y Reportes ----------
+TestResults/
+*.log
+
+## ---------- Sistemas Operativos ----------
+# Archivos temporales de Windows / Mac
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+.pdf

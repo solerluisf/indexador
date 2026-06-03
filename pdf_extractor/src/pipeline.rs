@@ -2,12 +2,15 @@ use anyhow::{Context, Result};
 use crossbeam_channel::bounded;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::panic;
 use crate::lang;
 use std::time::{Duration, Instant};
 
 use crate::extractor::extract_pdf;
+use crate::indexer::align_offsets_to_tantivy;
 use crate::indexer::Indexer;
 use crate::metrics::Metrics;
 use crate::normalizer::normalize_text;
@@ -15,7 +18,7 @@ use crate::ocr;
 use crate::output::{DocumentRecord, JsonlWriter};
 use crate::scanner::{scan_directory, JobStore};
 
-const CHANNEL_CAPACITY: usize = 5000;
+const DEFAULT_CHANNEL_CAPACITY: usize = 500;
 const BATCH_SIZE: i64 = 100;
 const DEFAULT_INDEXER_BATCH_SIZE: usize = 500;
 const DEFAULT_COMMIT_INTERVAL: u64 = 5000;
@@ -26,6 +29,9 @@ pub struct PipelineConfig {
     pub indexer_batch_size: Option<usize>,
     pub commit_interval: Option<u64>,
     pub commit_timeout: Option<u64>,
+    pub channel_capacity: Option<usize>,
+    pub progress_cb: Option<Box<dyn Fn(u64, u64) + Send>>,
+    pub cancel_flag: Option<&'static AtomicBool>,
 }
 
 impl Default for PipelineConfig {
@@ -35,6 +41,9 @@ impl Default for PipelineConfig {
             indexer_batch_size: None,
             commit_interval: None,
             commit_timeout: None,
+            channel_capacity: None,
+            progress_cb: None,
+            cancel_flag: None,
         }
     }
 }
@@ -62,6 +71,12 @@ impl PipelineConfig {
         self.commit_timeout
             .map(|v| if v == 0 { 1 } else { v })
             .unwrap_or(DEFAULT_COMMIT_TIMEOUT_SECS)
+    }
+
+    pub fn channel_cap(&self) -> usize {
+        self.channel_capacity
+            .map(|v| if v == 0 { 1 } else { v })
+            .unwrap_or(DEFAULT_CHANNEL_CAPACITY)
     }
 }
 
@@ -108,8 +123,9 @@ pub fn run_pipeline(
     }
     tracing::info!(pending = pending, "Jobs pending extraction");
 
-    let (task_tx, task_rx) = bounded::<ExtractorTask>(CHANNEL_CAPACITY);
-    let (result_tx, result_rx) = bounded::<DocumentRecord>(CHANNEL_CAPACITY);
+    let cap = config.channel_cap();
+    let (task_tx, task_rx) = bounded::<ExtractorTask>(cap);
+    let (result_tx, result_rx) = bounded::<DocumentRecord>(cap);
 
     let num_workers = config.extract_workers();
     let indexer_batch_size = config.indexer_batch();
@@ -120,26 +136,33 @@ pub fn run_pipeline(
     // Producer: claim pending jobs from DB and send to task channel
     let producer_jobs = Arc::clone(&jobs);
     let producer_metrics = Arc::clone(&metrics);
+    let producer_cancel = config.cancel_flag;
     let producer_handle = {
-        thread::spawn(move || loop {
-            match producer_jobs.claim_pending(BATCH_SIZE) {
-                Ok(batch) => {
-                    if batch.is_empty() {
-                        break;
-                    }
-                    for (id, path, checksum) in batch {
-                        producer_metrics.set_task_queue_depth(task_tx.len() as u64);
-                        if task_tx
-                            .send(ExtractorTask { id, path, checksum })
-                            .is_err()
-                        {
-                            return;
+        thread::spawn(move || {
+            loop {
+                if producer_cancel.map_or(false, |f| f.load(Ordering::Relaxed)) {
+                    tracing::info!("Cancel requested, stopping producer");
+                    break;
+                }
+                match producer_jobs.claim_pending(BATCH_SIZE) {
+                    Ok(batch) => {
+                        if batch.is_empty() {
+                            break;
+                        }
+                        for (id, path, checksum) in batch {
+                            producer_metrics.set_task_queue_depth(task_tx.len() as u64);
+                            if task_tx
+                                .send(ExtractorTask { id, path, checksum })
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Producer failed to claim jobs");
-                    break;
+                    Err(e) => {
+                        tracing::error!(error = %e, "Producer failed to claim jobs");
+                        break;
+                    }
                 }
             }
         })
@@ -156,44 +179,66 @@ pub fn run_pipeline(
             .name(format!("extract-{}", i))
             .spawn(move || {
                 for task in &task_rx {
-                    with_scratch_buf(|_buf| {
-                        let path_obj = PathBuf::from(&task.path);
-                        match extract_pdf(&path_obj) {
-                            Ok(extraction) => {
-                                let normalized = if !extraction.ocr_flag {
-                                    normalize_text(&extraction.text)
-                                } else {
-                                    String::new()
-                                };
-                                let math_source =
-                                    crate::math_tokenizer::extract_math_source(&extraction.text);
-                                let record = DocumentRecord {
-                                    id: task.id,
-                                    path: task.path,
-                                    checksum: task.checksum,
-                                    ocr_flag: extraction.ocr_flag,
-                                    language: lang::detect_language(&extraction.text),
-                                    math_source,
-                                    text: normalized,
-                                };
-                                if result_tx.send(record).is_err() {
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    id = task.id,
-                                    path = %task.path,
-                                    error = %e,
-                                    "Extraction failed"
-                                );
-                                worker_jobs
-                                    .mark_error(task.id, &format!("{}", e))
-                                    .ok();
-                                worker_metrics.increment_errored();
+                    let task_path = task.path.clone();
+                    let task_id = task.id;
+                    let task_checksum = task.checksum.clone();
+                    let extraction_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        let path_obj = PathBuf::from(&task_path);
+                        extract_pdf(&path_obj)
+                    }));
+                    match extraction_result {
+                        Ok(Ok(extraction)) => {
+                            let normalized = if !extraction.ocr_flag {
+                                normalize_text(&extraction.text)
+                            } else {
+                                String::new()
+                            };
+                            let math_source =
+                                crate::math_tokenizer::extract_math_source(&extraction.text);
+                            let record = DocumentRecord {
+                                id: task_id,
+                                path: task_path,
+                                checksum: task_checksum,
+                                ocr_flag: extraction.ocr_flag,
+                                language: lang::detect_language(&extraction.text),
+                                math_source,
+                                text: normalized,
+                                word_positions: extraction.word_positions,
+                            };
+                            if result_tx.send(record).is_err() {
+                                return;
                             }
                         }
-                    });
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                id = task_id,
+                                path = %task_path,
+                                error = %e,
+                                "Extraction failed"
+                            );
+                            worker_jobs
+                                .mark_error(task_id, &format!("{}", e))
+                                .ok();
+                            worker_metrics.increment_errored();
+                        }
+                        Err(panic_payload) => {
+                            let msg = panic_payload
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "Unknown panic".to_string());
+                            tracing::error!(
+                                id = task_id,
+                                path = %task_path,
+                                error = msg,
+                                "Worker panicked during extraction"
+                            );
+                            worker_jobs
+                                .mark_error(task_id, &format!("panic: {}", msg))
+                                .ok();
+                            worker_metrics.increment_errored();
+                        }
+                    }
                 }
             })
             .expect("Failed to spawn worker thread");
@@ -204,7 +249,7 @@ pub fn run_pipeline(
     drop(result_tx);
 
     // Indexer channel
-    let (index_tx, index_rx) = bounded::<DocumentRecord>(CHANNEL_CAPACITY);
+    let (index_tx, index_rx) = bounded::<DocumentRecord>(cap);
     let may_index = indexer.is_some();
 
     let indexer_handle = match indexer {
@@ -222,39 +267,88 @@ pub fn run_pipeline(
         None => None,
     };
 
+    let total_pending = pending as u64;
+    let progress_cb = &config.progress_cb;
+    let cancel_flag = config.cancel_flag;
+
     // Writer: consume results and persist
+    let is_cancelled = || cancel_flag.map_or(false, |f| f.load(Ordering::Relaxed));
+
+    macro_rules! process_record {
+        ($record:expr) => {{
+            let record = $record;
+            metrics.set_result_queue_depth(result_rx.len() as u64);
+            if let Err(e) = writer.write_record(&record) {
+                tracing::error!(
+                    id = record.id,
+                    path = %record.path,
+                    error = %e,
+                    "Failed to write record"
+                );
+                jobs.mark_error(record.id, &format!("write failed: {}", e))
+                    .ok();
+                metrics.increment_errored();
+                continue;
+            }
+            jobs.mark_done(record.id, record.ocr_flag).ok();
+            metrics.increment_processed();
+
+            if may_index && index_tx.send(record).is_err() {
+                tracing::warn!("Indexer channel closed, dropping record");
+            }
+
+            if let Some(ref cb) = progress_cb {
+                cb(metrics.processed(), total_pending);
+            }
+            metrics.log_summary();
+        }};
+    }
+
+    // Phase 1: normal blocking receive, check cancel between records
     for record in &result_rx {
-        metrics.set_result_queue_depth(result_rx.len() as u64);
-
-        if let Err(e) = writer.write_record(&record) {
-            tracing::error!(
-                id = record.id,
-                path = %record.path,
-                error = %e,
-                "Failed to write record"
-            );
-            jobs.mark_error(record.id, &format!("write failed: {}", e))
-                .ok();
-            metrics.increment_errored();
-            continue;
+        if is_cancelled() {
+            tracing::info!("Cancel requested — draining remaining extracted items");
+            break;
         }
-        jobs.mark_done(record.id, record.ocr_flag).ok();
-        metrics.increment_processed();
+        process_record!(record);
+    }
 
-        // Send to indexer if available
-        if may_index && index_tx.send(record).is_err() {
-            tracing::warn!("Indexer channel closed, dropping record");
+    // Phase 2: drain any records still in-flight from workers
+    //
+    // Workers may have already extracted PDFs and pushed to result_tx
+    // before the producer stopped.  Drain non-blocking until the channel
+    // is empty, then join workers and drain one last time in case a
+    // worker snuck one more in during the drain.
+    if is_cancelled() {
+        loop {
+            match result_rx.try_recv() {
+                Ok(record) => process_record!(record),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
         }
 
-        metrics.log_summary();
+        // Let workers finish their current extraction, then drain again
+        for h in worker_handles {
+            h.join().expect("Worker panicked");
+        }
+
+        loop {
+            match result_rx.try_recv() {
+                Ok(record) => process_record!(record),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+    } else {
+        for h in worker_handles {
+            h.join().expect("Worker panicked");
+        }
     }
 
     drop(index_tx);
 
     producer_handle.join().expect("Producer panicked");
-    for h in worker_handles {
-        h.join().expect("Worker panicked");
-    }
     if let Some(h) = indexer_handle {
         h.join().expect("Indexer panicked");
     }
@@ -361,6 +455,21 @@ fn flush_batch(
             now,
         ) {
             tracing::error!(id = record.id, error = %e, "Failed to index document");
+        } else {
+            indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Store word bounding-box positions with Tantivy-aligned offsets
+        if !record.word_positions.is_empty() {
+            let positions_with_offsets: Vec<(usize, crate::extractor::WordPosition)> =
+                align_offsets_to_tantivy(&record.text, &record.word_positions);
+            tracing::info!("[flush_batch] doc_id={}: {} word_positions → {} aligned positions",
+                record.id, record.word_positions.len(), positions_with_offsets.len());
+            if let Ok(store) = indexer.position_store.lock() {
+                if let Err(e) = store.store_positions(record.id, &positions_with_offsets) {
+                    tracing::error!(id = record.id, error = %e, "Failed to store word positions");
+                }
+            }
         }
     }
 }
@@ -429,6 +538,7 @@ pub fn run_ocr_post_processing(
                     language: Some(ocr_language.clone()),
                     math_source,
                     text: ocr_text.clone(),
+                    word_positions: Vec::new(),
                 };
                 if let Err(e) = writer.write_record(&record) {
                     tracing::error!(error = %e, id = id, "Failed to write OCR output record");

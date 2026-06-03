@@ -3,14 +3,16 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::query::{BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery};
+use tantivy::collector::DocSetCollector;
+use tantivy::query::{BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser, RegexQuery};
 #[cfg(test)]
 use tantivy::query::TermQuery;
 use tantivy::schema::*;
 use tantivy::tokenizer::{Stemmer, StopWordFilter, TextAnalyzer};
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDocument, Term};
+use tantivy::{DocSet, Postings, TERMINATED};
 
 use crate::math_tokenizer::MathAwareTokenizer;
 use crate::tokenizers::{ChineseBigramTokenizer, JapaneseTokenizer};
@@ -39,7 +41,6 @@ pub struct SearchIndex {
 pub struct IndexerMetrics {
     pub docs_indexed: AtomicU64,
     pub last_commit: Mutex<Instant>,
-    pub writer_mem_used: AtomicU64,
 }
 
 impl IndexerMetrics {
@@ -47,7 +48,6 @@ impl IndexerMetrics {
         Self {
             docs_indexed: AtomicU64::new(0),
             last_commit: Mutex::new(Instant::now()),
-            writer_mem_used: AtomicU64::new(0),
         }
     }
 
@@ -264,7 +264,194 @@ impl SearchIndex {
         path_filter: Option<&str>,
         offset: usize,
     ) -> Result<Vec<(f32, TantivyDocument)>> {
-        self.search_stem(query_str, limit, path_filter, offset, false)
+        if Self::is_quoted(query_str) {
+            self.search_phrase(Self::unquote(query_str), limit, path_filter, offset)
+        } else {
+            self.search_stem(query_str, limit, path_filter, offset, false)
+        }
+    }
+
+    /// Returns true if `s` is wrapped in ASCII double-quotes.
+    fn is_quoted(s: &str) -> bool {
+        s.len() >= 2 && s.as_bytes()[0] == b'"' && s.as_bytes()[s.len() - 1] == b'"'
+    }
+
+    /// Strips surrounding double-quotes from `s`.
+    fn unquote<'a>(s: &'a str) -> &'a str {
+        if Self::is_quoted(s) { &s[1..s.len() - 1] } else { s }
+    }
+
+    /// Searches using a Tantivy `PhraseQuery` built directly from whitespace-separated words.
+    /// The caller must have already stripped surrounding quotes from `phrase`.
+    fn search_phrase(
+        &self,
+        phrase: &str,
+        limit: usize,
+        path_filter: Option<&str>,
+        offset: usize,
+    ) -> Result<Vec<(f32, TantivyDocument)>> {
+        let reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let searcher = reader.searcher();
+
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        if words.len() == 1 {
+            return self.search_stem(phrase, limit, path_filter, offset, false);
+        }
+
+        let terms: Vec<Term> = words
+            .iter()
+            .map(|w| Term::from_field_text(self.content_norm_field, w))
+            .collect();
+
+        let phrase_query = PhraseQuery::new(terms);
+
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        clauses.push((Occur::Must, Box::new(phrase_query)));
+
+        if let Some(pattern) = path_filter {
+            if !pattern.is_empty() {
+                let re_query = RegexQuery::from_pattern(pattern, self.path_field)
+                    .context("Invalid path filter regex")?;
+                clauses.push((Occur::Must, Box::new(re_query)));
+            }
+        }
+
+        let query: Box<dyn Query> = if clauses.len() == 1 {
+            clauses.into_iter().next().unwrap().1
+        } else {
+            Box::new(BooleanQuery::new(clauses))
+        };
+
+        let fetch_count = limit.checked_add(offset).unwrap_or(limit);
+        let top_docs = searcher
+            .search(&*query, &TopDocs::with_limit(fetch_count))
+            .context("Phrase search failed")?;
+
+        let mut results = Vec::new();
+        for (score, doc_addr) in top_docs.iter().skip(offset) {
+            let doc = searcher.doc::<TantivyDocument>(*doc_addr)?;
+            results.push((*score, doc));
+            if results.len() >= limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Phrase-aware count: returns total matching documents for a PhraseQuery.
+    fn search_count_phrase(&self, phrase: &str) -> Result<u64> {
+        let reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let searcher = reader.searcher();
+
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        if words.len() <= 1 {
+            let query_parser = QueryParser::for_index(&self.index, vec![self.content_norm_field]);
+            let parsed = query_parser.parse_query(phrase)?;
+            let count = searcher.search(&parsed, &Count)?;
+            return Ok(count as u64);
+        }
+
+        let terms: Vec<Term> = words
+            .iter()
+            .map(|w| Term::from_field_text(self.content_norm_field, w))
+            .collect();
+        let phrase_query = PhraseQuery::new(terms);
+        let count = searcher.search(&phrase_query, &Count)?;
+        Ok(count as u64)
+    }
+
+    /// Returns the word offsets where `term` appears in document `doc_id`.
+    /// Each offset is the 0-indexed word position within the content_norm field.
+    ///
+    /// Works by scanning all segments' postings for the term, checking each
+    /// matching document's stored id field. This is reliable but slower than
+    /// a direct segment-local lookup.
+    ///
+    /// Returns an empty Vec if the term has no positions for this doc.
+    pub fn search_term_positions(&self, doc_id: u64, term: &str) -> Result<Vec<usize>> {
+        let reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let searcher = reader.searcher();
+        let content_term = tantivy::Term::from_field_text(self.content_norm_field, term);
+        let segment_readers = searcher.segment_readers();
+        let mut all_offsets = Vec::new();
+
+        for seg in segment_readers.iter() {
+            let inv_index = match seg.inverted_index(self.content_norm_field) {
+                Ok(idx) => idx,
+                Err(_) => continue,
+            };
+
+            let Ok(Some(mut postings)) = inv_index.read_postings(
+                &content_term,
+                IndexRecordOption::WithFreqsAndPositions,
+            ) else { continue };
+
+            let store_reader = match seg.get_store_reader(0) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            // Postings are already positioned at the first document
+            loop {
+                let seg_doc_id = postings.doc();
+                if seg_doc_id == TERMINATED {
+                    break;
+                }
+                if let Ok(stored_doc) = store_reader.get::<TantivyDocument>(seg_doc_id) {
+                    if let Some(id_val) = stored_doc.get_first(self.id_field) {
+                        if let Some(stored_id) = id_val.as_u64() {
+                            if stored_id == doc_id {
+                                let mut positions = Vec::new();
+                                postings.positions_with_offset(0, &mut positions);
+                                for pos in positions {
+                                    all_offsets.push(pos as usize);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                postings.advance();
+            }
+        }
+
+        Ok(all_offsets)
+    }
+
+    /// Returns the total number of matching documents (ignoring limit/offset).
+    /// For quoted phrase queries it uses `PhraseQuery` directly.
+    pub fn search_count(&self, query_str: &str) -> Result<u64> {
+        if Self::is_quoted(query_str) {
+            return self.search_count_phrase(Self::unquote(query_str));
+        }
+        let reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let searcher = reader.searcher();
+
+        let query_parser = QueryParser::for_index(&self.index, vec![self.content_norm_field]);
+        let parsed = query_parser.parse_query(query_str)
+            .context("Failed to parse search query for count")?;
+
+        let count = searcher.search(&parsed, &Count)?;
+        Ok(count as u64)
     }
 
     pub fn search_stem(
@@ -772,6 +959,73 @@ impl SearchIndex {
         writer.commit()?;
         Ok(true)
     }
+
+    /// Execute a boolean query where each clause is an independent text query
+    /// combined with MUST / SHOULD / MUST_NOT semantics.
+    pub fn search_boolean(
+        &self,
+        clauses: &[(&str, tantivy::query::Occur)],
+        limit: usize,
+        path_filter: Option<&str>,
+        offset: usize,
+        stem: bool,
+    ) -> Result<Vec<(f32, TantivyDocument)>> {
+        let reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let searcher = reader.searcher();
+
+        let search_field = if stem && self.content_stem_field.is_some() {
+            self.content_stem_field.unwrap()
+        } else {
+            self.content_norm_field
+        };
+
+        let query_parser = QueryParser::for_index(&self.index, vec![search_field]);
+
+        let mut bool_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for (term, occur) in clauses {
+            if !term.trim().is_empty() {
+                if let Ok(q) = query_parser.parse_query(term) {
+                    bool_clauses.push((*occur, q));
+                }
+            }
+        }
+
+        if let Some(pattern) = path_filter {
+            if !pattern.is_empty() {
+                if let Ok(re_query) = RegexQuery::from_pattern(pattern, self.path_field) {
+                    bool_clauses.push((Occur::Must, Box::new(re_query)));
+                }
+            }
+        }
+
+        if bool_clauses.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query: Box<dyn Query> = if bool_clauses.len() == 1 {
+            bool_clauses.into_iter().next().unwrap().1
+        } else {
+            Box::new(BooleanQuery::new(bool_clauses))
+        };
+
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit + offset))?;
+
+        let mut results = Vec::with_capacity(top_docs.len());
+        for (_score, doc_addr) in top_docs {
+            let doc = searcher.doc::<TantivyDocument>(doc_addr)?;
+            results.push((_score, doc));
+        }
+
+        if offset > 0 && offset < results.len() {
+            results = results.into_iter().skip(offset).collect();
+        }
+
+        Ok(results)
+    }
 }
 
 #[allow(dead_code)]
@@ -887,22 +1141,29 @@ fn build_schema() -> Schema {
 pub struct Indexer {
     search_index: SearchIndex,
     pub metrics: IndexerMetrics,
+    pub position_store: std::sync::Mutex<crate::positions::PositionStore>,
 }
 
 impl Indexer {
     pub fn new(index_path: &Path) -> Result<Self> {
         let search_index = SearchIndex::new(index_path)?;
+        let positions_path = index_path.join("positions.sqlite");
+        let position_store = std::sync::Mutex::new(crate::positions::PositionStore::open(&positions_path)?);
         Ok(Self {
             search_index,
             metrics: IndexerMetrics::new(),
+            position_store,
         })
     }
 
     pub fn with_ram_buffer(index_path: &Path, ram_buffer: u64) -> Result<Self> {
         let search_index = SearchIndex::with_ram_buffer(index_path, ram_buffer)?;
+        let positions_path = index_path.join("positions.sqlite");
+        let position_store = std::sync::Mutex::new(crate::positions::PositionStore::open(&positions_path)?);
         Ok(Self {
             search_index,
             metrics: IndexerMetrics::new(),
+            position_store,
         })
     }
 
@@ -939,6 +1200,77 @@ impl Indexer {
     pub fn metrics(&self) -> &IndexerMetrics {
         &self.metrics
     }
+}
+
+/// Tokenize text with the same "math" tokenizer used for `content_norm`.
+/// Returns `Vec<(position, text)>` in token order, where `position` is the
+/// 0-indexed word position within the token stream.
+///
+/// This is the canonical tokenizer — all word_offset values in SQLite should
+/// be derived from these positions so they align with Tantivy's term positions.
+pub fn tokenize_with_math(text: &str) -> Vec<(usize, String)> {
+    use tantivy::tokenizer::RegexTokenizer;
+    let mut analyzer = TextAnalyzer::builder(
+        RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
+            .expect("Invalid regex for math tokenizer"),
+    )
+    .filter(tantivy::tokenizer::LowerCaser)
+    .build();
+    let mut stream = analyzer.token_stream(text);
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        let t = stream.token();
+        tokens.push((t.position as usize, t.text.clone()));
+    }
+    tokens
+}
+
+/// Align WordPosition offsets to Tantivy token positions so SQLite
+/// word_offsets match `search_term_positions` results.
+///
+/// Iterates Tantivy tokens and matches each to the next available WordPosition
+/// whose cleaned text matches the token (case-insensitive). One-word look-ahead
+/// allows skipping extraneous WordPositions that have no corresponding token.
+pub fn align_offsets_to_tantivy(
+    text: &str,
+    word_positions: &[crate::extractor::WordPosition],
+) -> Vec<(usize, crate::extractor::WordPosition)> {
+    let tokens = tokenize_with_math(text);
+    let mut result = Vec::new();
+    let mut wp_idx = 0;
+
+    for &(pos, ref token_text) in &tokens {
+        if wp_idx >= word_positions.len() {
+            break;
+        }
+
+        let cleaned = crate::extractor::clean_word_text(&word_positions[wp_idx].text);
+        let cleaned_lower = cleaned.to_lowercase();
+
+        let matched = cleaned_lower == *token_text
+            || token_text.contains(&cleaned_lower)
+            || cleaned_lower.contains(token_text);
+
+        if matched {
+            result.push((pos, word_positions[wp_idx].clone()));
+            wp_idx += 1;
+        } else if wp_idx + 1 < word_positions.len() {
+            // Look ahead: does the next WordPosition match this token?
+            let next_cleaned = crate::extractor::clean_word_text(&word_positions[wp_idx + 1].text);
+            let next_lower = next_cleaned.to_lowercase();
+            if next_lower == *token_text
+                || token_text.contains(&next_lower)
+                || next_lower.contains(token_text)
+            {
+                // Current WordPosition has no corresponding token → skip it
+                result.push((pos, word_positions[wp_idx + 1].clone()));
+                wp_idx += 2;
+            } // else: this token has no bounding box → skip it
+        }
+        // else: this token has no bounding box → skip it
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -1653,6 +1985,56 @@ fn test_search_phrase_query_no_match_when_words_out_of_order() {
 }
 
 #[test]
+fn test_phrase_learning_machine_does_not_match() {
+    let dir = unique_index_dir();
+    let idx = SearchIndex::new(&dir).unwrap();
+    let mut writer = idx.writer().unwrap();
+
+    idx.add_document(&mut writer, 1, "/test_phrase.pdf", "cs1", "support vector machine", "content", "", "").unwrap();
+    idx.add_document(&mut writer, 2, "/test_phrase.pdf", "cs2", "machine learning", "content", "", "").unwrap();
+    idx.add_document(&mut writer, 3, "/test_phrase.pdf", "cs3", "vector machine learning", "content", "", "").unwrap();
+    writer.commit().unwrap();
+
+    // "learning machine" reversed — should NOT match any doc
+    let count = idx.search_count("\"learning machine\"").unwrap();
+    eprintln!("DEBUG search_count(\"learning machine\") = {}", count);
+    assert_eq!(count, 0, "search_count for reversed phrase should be 0");
+
+    let results = idx.search("\"learning machine\"", 10, None, 0).unwrap();
+    assert!(results.is_empty(), "search for reversed phrase should be empty");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_phrase_extra_learning_machine_does_not_match() {
+    let dir = unique_index_dir();
+    let idx = SearchIndex::new(&dir).unwrap();
+    let mut writer = idx.writer().unwrap();
+
+    // Same content as test_phrase_extra.pdf
+    idx.add_document(&mut writer, 1, "/test_phrase_extra.pdf", "cse1", "machine learning", "content", "", "").unwrap();
+    idx.add_document(&mut writer, 2, "/test_phrase_extra.pdf", "cse2", "machine", "content", "", "").unwrap();
+    idx.add_document(&mut writer, 3, "/test_phrase_extra.pdf", "cse3", "machine learning", "content", "", "").unwrap();
+    writer.commit().unwrap();
+
+    // "learning machine" reversed — should NOT match any doc
+    let count = idx.search_count("\"learning machine\"").unwrap();
+    eprintln!("DEBUG search_count(\"learning machine\") (extra) = {}", count);
+    assert_eq!(count, 0, "search_count for reversed phrase should be 0");
+
+    let results = idx.search("\"learning machine\"", 10, None, 0).unwrap();
+    assert!(results.is_empty(), "search for reversed phrase should be empty");
+
+    // Also verify "machine learning" DOES match both docs
+    let results = idx.search("\"machine learning\"", 10, None, 0).unwrap();
+    eprintln!("DEBUG search(\"machine learning\") returned {} results", results.len());
+    assert_eq!(results.len(), 2, "phrase 'machine learning' should match 2 docs in test_phrase_extra.pdf");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn test_search_phrase_query_empty_string_returns_nothing() {
     let dir = unique_index_dir();
     let idx = SearchIndex::new(&dir).unwrap();
@@ -1664,6 +2046,53 @@ fn test_search_phrase_query_empty_string_returns_nothing() {
 
     let results = idx.search("\"\"", 10, None, 0).unwrap();
     assert!(results.is_empty(), "Empty phrase should return no results");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_raw_string_machine_learning_returns_exactly_2_pages() {
+    // Simulates the real flow:
+    //   1. User types "machine learning" (sin comillas) in the C# UI
+    //   2. C# auto-quoting wraps it → "\"machine learning\""
+    //   3. Rust search() detects quotes → builds PhraseQuery directly
+    //   4. PhraseQuery matches only pages where tokens are strictly adjacent
+    let raw_query = "machine learning";
+    let quoted = format!("\"{}\"", raw_query);
+
+    let dir = unique_index_dir();
+    let idx = SearchIndex::new(&dir).unwrap();
+    let mut writer = idx.writer().unwrap();
+
+    // Page 1: solo "machine" — no tiene "learning" después
+    idx.add_document(&mut writer, 1, "/book.pdf", "cs1", "machine", "raw", "", "").unwrap();
+    // Page 2: "machine learning" — frase exacta contigua
+    idx.add_document(&mut writer, 2, "/book.pdf", "cs2", "machine learning", "raw", "", "").unwrap();
+    // Page 3: "machine learning" — frase exacta contigua
+    idx.add_document(&mut writer, 3, "/book.pdf", "cs3", "machine learning", "raw", "", "").unwrap();
+    // Page 4: "the machine is learning fast" — palabras sueltas, NO contiguas
+    idx.add_document(&mut writer, 4, "/book.pdf", "cs4", "the machine is learning fast", "raw", "", "").unwrap();
+
+    writer.commit().unwrap();
+
+    // Usar el query quoted (como llega desde C# con auto-quoting)
+    let results = idx.search(&quoted, 10, None, 0).unwrap();
+    assert_eq!(results.len(), 2,
+        "PhraseQuery for 'machine learning' debe retornar exactamente 2 páginas (2 y 3), no {}",
+        results.len());
+
+    // Verificar que los IDs corresponden a las páginas correctas
+    let mut ids: Vec<u64> = results.iter()
+        .map(|(_, doc)| doc.get_first(idx.id_field).unwrap().as_u64().unwrap())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![2, 3],
+        "Las páginas 2 y 3 deben ser las únicas retornadas. Obtenidas: {:?}", ids);
+
+    // También verificar que search_count es consistente
+    let count = idx.search_count(&quoted).unwrap();
+    assert_eq!(count, 2,
+        "search_count debe coincidir: 2, no {}", count);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2099,16 +2528,86 @@ fn test_search_fuzzy_with_path_filter() {
     }
 
     #[test]
+    fn test_search_term_positions_basic() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world hello", "content", "eng", "").unwrap()
+;
+        writer.commit().unwrap();
+
+        // First verify the doc is searchable at all
+        let results = idx.search("hello", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Doc should be findable via search");
+
+        // Now try position lookup
+        let positions = idx.search_term_positions(1, "hello").unwrap();
+        if positions.is_empty() {
+            // Debug: check which segment the doc is in
+            let reader = idx.index.reader_builder()
+                .reload_policy(ReloadPolicy::OnCommitWithDelay)
+                .try_into().unwrap();
+            let searcher = reader.searcher();
+            let doc_id_term = tantivy::Term::from_field_u64(idx.id_field, 1);
+            let addrs = searcher.search(
+                &tantivy::query::TermQuery::new(doc_id_term, tantivy::schema::IndexRecordOption::Basic),
+                &tantivy::collector::DocSetCollector,
+            ).unwrap();
+            panic!(
+                "No positions found. DocAddrs: {:?}, num_segments: {}, num_docs: {}",
+                addrs,
+                searcher.segment_readers().len(),
+                searcher.num_docs(),
+            );
+        }
+        assert!(positions.contains(&0), "Position 0 should contain 'hello', got positions: {:?}", positions);
+        assert!(positions.contains(&2), "Position 2 should contain 'hello'");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_term_positions_no_match() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "eng", "").unwrap()
+;
+        writer.commit().unwrap();
+
+        let positions = idx.search_term_positions(1, "nonexistent").unwrap();
+        assert!(positions.is_empty(), "Non-existent term should return no positions");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_term_positions_nonexistent_doc() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "eng", "").unwrap()
+;
+        writer.commit().unwrap();
+
+        let positions = idx.search_term_positions(999, "hello").unwrap();
+        assert!(positions.is_empty(), "Non-existent doc_id should return no positions");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_stem_search_no_match() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "", "").unwrap()
-;
+        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "", "").unwrap();
         writer.commit().unwrap();
 
-        // Stem search for word that doesn't exist should return empty
         let results = idx.search_stem("nonexistent", 10, None, 0, true).unwrap();
         assert!(results.is_empty(), "Stemmed search should return empty for non-matching query");
 
@@ -2888,5 +3387,168 @@ fn test_search_fuzzy_with_path_filter() {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- tokenize_with_math ---
+
+    #[test]
+    fn test_tokenize_with_math_simple() {
+        let tokens = tokenize_with_math("hello world");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], (0, "hello".to_string()));
+        assert_eq!(tokens[1], (1, "world".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_with_math_lowercases() {
+        let tokens = tokenize_with_math("Hello World");
+        assert_eq!(tokens[0].1, "hello");
+        assert_eq!(tokens[1].1, "world");
+    }
+
+    #[test]
+    fn test_tokenize_with_math_skips_punctuation() {
+        let tokens = tokenize_with_math("hello, world!");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], (0, "hello".to_string()));
+        assert_eq!(tokens[1], (1, "world".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_with_math_keeps_symbols() {
+        let tokens = tokenize_with_math("E = mc^2");
+        assert!(tokens.iter().any(|(_, t)| t == "e"));
+        assert!(tokens.iter().any(|(_, t)| t == "mc^2"));
+    }
+
+    #[test]
+    fn test_tokenize_with_math_empty() {
+        let tokens = tokenize_with_math("");
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_tokenize_with_math_newline_separator() {
+        let tokens = tokenize_with_math("machine\nlearning");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], (0, "machine".to_string()));
+        assert_eq!(tokens[1], (1, "learning".to_string()));
+    }
+
+    // --- align_offsets_to_tantivy ---
+
+    #[test]
+    fn test_align_offsets_to_tantivy_simple() {
+        let wp = vec![
+            crate::extractor::WordPosition {
+                page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "hello".to_string(),
+            },
+            crate::extractor::WordPosition {
+                page: 1, x_min: 10.0, y_min: 0.0, x_max: 20.0, y_max: 10.0,
+                text: "world".to_string(),
+            },
+        ];
+        let aligned = align_offsets_to_tantivy("hello world", &wp);
+        assert_eq!(aligned.len(), 2);
+        assert_eq!(aligned[0].0, 0); // Tantivy position 0
+        assert_eq!(aligned[0].1.page, 1);
+        assert_eq!(aligned[1].0, 1); // Tantivy position 1
+        assert_eq!(aligned[1].1.page, 1);
+    }
+
+    #[test]
+    fn test_align_offsets_to_tantivy_case_insensitive() {
+        let wp = vec![
+            crate::extractor::WordPosition {
+                page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "PATTERN".to_string(),
+            },
+            crate::extractor::WordPosition {
+                page: 2, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "Pattern".to_string(),
+            },
+        ];
+        let aligned = align_offsets_to_tantivy("PATTERN Pattern", &wp);
+        assert_eq!(aligned.len(), 2);
+        assert_eq!(aligned[0].0, 0);
+        assert_eq!(aligned[0].1.page, 1);
+        assert_eq!(aligned[1].0, 1);
+        assert_eq!(aligned[1].1.page, 2);
+    }
+
+    #[test]
+    fn test_align_offsets_to_tantivy_skips_unmatched_tokens() {
+        // "foo + bar" → Tantivy tokens: ["foo", "+", "bar"]
+        // WordPositions: ["foo", "bar"] (filtered out "+")
+        let wp = vec![
+            crate::extractor::WordPosition {
+                page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "foo".to_string(),
+            },
+            crate::extractor::WordPosition {
+                page: 2, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "bar".to_string(),
+            },
+        ];
+        // Tantivy produces ["foo"@0, "+"@1, "bar"@2]
+        // Token "foo" matches wp[0] → offset 0
+        // Token "+" has no match → skipped
+        // Token "bar" matches wp[1] → offset 2
+        let aligned = align_offsets_to_tantivy("foo + bar", &wp);
+        assert_eq!(aligned.len(), 2);
+        assert_eq!(aligned[0].0, 0);
+        assert_eq!(aligned[0].1.text, "foo");
+        assert_eq!(aligned[1].0, 2);
+        assert_eq!(aligned[1].1.text, "bar");
+    }
+
+    #[test]
+    fn test_align_offsets_to_tantivy_skips_unmatched_word_positions() {
+        // "hello world" → Tantivy tokens: ["hello"@0, "world"@1]
+        // WordPositions: ["hello", "foo", "world"] (extra "foo" has no token)
+        // "hello"@0 matches wp[0], wp[1]="foo" doesn't match "world"@1
+        // look-ahead: wp[2]="world" matches "world"@1 → skip wp[1], use wp[2]
+        let wp = vec![
+            crate::extractor::WordPosition {
+                page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "hello".to_string(),
+            },
+            crate::extractor::WordPosition {
+                page: 1, x_min: 10.0, y_min: 0.0, x_max: 20.0, y_max: 10.0,
+                text: "foo".to_string(),
+            },
+            crate::extractor::WordPosition {
+                page: 2, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "world".to_string(),
+            },
+        ];
+        let aligned = align_offsets_to_tantivy("hello world", &wp);
+        assert_eq!(aligned.len(), 2);
+        assert_eq!(aligned[0].0, 0);
+        assert_eq!(aligned[0].1.text, "hello");
+        assert_eq!(aligned[1].0, 1);
+        assert_eq!(aligned[1].1.text, "world");
+    }
+
+    #[test]
+    fn test_align_offsets_to_tantivy_multi_page_preserves_offsets() {
+        // Simulates a 2-page PDF with "machine" on page 1 and "learning" on page 2
+        let wp = vec![
+            crate::extractor::WordPosition {
+                page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "machine".to_string(),
+            },
+            crate::extractor::WordPosition {
+                page: 2, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "learning".to_string(),
+            },
+        ];
+        let aligned = align_offsets_to_tantivy("machine\nlearning", &wp);
+        assert_eq!(aligned.len(), 2);
+        assert_eq!(aligned[0].0, 0); // "machine" at Tantivy position 0
+        assert_eq!(aligned[0].1.page, 1);
+        assert_eq!(aligned[1].0, 1); // "learning" at Tantivy position 1
+        assert_eq!(aligned[1].1.page, 2);
     }
 }

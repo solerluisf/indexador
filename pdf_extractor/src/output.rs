@@ -14,6 +14,8 @@ pub struct DocumentRecord {
     pub language: Option<String>,
     pub math_source: Option<String>,
     pub text: String,
+    #[serde(skip)]
+    pub word_positions: Vec<crate::extractor::WordPosition>,
 }
 
 pub struct JsonlWriter {
@@ -70,6 +72,7 @@ mod tests {
             language: None,
             math_source: None,
             text: "hello world".into(),
+            word_positions: Vec::new(),
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"id\":42"));
@@ -89,6 +92,7 @@ mod tests {
             language: Some("en".into()),
             math_source: None,
             text: "".into(),
+            word_positions: Vec::new(),
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"language\":\"en\""));
@@ -105,6 +109,7 @@ mod tests {
             language: None,
             math_source: None,
             text: "line1\nline2\ttabbed \"quoted\" \\backslash".into(),
+            word_positions: Vec::new(),
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -121,6 +126,7 @@ mod tests {
             language: Some("ja".into()),
             math_source: None,
             text: "こんにちは世界 ∑∫".into(),
+            word_positions: Vec::new(),
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -131,7 +137,8 @@ mod tests {
     fn test_document_record_language_none_omitted() {
         let record = DocumentRecord {
             id: 5, path: "/n.pdf".into(), checksum: "e".into(),
-            ocr_flag: false, language: None, math_source: None, text: "x".into(),
+            ocr_flag: false, language: None, math_source: None,             text: "x".into(),
+            word_positions: Vec::new(),
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"language\":null"));
@@ -154,6 +161,7 @@ mod tests {
             language: None,
             math_source: None,
             text: "hello".into(),
+            word_positions: Vec::new(),
         };
         writer.write_record(&record).unwrap();
 
@@ -175,10 +183,12 @@ mod tests {
         writer.write_record(&DocumentRecord {
             id: 1, path: "/a.pdf".into(), checksum: "a".into(),
             ocr_flag: false,             language: None, math_source: None, text: "one".into(),
+            word_positions: Vec::new(),
         }).unwrap();
         writer.write_record(&DocumentRecord {
             id: 2, path: "/b.pdf".into(), checksum: "b".into(),
             ocr_flag: true, language: None, math_source: None, text: "two".into(),
+            word_positions: Vec::new(),
         }).unwrap();
 
         let mut content = String::new();
@@ -200,6 +210,7 @@ mod tests {
         let rec = || DocumentRecord {
             id: 1, path: "/a.pdf".into(), checksum: "x".into(),
             ocr_flag: false, language: None, math_source: None, text: "t".into(),
+            word_positions: Vec::new(),
         };
         writer.write_record(&rec()).unwrap();
         assert_eq!(writer.count(), 1);
@@ -233,6 +244,7 @@ mod tests {
             language: None,
             math_source: None,
             text: "x".repeat(100_000),
+            word_positions: Vec::new(),
         };
         writer.write_record(&record).unwrap();
 
@@ -254,6 +266,7 @@ mod tests {
         w1.write_record(&DocumentRecord {
             id: 1, path: "/a.pdf".into(), checksum: "x".into(),
             ocr_flag: false, language: None, math_source: None, text: "first".into(),
+            word_positions: Vec::new(),
         }).unwrap();
         drop(w1);
 
@@ -261,6 +274,7 @@ mod tests {
         w2.write_record(&DocumentRecord {
             id: 2, path: "/b.pdf".into(), checksum: "y".into(),
             ocr_flag: true, language: None, math_source: None, text: "second".into(),
+            word_positions: Vec::new(),
         }).unwrap();
         drop(w2);
 
