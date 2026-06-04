@@ -47,6 +47,7 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
                 <!-- Match navigation bar -->
@@ -68,6 +69,19 @@
                               HorizontalScrollBarVisibility="Auto">
                     <StackPanel x:Name="PageStack" Margin="0,0,10,0"/>
                 </ScrollViewer>
+
+                <!-- Extracted words field -->
+                <TextBox Grid.Row="2" x:Name="WordsField"
+                         IsReadOnly="True"
+                         Height="200"
+                         Margin="0,5,10,0"
+                         TextWrapping="Wrap"
+                         VerticalScrollBarVisibility="Auto"
+                         FontSize="11"
+                         FontFamily="Consolas"
+                         Foreground="DimGray"
+                         Background="#F5F5F5"
+                         Text=""/>
             </Grid>
         </Grid>
 
@@ -76,34 +90,47 @@
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="200"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="200"/>
                 <ColumnDefinition Width="100"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
-            <Label Grid.Column="0" Content="Search:" VerticalAlignment="Center"/>
-            <TextBox Grid.Column="1" x:Name="SearchBox" Height="28"/>
-            <Button Grid.Column="2" x:Name="SearchButton" Content="Search" Height="28" Margin="5,0,0,0"
-                    Click="OnSearchClick"/>
+            <Label Grid.Column="0" Content="Collection:" VerticalAlignment="Center"/>
+            <ComboBox Grid.Column="1" x:Name="CollectionFilter" Width="180" Height="28"
+                      DisplayMemberPath="Label" SelectedValuePath="Id"
+                      SelectionChanged="OnCollectionFilterChanged" />
 
-            <ComboBox Grid.Column="3" x:Name="SearchMode" Width="120" Height="28" Margin="10,0,0,0"
-                      SelectedIndex="0" SelectionChanged="OnSearchModeChanged">
+            <Label Grid.Column="2" Content="Search:" VerticalAlignment="Center" Margin="10,0,0,0"/>
+            <TextBox Grid.Column="3" x:Name="SearchBox" Height="28" IsEnabled="False"/>
+            <Button Grid.Column="4" x:Name="SearchButton" Content="Search" Height="28" Margin="5,0,0,0"
+                    Click="OnSearchClick" IsEnabled="False"/>
+
+            <ComboBox Grid.Column="5" x:Name="SearchMode" Width="120" Height="28" Margin="10,0,0,0"
+                      SelectedIndex="0" SelectionChanged="OnSearchModeChanged" IsEnabled="False">
                 <ComboBoxItem Content="Standard"/>
                 <ComboBoxItem Content="Fuzzy"/>
                 <ComboBoxItem Content="Stem"/>
                 <ComboBoxItem Content="Boolean"/>
             </ComboBox>
 
-            <StackPanel Grid.Column="4" Orientation="Horizontal" Margin="20,0,0,0">
+            <StackPanel Grid.Column="6" Orientation="Horizontal" Margin="20,0,0,0">
                 <Button x:Name="PrevPage" Content="◀◀" Width="30" Height="28"
                         Click="OnPrevPage" IsEnabled="False" ToolTip="Previous page of results"/>
                 <Label x:Name="PageInfo" Content="0 / 0" VerticalAlignment="Center" Margin="5,0"/>
                 <Button x:Name="NextPage" Content="▶▶" Width="30" Height="28"
                         Click="OnNextPage" IsEnabled="False" ToolTip="Next page of results"/>
+                <Separator Width="1" Height="20" Margin="8,0" Background="LightGray"/>
+                <Button x:Name="PrevPosition" Content="◀" Width="28" Height="24"
+                        Click="OnPrevPosition" IsEnabled="False" ToolTip="Previous match"/>
+                <Label x:Name="PositionInfo" Content="0 / 0" VerticalAlignment="Center" Margin="4,0"/>
+                <Button x:Name="NextPosition" Content="▶" Width="28" Height="24"
+                        Click="OnNextPosition" IsEnabled="False" ToolTip="Next match"/>
             </StackPanel>
 
-            <StatusBar Grid.Column="5" Margin="10,0,0,0">
+            <StatusBar Grid.Column="7" Margin="10,0,0,0">
                 <StatusBarItem x:Name="StatusItem">
                     <TextBlock x:Name="ResultCountLabel" Text="Ready"/>
                 </StatusBarItem>

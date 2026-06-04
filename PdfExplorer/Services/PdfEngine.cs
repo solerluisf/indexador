@@ -8,6 +8,9 @@ namespace PdfExplorer.Services;
 public sealed class PdfEngine : IDisposable
 {
     private const string Dll = "pdf_extractor_capi.dll";
+    private readonly string _settingsPath;
+
+    public AppSettings Settings { get; } = new();
 
     private static void Log(string msg)
     {
@@ -37,6 +40,9 @@ public sealed class PdfEngine : IDisposable
         if (rc != 0)
             ThrowOnError(rc, this);
 
+        _settingsPath = System.IO.Path.Combine(registryDir, "settings.json");
+        LoadSettings();
+
         Collections = ListCollections();
         Log("PdfEngine done");
     }
@@ -53,6 +59,9 @@ public sealed class PdfEngine : IDisposable
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_collection_stats(uint collId, byte[] outJson, ref uint outLen);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_get_problematic_jobs(uint collId, byte[] outJson, ref uint outLen);
 
     public long AddCollection(string booksFolder)
     {
@@ -81,6 +90,15 @@ public sealed class PdfEngine : IDisposable
         return JsonSerializer.Deserialize<CollectionStats>(json);
     }
 
+    public List<ProblematicJob> GetProblematicJobs(uint collId)
+    {
+        Log($"Calling GetProblematicJobs({collId})");
+        var json = CallBuf((buf, ref len) => pdf_get_problematic_jobs(collId, buf, ref len));
+        var result = JsonSerializer.Deserialize<List<ProblematicJob>>(json) ?? new List<ProblematicJob>();
+        Log($"GetProblematicJobs returned: {result.Count} items");
+        return result;
+    }
+
     // ── Search ─────────────────────────────────────────────────────
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -95,9 +113,15 @@ public sealed class PdfEngine : IDisposable
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_get_term_positions(uint collId, long docId, byte[] term, byte[] outJson, ref uint outLen);
 
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    private static extern void pdf_free_string(IntPtr ptr);
+
     public SearchResponse Search(string query, int limit = 1000, int offset = 0, uint? collId = null)
     {
-        if (query is not null && query.Contains(' ') && !query.Contains('"') && !query.Contains('\'')
+        if (string.IsNullOrWhiteSpace(query))
+            return new SearchResponse(0, Array.Empty<SearchResult>());
+
+        if (query.Contains(' ') && !query.Contains('"') && !query.Contains('\'')
             && !query.Contains(" AND ") && !query.Contains(" OR ")
             && query[0] != '+' && query[0] != '-')
         {
@@ -105,9 +129,28 @@ public sealed class PdfEngine : IDisposable
         }
         Log($"Calling Search(query='{query}', limit={limit}, offset={offset}, collId={collId})");
         var q = Utf8(query);
-        var json = collId.HasValue
-            ? CallBuf((buf, ref len) => pdf_search_collection(collId.Value, q, (uint)limit, (uint)offset, buf, ref len))
-            : CallBuf((buf, ref len) => pdf_search_all(q, (uint)limit, (uint)offset, buf, ref len));
+        var buf = new byte[65536];
+        uint len = (uint)buf.Length;
+        int rc;
+
+        if (collId.HasValue)
+            rc = pdf_search_collection(collId.Value, q, (uint)limit, (uint)offset, buf, ref len);
+        else
+            rc = pdf_search_all(q, (uint)limit, (uint)offset, buf, ref len);
+
+        while (rc == -4)
+        {
+            buf = new byte[len];
+            if (collId.HasValue)
+                rc = pdf_search_collection(collId.Value, q, (uint)limit, (uint)offset, buf, ref len);
+            else
+                rc = pdf_search_all(q, (uint)limit, (uint)offset, buf, ref len);
+        }
+
+        if (rc != 0)
+            ThrowOnError(rc, this);
+
+        var json = Encoding.UTF8.GetString(buf, 0, (int)len);
         var result = JsonSerializer.Deserialize<SearchResponse>(json) ?? new SearchResponse(0, Array.Empty<SearchResult>());
         Log($"Search returned: total={result.Total}");
         return result;
@@ -148,14 +191,18 @@ public sealed class PdfEngine : IDisposable
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_set_boolean_query(byte[]? json);
 
-    public uint FuzzyDistance { set => pdf_set_fuzzy_distance(value); }
-    public bool StemEnabled { set => pdf_set_stem(value ? 1u : 0u); }
-    public string? SearchField { set => pdf_set_search_field(value is not null ? Utf8(value) : null); }
-    public string? PathFilter { set => pdf_set_path_filter(value is not null ? Utf8(value) : null); }
-    public float RecencyWeight { set => pdf_set_recency_weight(value); }
-    public string? FieldWeights { set => pdf_set_field_weights(value is not null ? Utf8(value) : null); }
-    public string? BooleanQuery { set => pdf_set_boolean_query(value is not null ? Utf8(value) : null); }
-    public void SetCollectionBoost(uint collId, float weight) => pdf_set_collection_boost(collId, weight);
+    public uint FuzzyDistance { set { Settings.FuzzyDistance = value; pdf_set_fuzzy_distance(value); } }
+    public bool StemEnabled { set { Settings.StemEnabled = value; pdf_set_stem(value ? 1u : 0u); } }
+    public string? SearchField { set { Settings.SearchField = value; pdf_set_search_field(value is not null ? Utf8(value) : null); } }
+    public string? PathFilter { set { Settings.PathFilter = value; pdf_set_path_filter(value is not null ? Utf8(value) : null); } }
+    public float RecencyWeight { set { Settings.RecencyWeight = value; pdf_set_recency_weight(value); } }
+    public string? FieldWeights { set { Settings.FieldWeights = value; pdf_set_field_weights(value is not null ? Utf8(value) : null); } }
+    public string? BooleanQuery { set { Settings.BooleanQuery = value; pdf_set_boolean_query(value is not null ? Utf8(value) : null); } }
+    public void SetCollectionBoost(uint collId, float weight)
+    {
+        Settings.CollectionBoosts[collId] = weight;
+        pdf_set_collection_boost(collId, weight);
+    }
 
     // ── Indexing ───────────────────────────────────────────────────
 
@@ -167,6 +214,12 @@ public sealed class PdfEngine : IDisposable
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_is_cancel_requested();
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_close_collection(uint collId);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_close_all();
 
     public async Task<int> IndexCollectionAsync(uint collId, bool ocr, bool noIndex,
         IProgress<(long current, long total)>? progress, CancellationToken ct)
@@ -185,7 +238,7 @@ public sealed class PdfEngine : IDisposable
         var progressCb = Marshal.GetFunctionPointerForDelegate(cb);
         var rc = await Task.Run(() =>
         {
-            _ = cb;
+            _ = cb; // Keep delegate alive so GC doesn't collect it during P/Invoke call
             return pdf_index_collection(collId, flags, progressCb);
         });
         Log($"IndexCollectionAsync returned: {rc}");
@@ -243,16 +296,86 @@ public sealed class PdfEngine : IDisposable
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_set_ocr_max_dim(uint value);
 
-    public ulong RamBuffer { set => pdf_set_ram_buffer(value); }
-    public uint IndexerBatchSize { set => pdf_set_indexer_batch_size(value); }
-    public uint CommitInterval { set => pdf_set_commit_interval(value); }
-    public uint CommitTimeout { set => pdf_set_commit_timeout(value); }
-    public uint ExtractWorkers { set => pdf_set_extract_workers(value); }
-    public uint ChannelCapacity { set => pdf_set_channel_capacity(value); }
-    public string? TesseractPath { set => pdf_set_tesseract_path(value is not null ? Utf8(value) : null); }
-    public string? OcrLanguage { set => pdf_set_ocr_language(value is not null ? Utf8(value) : null); }
-    public uint OcrWorkers { set => pdf_set_ocr_workers(value); }
-    public uint OcrMaxDim { set => pdf_set_ocr_max_dim(value); }
+    public ulong RamBuffer { set { Settings.RamBuffer = value; pdf_set_ram_buffer(value); } }
+    public uint IndexerBatchSize { set { Settings.IndexerBatchSize = value; pdf_set_indexer_batch_size(value); } }
+    public uint CommitInterval { set { Settings.CommitInterval = value; pdf_set_commit_interval(value); } }
+    public uint CommitTimeout { set { Settings.CommitTimeout = value; pdf_set_commit_timeout(value); } }
+    public uint ExtractWorkers { set { Settings.ExtractWorkers = value; pdf_set_extract_workers(value); } }
+    public uint ChannelCapacity { set { Settings.ChannelCapacity = value; pdf_set_channel_capacity(value); } }
+    public string? TesseractPath { set { Settings.TesseractPath = value; pdf_set_tesseract_path(value is not null ? Utf8(value) : null); } }
+    public string? OcrLanguage { set { Settings.OcrLanguage = value; pdf_set_ocr_language(value is not null ? Utf8(value) : null); } }
+    public uint OcrWorkers { set { Settings.OcrWorkers = value; pdf_set_ocr_workers(value); } }
+    public uint OcrMaxDim { set { Settings.OcrMaxDim = value; pdf_set_ocr_max_dim(value); } }
+
+    // ── Settings persistence ────────────────────────────────────────
+
+    public void SaveSettings()
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(Settings, new JsonSerializerOptions { WriteIndented = true });
+            System.IO.File.WriteAllText(_settingsPath, json);
+        }
+        catch { /* best-effort */ }
+    }
+
+    public void LoadSettings()
+    {
+        if (!System.IO.File.Exists(_settingsPath)) return;
+        try
+        {
+            var json = System.IO.File.ReadAllText(_settingsPath);
+            var s = JsonSerializer.Deserialize<AppSettings>(json);
+            if (s is null) return;
+
+            Settings.FuzzyDistance = s.FuzzyDistance;
+            Settings.StemEnabled = s.StemEnabled;
+            Settings.RecencyWeight = s.RecencyWeight;
+            Settings.TesseractPath = s.TesseractPath;
+            Settings.OcrLanguage = s.OcrLanguage;
+            Settings.OcrWorkers = s.OcrWorkers;
+            Settings.OcrMaxDim = s.OcrMaxDim;
+            Settings.RamBuffer = s.RamBuffer;
+            Settings.IndexerBatchSize = s.IndexerBatchSize;
+            Settings.CommitInterval = s.CommitInterval;
+            Settings.CommitTimeout = s.CommitTimeout;
+            Settings.ExtractWorkers = s.ExtractWorkers;
+            Settings.ChannelCapacity = s.ChannelCapacity;
+            Settings.CollectionBoosts = s.CollectionBoosts ?? new();
+            Settings.SearchField = s.SearchField;
+            Settings.PathFilter = s.PathFilter;
+            Settings.FieldWeights = s.FieldWeights;
+            Settings.BooleanQuery = s.BooleanQuery;
+
+            // Push to DLL
+            pdf_set_fuzzy_distance(Settings.FuzzyDistance);
+            pdf_set_stem(Settings.StemEnabled ? 1u : 0u);
+            pdf_set_recency_weight(Settings.RecencyWeight);
+            if (Settings.TesseractPath is not null)
+                pdf_set_tesseract_path(Utf8(Settings.TesseractPath));
+            if (Settings.OcrLanguage is not null)
+                pdf_set_ocr_language(Utf8(Settings.OcrLanguage));
+            pdf_set_ocr_workers(Settings.OcrWorkers);
+            pdf_set_ocr_max_dim(Settings.OcrMaxDim);
+            pdf_set_ram_buffer(Settings.RamBuffer);
+            pdf_set_indexer_batch_size(Settings.IndexerBatchSize);
+            pdf_set_commit_interval(Settings.CommitInterval);
+            pdf_set_commit_timeout(Settings.CommitTimeout);
+            pdf_set_extract_workers(Settings.ExtractWorkers);
+            pdf_set_channel_capacity(Settings.ChannelCapacity);
+            foreach (var (id, weight) in Settings.CollectionBoosts)
+                pdf_set_collection_boost(id, weight);
+            if (Settings.FieldWeights is not null)
+                pdf_set_field_weights(Utf8(Settings.FieldWeights));
+            if (Settings.SearchField is not null)
+                pdf_set_search_field(Utf8(Settings.SearchField));
+            if (Settings.PathFilter is not null)
+                pdf_set_path_filter(Utf8(Settings.PathFilter));
+            if (Settings.BooleanQuery is not null)
+                pdf_set_boolean_query(Utf8(Settings.BooleanQuery));
+        }
+        catch { /* best-effort — corrupt or old settings file */ }
+    }
 
     // ── Utilities ──────────────────────────────────────────────────
 
@@ -311,7 +434,7 @@ public sealed class PdfEngine : IDisposable
         var buf = new byte[initialSize];
         uint len = (uint)buf.Length;
         var rc = nativeCall(buf, ref len);
-        if (rc == -4)
+        while (rc == -4)
         {
             buf = new byte[len];
             rc = nativeCall(buf, ref len);
@@ -336,6 +459,11 @@ public sealed class PdfEngine : IDisposable
 
     public void Dispose()
     {
-        // No native cleanup needed — GC handles P/Invoke stubs
+        pdf_close_all();
+    }
+
+    public void CloseCollection(uint collId)
+    {
+        pdf_close_collection(collId);
     }
 }

@@ -14,7 +14,7 @@ public sealed class PdfPageRenderer : IDisposable
 
     private static void Log(string msg) => Console.Error.WriteLine($"[PdfPageRenderer] {msg}");
 
-    public PdfPageRenderer(double targetWidth = 800)
+    public PdfPageRenderer(double targetWidth = 900)
     {
         _targetWidth = targetWidth;
         Log($"Created, targetWidth={targetWidth}");
@@ -22,7 +22,7 @@ public sealed class PdfPageRenderer : IDisposable
 
     public async Task LoadDocumentAsync(string pdfPath)
     {
-        // Strip \\?\ prefix — WinRT API doesn't handle it
+        // Strip \\?\ prefix for WinRT — but keep original for FileStream fallback
         var cleanPath = pdfPath.StartsWith(@"\\?\") ? pdfPath[4..] : pdfPath;
 
         if (_currentPath == cleanPath && _document is not null)
@@ -34,6 +34,7 @@ public sealed class PdfPageRenderer : IDisposable
         DisposeDocument();
         Log($"LoadDocumentAsync: loading '{cleanPath}'");
 
+        // Try 1: StorageFile (fast, but may fail with long paths / UNABLE_TO_MASK_PATH)
         try
         {
             var file = await StorageFile.GetFileFromPathAsync(cleanPath);
@@ -41,10 +42,34 @@ public sealed class PdfPageRenderer : IDisposable
             _document = await PdfDocument.LoadFromFileAsync(file);
             Log($"  PdfDocument loaded, pages={_document.PageCount}");
             _currentPath = cleanPath;
+            return;
         }
         catch (Exception ex)
         {
-            Log($"  LoadDocumentAsync error: {ex.GetType().Name}: {ex.Message}");
+            Log($"  StorageFile failed ({ex.GetType().Name}: {ex.Message}) — trying memory stream");
+        }
+
+        // Try 2: FileStream + InMemoryRandomAccessStream (handles any path, no WinRT limitations)
+        try
+        {
+            var fileBytes = await System.IO.File.ReadAllBytesAsync(pdfPath);
+            Log($"  ReadAllBytesAsync OK, size={fileBytes.Length} bytes");
+
+            var memStream = new InMemoryRandomAccessStream();
+            using (var writer = new DataWriter(memStream.GetOutputStreamAt(0)))
+            {
+                writer.WriteBytes(fileBytes);
+                await writer.StoreAsync();
+            }
+            memStream.Seek(0);
+
+            _document = await PdfDocument.LoadFromStreamAsync(memStream);
+            Log($"  PdfDocument loaded from stream, pages={_document.PageCount}");
+            _currentPath = cleanPath;
+        }
+        catch (Exception ex)
+        {
+            Log($"  Memory stream fallback also failed: {ex.GetType().Name}: {ex.Message}");
             throw;
         }
     }
@@ -62,10 +87,14 @@ public sealed class PdfPageRenderer : IDisposable
         try
         {
             page = _document.GetPage((uint)pageIndex);
-            var pageWidth = page.Size.Width;
-            var pageHeight = page.Size.Height;
-            Log($"  Page {pageIndex + 1}: size={pageWidth}x{pageHeight} pts");
+            var pageWidthDips = page.Size.Width;
+            var pageHeightDips = page.Size.Height;
+            // PdfPage.Size is in DIPs (1/96 inch).  Convert to PDF points (1/72 inch).
+            var pageWidth = pageWidthDips * 72.0 / 96.0;
+            var pageHeight = pageHeightDips * 72.0 / 96.0;
+            Log($"  Page {pageIndex + 1}: size={pageWidthDips}x{pageHeightDips} dips ({pageWidth:F1}x{pageHeight:F1} pts)");
 
+            var t0 = DateTime.UtcNow;
             var dpi = _targetWidth / (pageWidth / 72.0);
             var destWidth = (uint)(pageWidth * dpi / 72.0);
             var destHeight = (uint)(pageHeight * dpi / 72.0);
@@ -79,39 +108,30 @@ public sealed class PdfPageRenderer : IDisposable
 
             stream = new InMemoryRandomAccessStream();
             await page.RenderToStreamAsync(stream, options);
-            Log($"  RenderToStreamAsync OK, size={stream.Size} bytes");
+            var t1 = DateTime.UtcNow;
+            Log($"  RenderToStreamAsync OK, size={stream.Size} bytes (took {(t1 - t0).TotalMilliseconds:F1}ms)");
 
-            // Read all bytes from the WinRT stream using chunked DataReader
+            // Read rendered page bytes — single read, single allocation
             stream.Seek(0);
             var reader = new DataReader(stream.GetInputStreamAt(0));
-            var allBytes = new System.IO.MemoryStream((int)stream.Size);
-            uint remaining = (uint)stream.Size;
-            while (remaining > 0)
-            {
-                uint chunkSize = Math.Min(remaining, 65536);
-                uint loaded = await reader.LoadAsync(chunkSize);
-                if (loaded == 0) break;
-                var chunk = new byte[loaded];
-                reader.ReadBytes(chunk);
-                allBytes.Write(chunk, 0, (int)loaded);
-                remaining -= loaded;
-            }
+            uint loaded = await reader.LoadAsync((uint)stream.Size);
+            var imageBytes = new byte[loaded];
+            reader.ReadBytes(imageBytes);
             reader.Dispose();
 
             var imgWidth = (int)destWidth;
             var imgHeight = (int)destHeight;
 
             // Load into BitmapImage directly from memory (no temp file)
-            allBytes.Seek(0, System.IO.SeekOrigin.Begin);
             var bitmap = new BitmapImage();
             bitmap.BeginInit();
-            bitmap.StreamSource = allBytes;
+            bitmap.StreamSource = new System.IO.MemoryStream(imageBytes);
             bitmap.CacheOption = BitmapCacheOption.OnLoad;
             bitmap.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
             bitmap.EndInit();
             bitmap.Freeze();
-
-            Log($"  BitmapImage OK ({imgWidth}x{imgHeight})");
+            var t2 = DateTime.UtcNow;
+            Log($"  BitmapImage OK ({imgWidth}x{imgHeight}) (took {(t2 - t1).TotalMilliseconds:F1}ms)");
 
             return new PageRenderItem
             {

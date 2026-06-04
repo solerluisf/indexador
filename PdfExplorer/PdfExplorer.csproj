@@ -12,7 +12,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="..\target\release\pdf_extractor_capi.dll">
+    <Content Include="..\target\$(Configuration)\pdf_extractor_capi.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Visible>false</Visible>
     </Content>

@@ -24,4 +24,10 @@ public partial class App : Application
             Shutdown();
         }
     }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        Engine?.SaveSettings();
+        base.OnExit(e);
+    }
 }

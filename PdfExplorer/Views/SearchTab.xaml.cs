@@ -10,14 +10,23 @@ namespace PdfExplorer.Views;
 public partial class SearchTab : Page
 {
     private readonly PdfEngine _engine;
-    private readonly PdfPageRenderer _renderer = new(800);
+    private readonly PdfPageRenderer _renderer = new(1920);
+    private readonly Dictionary<(string, int), PageRenderItem> _globalPageCache = new();
     private int _currentPage;
     private long _totalHits;
     private string _lastQuery = string.Empty;
+    private string _currentPdfPath = string.Empty;
     private List<WordPosition> _lastPositions = new();
-    private List<PageRenderItem> _renderedPages = new();
+    private List<int> _matchingPages = new();
+    private Dictionary<int, List<WordPosition>> _positionsByPage = new();
+    private Dictionary<int, PageRenderItem> _pageCache = new();
     private int _currentMatchIndex;
     private int _totalMatchPages;
+    private List<Border?> _pageElements = new();
+    private bool _isLoadingNextPage;
+    private int _currentPositionIndex = -1;
+    private Dictionary<int, List<Rectangle>> _matchHighlightRects = new();
+    private uint _selectedCollId;
 
     private static void Log(string msg)
     {
@@ -30,7 +39,33 @@ public partial class SearchTab : Page
         Log("Constructor start");
         InitializeComponent();
         _engine = App.Engine;
+        Loaded += OnLoaded;
         Log("Constructor end, engine=" + (_engine is not null ? "ok" : "null"));
+    }
+
+    private void OnLoaded(object sender, RoutedEventArgs e)
+    {
+        CollectionFilter.ItemsSource = _engine.Collections;
+        CollectionFilter.SelectedIndex = -1;
+    }
+
+    private void OnCollectionFilterChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (CollectionFilter.SelectedItem is CollectionInfo coll)
+        {
+            _selectedCollId = (uint)coll.Id;
+            SearchBox.IsEnabled = true;
+            SearchButton.IsEnabled = true;
+            SearchMode.IsEnabled = true;
+            SearchBox.Focus();
+        }
+        else
+        {
+            _selectedCollId = 0;
+            SearchBox.IsEnabled = false;
+            SearchButton.IsEnabled = false;
+            SearchMode.IsEnabled = false;
+        }
     }
 
     // ── Search ──────────────────────────────────────────────────────
@@ -52,7 +87,7 @@ public partial class SearchTab : Page
 
         try
         {
-            var results = _engine.Search(query, limit: 1000, offset: _currentPage * 1000);
+            var results = _engine.Search(query, limit: 1000, offset: _currentPage * 1000, collId: _selectedCollId);
             _totalHits = results.Total;
             Log($"RunSearch: totalHits={_totalHits}, results count={results.Results.Count}");
 
@@ -93,6 +128,7 @@ public partial class SearchTab : Page
                 _engine.StemEnabled = false;
                 break;
         }
+        _engine.SaveSettings();
     }
 
     private async void OnNextPage(object sender, RoutedEventArgs e)
@@ -119,22 +155,42 @@ public partial class SearchTab : Page
             return;
         }
 
+        var t0 = DateTime.UtcNow;
         Log($"OnResultSelected: id={result.Id}, path={result.Path}, collId={result.CollectionId}, query='{_lastQuery}'");
 
         ClearViewer();
+        _currentPdfPath = result.Path;
         StatusLabel.Text = System.IO.Path.GetFileName(result.Path);
 
         // Fetch term positions for the current search term
         try
         {
             _lastPositions = _engine.GetTermPositions(
-                (uint)(result.CollectionId ?? 0),
+                _selectedCollId,
                 result.Id,
                 _lastQuery
             );
-            Log($"GetTermPositions returned {_lastPositions.Count} positions");
+            var t1 = DateTime.UtcNow;
+            Log($"GetTermPositions returned {_lastPositions.Count} positions (took {(t1 - t0).TotalMilliseconds:F0}ms)");
             if (_lastPositions.Count > 0)
-                Log($"First position: page={_lastPositions[0].Page}, x_min={_lastPositions[0].XMin}");
+                Log($"First position: page={_lastPositions[0].Page}, x_min={_lastPositions[0].XMin}, word_text={_lastPositions[0].WordText}");
+
+            // Populate positions with word text and coordinates
+            if (_lastPositions.Count > 0)
+            {
+                var lines = new List<string>(_lastPositions.Count + 1);
+                lines.Add($"Positions ({_lastPositions.Count}):");
+                foreach (var p in _lastPositions)
+                {
+                    var word = string.IsNullOrWhiteSpace(p.WordText) ? "?" : p.WordText;
+                    lines.Add($"  p{p.Page} \"{word}\" ({p.XMin:F1},{p.YMin:F1})-({p.XMax:F1},{p.YMax:F1})");
+                }
+                WordsField.Text = string.Join("\n", lines);
+            }
+            else
+            {
+                WordsField.Text = result.Snippet;
+            }
         }
         catch (Exception ex)
         {
@@ -143,12 +199,15 @@ public partial class SearchTab : Page
             return;
         }
 
+        var tPos = DateTime.UtcNow;
+
         // Load PDF
         try
         {
             Log($"Loading PDF: {result.Path}");
             await _renderer.LoadDocumentAsync(result.Path);
-            Log($"PDF loaded, page count={_renderer.PageCount}");
+            var t2 = DateTime.UtcNow;
+            Log($"PDF loaded, page count={_renderer.PageCount} (took {(t2 - tPos).TotalMilliseconds:F0}ms)");
         }
         catch (Exception ex)
         {
@@ -164,162 +223,244 @@ public partial class SearchTab : Page
             return;
         }
 
+        var tPdf = DateTime.UtcNow;
+
         // Determine which pages match (sorted, 0-based)
-        var matchingPages = _lastPositions
+        _matchingPages = _lastPositions
             .Select(p => p.Page - 1)
             .Where(p => p >= 0)
             .Distinct()
             .OrderBy(p => p)
             .ToList();
 
-        Log($"Matching pages ({matchingPages.Count}): [{string.Join(", ", matchingPages.Select(p => p + 1))}]");
+        Log($"Matching pages ({_matchingPages.Count}): [{string.Join(", ", _matchingPages.Select(p => p + 1))}]");
 
         // Group positions by page
-        var positionsByPage = _lastPositions
+        _positionsByPage = _lastPositions
             .GroupBy(p => p.Page - 1)
             .ToDictionary(g => g.Key, g => g.ToList());
 
-        _renderedPages = new List<PageRenderItem>(matchingPages.Count);
-        foreach (var pageIdx in matchingPages)
-        {
-            var pagePositions = positionsByPage.GetValueOrDefault(pageIdx, new List<WordPosition>());
-            Log($"Rendering page {pageIdx + 1} (0-based={pageIdx}), positions={pagePositions.Count}");
-            try
-            {
-                var item = await _renderer.RenderPageAsync(pageIdx, pagePositions);
-                Log($"  rendered: image={(item.PageImage is not null ? $"{item.ImagePixelWidth}x{item.ImagePixelHeight}" : "null")}");
-                _renderedPages.Add(item);
-            }
-            catch (Exception ex)
-            {
-                Log($"  RenderPageAsync error: {ex.GetType().Name}: {ex.Message}");
-                _renderedPages.Add(new PageRenderItem
-                {
-                    PageNumber = pageIdx + 1,
-                    ImagePixelWidth = 0,
-                    PdfPageWidth = 0,
-                    Positions = pagePositions,
-                });
-            }
-        }
+        _totalMatchPages = _matchingPages.Count;
 
-        if (_renderedPages.Count == 0)
+        if (_matchingPages.Count == 0)
         {
-            Log("No pages rendered successfully");
-            StatusLabel.Text += " — failed to render any pages";
+            Log("No matching pages");
+            StatusLabel.Text += " — no matching pages";
             return;
         }
 
-        Log($"Building page view with {_renderedPages.Count} pages");
-        BuildPageView();
-
-        _totalMatchPages = _renderedPages.Count;
+        // Render only the first match page; remaining pages load on scroll
         _currentMatchIndex = 0;
+        _currentPositionIndex = -1;
+        _pageElements = new List<Border?>(_matchingPages.Count);
+        for (int i = 0; i < _matchingPages.Count; i++)
+            _pageElements.Add(null);
+
+        var firstItem = await GetOrRenderPageAsync(_matchingPages[0]);
+        var t3 = DateTime.UtcNow;
+        Log($"First page rendered (took {(t3 - tPdf).TotalMilliseconds:F0}ms)");
+        AddPageToStack(0, firstItem);
         UpdateMatchNav();
+        UpdatePositionNav();
         ScrollToMatch(0);
-        Log("OnResultSelected complete");
+
+        PageScroller.ScrollChanged += OnPageScroll;
+        _isLoadingNextPage = false;
+
+        var tEnd = DateTime.UtcNow;
+        Log($"OnResultSelected complete (total {(tEnd - t0).TotalMilliseconds:F0}ms)");
     }
 
-    private void BuildPageView()
+    // ── Lazy rendering ───────────────────────────────────────────────
+
+    private async Task<PageRenderItem> GetOrRenderPageAsync(int pageIdx)
     {
-        PageStack.Children.Clear();
-
-        foreach (var item in _renderedPages)
+        var cacheKey = (_currentPdfPath, pageIdx);
+        if (_globalPageCache.TryGetValue(cacheKey, out var cached))
         {
-            var border = new Border
-            {
-                BorderBrush = Brushes.Silver,
-                BorderThickness = new Thickness(1),
-                Margin = new Thickness(0, 0, 0, 10),
-                Padding = new Thickness(5),
-            };
-
-            var header = new TextBlock
-            {
-                Text = item.PageImage is null
-                    ? $"{item.PageHeader} — render failed"
-                    : item.PageHeader,
-                FontWeight = FontWeights.SemiBold,
-                Margin = new Thickness(0, 0, 0, 4),
-            };
-
-            var image = new Image
-            {
-                Source = item.PageImage,
-                Stretch = Stretch.None,
-                HorizontalAlignment = HorizontalAlignment.Left,
-            };
-
-            // Fallback text when image is null
-            if (item.PageImage is null && item.ImagePixelWidth > 0)
-                image.Source = null;
-
-            var canvas = new Canvas
-            {
-                Width = item.ImagePixelWidth,
-                Height = item.ImagePixelHeight,
-                IsHitTestVisible = false,
-                Background = Brushes.Transparent,
-            };
-
-            // Add highlight rectangles
-            foreach (var rect in item.GetHighlightRects())
-            {
-                var r = new Rectangle
-                {
-                    Width = rect.Width,
-                    Height = rect.Height,
-                    Fill = new SolidColorBrush(Color.FromArgb(0x60, 0xFF, 0xE6, 0x00)),
-                    Stroke = new SolidColorBrush(Color.FromArgb(0x99, 0xFF, 0xB4, 0x00)),
-                    StrokeThickness = 1,
-                    RadiusX = 1,
-                    RadiusY = 1,
-                };
-                Canvas.SetLeft(r, rect.X);
-                Canvas.SetTop(r, rect.Y);
-                canvas.Children.Add(r);
-            }
-
-            var grid = new Grid();
-            grid.Children.Add(image);
-            grid.Children.Add(canvas);
-
-            var stack = new StackPanel();
-            stack.Children.Add(header);
-            stack.Children.Add(grid);
-            border.Child = stack;
-            PageStack.Children.Add(border);
+            _pageCache[pageIdx] = cached;
+            return cached;
         }
 
-        var pageNums = string.Join(", ", _renderedPages.Select(p => p.PageNumber));
-        Log($"BuildPageView: added {_renderedPages.Count} items to PageStack [{pageNums}]");
+        if (_pageCache.TryGetValue(pageIdx, out var cachedLocal))
+            return cachedLocal;
+
+        Log($"Rendering page {pageIdx + 1} (0-based={pageIdx})");
+        StatusLabel.Text = $"Rendering page {pageIdx + 1}...";
+
+        var pagePositions = _positionsByPage.GetValueOrDefault(pageIdx, new List<WordPosition>());
+        try
+        {
+            var item = await _renderer.RenderPageAsync(pageIdx, pagePositions);
+            Log($"  rendered: image={(item.PageImage is not null ? $"{item.ImagePixelWidth}x{item.ImagePixelHeight}" : "null")}");
+            _pageCache[pageIdx] = item;
+            _globalPageCache[cacheKey] = item;
+            return item;
+        }
+        catch (Exception ex)
+        {
+            Log($"RenderPageAsync error: {ex.GetType().Name}: {ex.Message}");
+            var fallback = new PageRenderItem
+            {
+                PageNumber = pageIdx + 1,
+                ImagePixelWidth = 0,
+                PdfPageWidth = 0,
+                Positions = pagePositions,
+            };
+            _pageCache[pageIdx] = fallback;
+            _globalPageCache[cacheKey] = fallback;
+            return fallback;
+        }
+    }
+
+    private void AddPageToStack(int matchIndex, PageRenderItem item)
+    {
+        Log($"AddPageToStack: matchIndex={matchIndex}, page={item.PageNumber}, imgSize={item.ImagePixelWidth}x{item.ImagePixelHeight}, pdfSize={item.PdfPageWidth}x{item.PdfPageHeight}, positions={item.Positions.Count}");
+
+        var image = new Image
+        {
+            Source = item.PageImage,
+            Stretch = Stretch.Uniform,
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+
+        if (item.PageImage is null && item.ImagePixelWidth > 0)
+            image.Source = null;
+
+        var pageIdx = _matchingPages[matchIndex];
+        var pagePositions = _positionsByPage.GetValueOrDefault(pageIdx, new());
+        var highlightBase = item.GetHighlightRects(pagePositions).ToList();
+        if (highlightBase.Count > 0)
+        {
+            var first = highlightBase[0];
+            Log($"  highlightBase: count={highlightBase.Count}, first=({first.X:F1},{first.Y:F1} {first.Width:F1}x{first.Height:F1})");
+        }
+        else
+        {
+            Log($"  highlightBase: EMPTY");
+        }
+        var rectList = new List<Rectangle>(highlightBase.Count);
+
+        var canvas = new Canvas
+        {
+            IsHitTestVisible = false,
+            Background = Brushes.Transparent,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Top,
+        };
+
+        foreach (var r in highlightBase)
+        {
+            var rect = new Rectangle
+            {
+                Width = r.Width,
+                Height = r.Height,
+                Fill = new SolidColorBrush(Color.FromArgb(0xCC, 0xFF, 0xE6, 0x00)),
+                Stroke = new SolidColorBrush(Color.FromArgb(0xEE, 0xFF, 0xB4, 0x00)),
+                StrokeThickness = 1,
+                RadiusX = 1,
+                RadiusY = 1,
+            };
+            Canvas.SetLeft(rect, r.X);
+            Canvas.SetTop(rect, r.Y);
+            canvas.Children.Add(rect);
+            rectList.Add(rect);
+        }
+
+        _matchHighlightRects[matchIndex] = rectList;
+
+        image.SizeChanged += (s, e) =>
+        {
+            var aw = image.ActualWidth;
+            var ah = image.ActualHeight;
+            if (aw <= 0 || ah <= 0) { Log($"  SizeChanged: aw={aw}, ah={ah} — SKIP"); return; }
+
+            var sFactor = aw / item.ImagePixelWidth;
+            Log($"  SizeChanged: aw={aw:F1}, ah={ah:F1}, sFactor={sFactor:F4}, canvasChildren={canvas.Children.Count}");
+
+            canvas.Width = aw;
+            canvas.Height = ah;
+
+            for (int i = 0; i < canvas.Children.Count; i++)
+            {
+                var rect = (Rectangle)canvas.Children[i];
+                var hb = highlightBase[i];
+                rect.Width = Math.Max(hb.Width * sFactor, 6.0);
+                rect.Height = Math.Max(hb.Height * sFactor, 6.0);
+                Canvas.SetLeft(rect, hb.X * sFactor);
+                Canvas.SetTop(rect, hb.Y * sFactor);
+            }
+        };
+
+        var border = new Border
+        {
+            BorderBrush = Brushes.Silver,
+            BorderThickness = new Thickness(1),
+            Margin = new Thickness(0, 0, 0, 10),
+            Padding = new Thickness(5),
+        };
+
+        var header = new TextBlock
+        {
+            Text = item.PageImage is null
+                ? $"{item.PageHeader} — render failed"
+                : item.PageHeader,
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 0, 0, 4),
+        };
+
+        var grid = new Grid();
+        grid.Children.Add(image);
+        grid.Children.Add(canvas);
+
+        var stack = new StackPanel();
+        stack.Children.Add(header);
+        stack.Children.Add(grid);
+        border.Child = stack;
+        PageStack.Children.Add(border);
+        _pageElements[matchIndex] = border;
+
+        Log($"AddPageToStack: matchIndex={matchIndex}, page={item.PageNumber}");
     }
 
     // ── Match navigation ────────────────────────────────────────────
 
-    private void OnPrevMatch(object sender, RoutedEventArgs e)
+    private async void OnPrevMatch(object sender, RoutedEventArgs e)
     {
-        if (_currentMatchIndex > 0)
-            ScrollToMatch(_currentMatchIndex - 1);
+        if (_currentMatchIndex <= 0) return;
+        var prevIdx = _currentMatchIndex - 1;
+        _currentMatchIndex = prevIdx;
+
+        if (_pageElements[prevIdx] is null)
+        {
+            var item = await GetOrRenderPageAsync(_matchingPages[prevIdx]);
+            AddPageToStack(prevIdx, item);
+        }
+        ScrollToMatch(prevIdx);
     }
 
-    private void OnNextMatch(object sender, RoutedEventArgs e)
+    private async void OnNextMatch(object sender, RoutedEventArgs e)
     {
-        if (_currentMatchIndex < _totalMatchPages - 1)
-            ScrollToMatch(_currentMatchIndex + 1);
+        if (_currentMatchIndex >= _totalMatchPages - 1) return;
+        var nextIdx = _currentMatchIndex + 1;
+        _currentMatchIndex = nextIdx;
+
+        if (_pageElements[nextIdx] is null)
+        {
+            var item = await GetOrRenderPageAsync(_matchingPages[nextIdx]);
+            AddPageToStack(nextIdx, item);
+        }
+        ScrollToMatch(nextIdx);
     }
 
     private void ScrollToMatch(int index)
     {
         Log($"ScrollToMatch({index})");
-        if (index < 0 || index >= _renderedPages.Count) return;
+        if (index < 0 || index >= _matchingPages.Count) return;
         _currentMatchIndex = index;
 
-        if (index < PageStack.Children.Count)
-        {
-            var element = PageStack.Children[index] as FrameworkElement;
-            element?.BringIntoView();
-        }
+        var element = _pageElements[index];
+        element?.BringIntoView();
 
         UpdateMatchNav();
     }
@@ -333,17 +474,107 @@ public partial class SearchTab : Page
         NextMatch.IsEnabled = _currentMatchIndex < _totalMatchPages - 1;
     }
 
+    private async void OnPageScroll(object sender, ScrollChangedEventArgs e)
+    {
+        if (_isLoadingNextPage) return;
+
+        var nextIdx = _pageElements.FindIndex(b => b is null);
+        if (nextIdx < 0 || nextIdx >= _matchingPages.Count) return;
+
+        // Load next page when close to the bottom of the rendered content
+        var remaining = PageScroller.ScrollableHeight - PageScroller.VerticalOffset;
+        if (remaining > 400) return;
+
+        _isLoadingNextPage = true;
+        try
+        {
+            var item = await GetOrRenderPageAsync(_matchingPages[nextIdx]);
+            AddPageToStack(nextIdx, item);
+        }
+        finally
+        {
+            _isLoadingNextPage = false;
+        }
+    }
+
+    // ── Position (individual match) navigation ─────────────────────
+
+    private void UpdatePositionNav()
+    {
+        var count = _lastPositions.Count;
+        PositionInfo.Content = count > 0 && _currentPositionIndex >= 0
+            ? $"{_currentPositionIndex + 1} / {count}"
+            : "0 / 0";
+        PrevPosition.IsEnabled = count > 0 && _currentPositionIndex > 0;
+        NextPosition.IsEnabled = count > 0 && _currentPositionIndex < count - 1;
+    }
+
+    private async void OnPrevPosition(object sender, RoutedEventArgs e)
+    {
+        if (_lastPositions.Count == 0 || _currentPositionIndex <= 0) return;
+        _currentPositionIndex--;
+        await NavigateToPosition(_currentPositionIndex);
+    }
+
+    private async void OnNextPosition(object sender, RoutedEventArgs e)
+    {
+        if (_lastPositions.Count == 0 || _currentPositionIndex >= _lastPositions.Count - 1) return;
+        _currentPositionIndex++;
+        await NavigateToPosition(_currentPositionIndex);
+    }
+
+    private async Task NavigateToPosition(int posIdx)
+    {
+        var pos = _lastPositions[posIdx];
+        var pageIdx = pos.Page - 1;
+
+        var matchIdx = _matchingPages.IndexOf(pageIdx);
+        if (matchIdx < 0) return;
+
+        // Ensure the page is loaded
+        if (_pageElements[matchIdx] is null)
+        {
+            var item = await GetOrRenderPageAsync(pageIdx);
+            AddPageToStack(matchIdx, item);
+        }
+
+        // Find which position occurrence within the page
+        var pagePositions = _positionsByPage[pageIdx];
+        var posInPage = pagePositions.IndexOf(pos);
+
+        if (_matchHighlightRects.TryGetValue(matchIdx, out var rects) && posInPage < rects.Count)
+        {
+            _currentMatchIndex = matchIdx;
+            rects[posInPage].BringIntoView();
+            UpdateMatchNav();
+        }
+
+        UpdatePositionNav();
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────
 
     private void ClearViewer()
     {
+        PageScroller.ScrollChanged -= OnPageScroll;
         PageStack.Children.Clear();
-        _renderedPages.Clear();
+        _pageElements.Clear();
+        _pageCache.Clear();
+        _matchingPages.Clear();
+        _positionsByPage.Clear();
         _lastPositions.Clear();
         _currentMatchIndex = 0;
         _totalMatchPages = 0;
+        _isLoadingNextPage = false;
+        _currentPositionIndex = -1;
+        _matchHighlightRects.Clear();
+        PageScroller.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
         MatchInfo.Content = "0 matches";
         PrevMatch.IsEnabled = false;
         NextMatch.IsEnabled = false;
+        PositionInfo.Content = "0 / 0";
+        PrevPosition.IsEnabled = false;
+        NextPosition.IsEnabled = false;
+        WordsField.Text = "";
     }
 }

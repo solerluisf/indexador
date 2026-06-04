@@ -15,18 +15,18 @@ public sealed class PageRenderItem
     public string PageHeader => $"Page {PageNumber}";
     public List<WordPosition> Positions { get; init; } = new();
 
-    public List<Rect> GetHighlightRects()
+    public List<Rect> GetHighlightRects(List<WordPosition> positions)
     {
         if (ImagePixelWidth <= 0) return new List<Rect>();
         var scaleX = ImagePixelWidth / PdfPageWidth;
         var scaleY = ImagePixelHeight / PdfPageHeight;
-        var rects = new List<Rect>(Positions.Count);
-        foreach (var p in Positions)
+        var rects = new List<Rect>(positions.Count);
+        foreach (var p in positions)
         {
             var x = p.XMin * scaleX;
             var y = (PdfPageHeight - p.YMax) * scaleY;
-            var w = Math.Max(2, (p.XMax - p.XMin) * scaleX);
-            var h = Math.Max(2, (p.YMax - p.YMin) * scaleY);
+            var w = Math.Max(8, (p.XMax - p.XMin) * scaleX);
+            var h = Math.Max(8, (p.YMax - p.YMin) * scaleY);
             rects.Add(new Rect(x, y, w, h));
         }
         return rects;

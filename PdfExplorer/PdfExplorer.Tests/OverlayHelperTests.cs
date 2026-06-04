@@ -112,11 +112,11 @@ public class OverlayHelperTests
             PdfPageHeight = 500,
             Positions = new List<WordPosition>
             {
-                new(1, 10, 20, 50, 60),
+                new(1, 10, 20, 50, 60, WordText: null),
             },
         };
 
-        var rects = item.GetHighlightRects();
+        var rects = item.GetHighlightRects(item.Positions);
 
         Assert.Single(rects);
         // scaleX = 800/400 = 2, scaleY = 1000/500 = 2
@@ -142,11 +142,11 @@ public class OverlayHelperTests
             PdfPageHeight = 500,
             Positions = new List<WordPosition>
             {
-                new(1, 10, 20, 50, 60),
+                new(1, 10, 20, 50, 60, WordText: null),
             },
         };
 
-        Assert.Empty(item.GetHighlightRects());
+        Assert.Empty(item.GetHighlightRects(item.Positions));
     }
 
     [Fact]
@@ -162,7 +162,7 @@ public class OverlayHelperTests
             Positions = new List<WordPosition>(),
         };
 
-        Assert.Empty(item.GetHighlightRects());
+        Assert.Empty(item.GetHighlightRects(item.Positions));
     }
 
     [Fact]
@@ -177,15 +177,15 @@ public class OverlayHelperTests
             PdfPageHeight = 500,
             Positions = new List<WordPosition>
             {
-                new(1, 10, 20, 10.5f, 20.5f), // very small highlight: 0.5pt * 2 = 1px → clamped to 2
+                new(1, 10, 20, 10.5f, 20.5f, WordText: null),
             },
         };
 
-        var rects = item.GetHighlightRects();
+        var rects = item.GetHighlightRects(item.Positions);
 
         Assert.Single(rects);
-        Assert.Equal(2, rects[0].Width);
-        Assert.Equal(2, rects[0].Height);
+        Assert.Equal(8, rects[0].Width);
+        Assert.Equal(8, rects[0].Height);
     }
 
     [Fact]
@@ -201,11 +201,11 @@ public class OverlayHelperTests
             PdfPageHeight = 200,
             Positions = new List<WordPosition>
             {
-                new(1, 0, 0, 10, 10), // bottom-left of PDF → top of WPF
+                new(1, 0, 0, 10, 10, WordText: null),
             },
         };
 
-        var rects = item.GetHighlightRects();
+        var rects = item.GetHighlightRects(item.Positions);
 
         // scaleX = 200/100 = 2, scaleY = 400/200 = 2
         // y = (200 - 10) * 2 = 380 (near bottom of WPF canvas since it was near top of PDF)

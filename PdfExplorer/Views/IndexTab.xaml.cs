@@ -13,6 +13,7 @@ public partial class IndexTab : Page
         InitializeComponent();
         _engine = App.Engine;
         LoadCollections();
+        CollectionList.SelectionChanged += OnCollectionChanged;
         Loaded += OnLoaded;
     }
 
@@ -24,6 +25,34 @@ public partial class IndexTab : Page
     private void LoadCollections()
     {
         CollectionList.ItemsSource = _engine.Collections;
+        ProblematicExpander.Visibility = Visibility.Collapsed;
+    }
+
+    private async void OnCollectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        ProblematicExpander.Visibility = Visibility.Collapsed;
+        ProgressBar.Visibility = Visibility.Collapsed;
+        StatusLabel.Content = "Ready";
+
+        if (CollectionList.SelectedItem is not Models.CollectionInfo coll)
+            return;
+
+        try
+        {
+            var stats = _engine.GetCollectionStats((uint)coll.Id);
+            if (stats is not null && stats.NumDocs > 0)
+            {
+                StatusLabel.Content = $"{stats.NumDocs} documents indexed";
+                ProgressBar.Value = 100;
+                ProgressBar.Visibility = Visibility.Visible;
+            }
+        }
+        catch
+        {
+            // Collection has no Tantivy index yet — normal for newly added folders
+        }
+
+        ShowProblematicFiles((uint)coll.Id);
     }
 
     private void OnAddCollection(object sender, RoutedEventArgs e)
@@ -97,8 +126,11 @@ public partial class IndexTab : Page
 
         if (result >= 0)
         {
-            LogHelper.Log("IndexTab", $"Indexing completed: {result} documents indexed");
-            StatusLabel.Content = $"Done — {result} documents indexed";
+            var stats = _engine.GetCollectionStats((uint)coll.Id);
+            var indexed = stats?.NumDocs ?? result;
+            LogHelper.Log("IndexTab", $"Indexing completed: {result} processed, {indexed} in Tantivy");
+            StatusLabel.Content = $"Done — {indexed} documents indexed";
+            ShowProblematicFiles((uint)coll.Id);
         }
         else
         {
@@ -110,6 +142,29 @@ public partial class IndexTab : Page
         }
         IndexBtn.IsEnabled = true;
         CancelBtn.IsEnabled = false;
+    }
+
+    private void ShowProblematicFiles(uint collId)
+    {
+        try
+        {
+            var items = _engine.GetProblematicJobs(collId);
+            if (items.Count > 0)
+            {
+                ProblematicList.ItemsSource = items;
+                ProblematicExpander.Header = $"Show {items.Count} problematic file(s)";
+                ProblematicExpander.Visibility = Visibility.Visible;
+                ProblematicExpander.IsExpanded = true;
+            }
+            else
+            {
+                ProblematicExpander.Visibility = Visibility.Collapsed;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHelper.Log("IndexTab", $"Error loading problematic files: {ex.Message}");
+        }
     }
 
     private void OnCancel(object sender, RoutedEventArgs e)

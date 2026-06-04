@@ -60,6 +60,9 @@
                     <Label Content="Extract Workers" />
                     <Slider x:Name="ExtractWorkers" Minimum="1" Maximum="32" TickFrequency="1"
                             Value="6" Width="300" HorizontalAlignment="Left" />
+                    <Label Content="Channel Capacity" />
+                    <Slider x:Name="ChannelCapacity" Minimum="16" Maximum="8192" TickFrequency="16"
+                            Value="500" Width="300" HorizontalAlignment="Left" />
                 </StackPanel>
             </Expander>
 
