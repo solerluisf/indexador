@@ -1,4 +1,5 @@
 using System.Windows;
+using System.Windows.Threading;
 using PdfExplorer.Services;
 
 namespace PdfExplorer;
@@ -9,6 +10,11 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // Global exception handlers (must be registered BEFORE any UI work)
+        AppDomain.CurrentDomain.UnhandledException += OnAppDomainUnhandledException;
+        Current.DispatcherUnhandledException += OnDispatcherUnhandledException;
+        TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+
         try
         {
             var registryDir = System.IO.Path.Combine(
@@ -16,18 +22,63 @@ public partial class App : Application
                 "registry");
             System.IO.Directory.CreateDirectory(registryDir);
             Engine = new PdfEngine(registryDir);
+            ApplyTheme(Engine.ThemeName ?? "Light");
             base.OnStartup(e);
         }
         catch (System.Exception ex)
         {
+            LogHelper.Log("App", $"Startup fatal: {ex}");
             MessageBox.Show($"Startup error: {ex.Message}\n\n{ex.StackTrace}", "PdfExplorer", MessageBoxButton.OK, MessageBoxImage.Error);
             Shutdown();
         }
     }
 
+    public static void ApplyTheme(string name)
+    {
+        var uri = new Uri($"Themes/{name}.xaml", UriKind.Relative);
+        var dict = new ResourceDictionary { Source = uri };
+
+        var merged = Current.Resources.MergedDictionaries;
+        merged.Clear();
+        merged.Add(dict);
+
+        Engine.ThemeName = name;
+        Engine.SaveSettings();
+    }
+
     protected override void OnExit(ExitEventArgs e)
     {
-        Engine?.SaveSettings();
+        try
+        {
+            Engine?.SaveSettings();
+            Engine?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            LogHelper.Log("App", $"Dispose error in OnExit: {ex}");
+        }
         base.OnExit(e);
+    }
+
+    // ── Global exception handlers ─────────────────────────────────
+
+    private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
+    {
+        LogHelper.Log("App", $"DispatcherUnhandledException: {e.Exception}");
+        MessageBox.Show($"Unhandled UI error:\n{e.Exception.Message}", "PdfExplorer", MessageBoxButton.OK, MessageBoxImage.Error);
+        e.Handled = true; // prevent process termination
+    }
+
+    private void OnAppDomainUnhandledException(object sender, UnhandledExceptionEventArgs e)
+    {
+        var ex = e.ExceptionObject as Exception;
+        LogHelper.Log("App", $"AppDomainUnhandledException (terminating={e.IsTerminating}): {ex}");
+        // Cannot prevent termination if IsTerminating == true, but we logged it.
+    }
+
+    private void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    {
+        LogHelper.Log("App", $"UnobservedTaskException: {e.Exception}");
+        e.SetObserved(); // prevent process termination
     }
 }

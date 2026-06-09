@@ -41,7 +41,10 @@ impl Tokenizer for JapaneseTokenizer {
                     }
                 })
                 .collect::<Vec<_>>(),
-            Err(_) => Vec::new(),
+            Err(e) => {
+                eprintln!("[tokenizer] Lindera tokenization failed: {}", e);
+                Vec::new()
+            }
         };
         BoxTokenStream::new(TokenVecStream::new(tokens))
     }
@@ -126,6 +129,172 @@ impl TokenStream for TokenVecStream {
     fn token_mut(&mut self) -> &mut Token {
         &mut self.tokens[self.index - 1]
     }
+}
+
+use std::sync::OnceLock;
+use tantivy::tokenizer::RegexTokenizer;
+
+fn jp_tokenizer() -> Option<&'static JapaneseTokenizer> {
+    static JP: OnceLock<Option<JapaneseTokenizer>> = OnceLock::new();
+    JP.get_or_init(|| {
+        match JapaneseTokenizer::new() {
+            Ok(tok) => Some(tok),
+            Err(e) => {
+                eprintln!("[tokenizer] Lindera init failed: {}", e);
+                None
+            }
+        }
+    }).as_ref()
+}
+
+fn math_tokenizer() -> Option<&'static RegexTokenizer> {
+    static MATH: OnceLock<Option<RegexTokenizer>> = OnceLock::new();
+    MATH.get_or_init(|| {
+        match RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+") {
+            Ok(tok) => Some(tok),
+            Err(e) => {
+                eprintln!("[tokenizer] Regex init failed: {}", e);
+                None
+            }
+        }
+    }).as_ref()
+}
+
+fn collect_tokens_lowered(stream: &mut dyn TokenStream) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        let t = stream.token();
+        tokens.push(Token {
+            offset_from: t.offset_from,
+            offset_to: t.offset_to,
+            position: t.position,
+            position_length: t.position_length,
+            text: t.text.to_lowercase(),
+        });
+    }
+    tokens
+}
+
+/// Check if text contains Hiragana or Katakana characters (Japanese kana).
+fn has_japanese_kana(text: &str) -> bool {
+    text.chars().any(|c| {
+        let cp = c as u32;
+        matches!(cp, 0x3040..=0x309F | 0x30A0..=0x30FF | 0x31F0..=0x31FF)
+    })
+}
+
+/// Check if text contains CJK Unified Ideographs (shared by Chinese, Japanese, Korean).
+/// Covers all blocks from Extension A through H and Compatibility Ideographs.
+fn has_cjk_ideographs(text: &str) -> bool {
+    text.chars().any(|c| {
+        let cp = c as u32;
+        matches!(
+            cp,
+            0x3400..=0x4DBF   // CJK Extension A
+            | 0x4E00..=0x9FFF   // CJK Unified Ideographs
+            | 0xF900..=0xFAFF   // CJK Compatibility Ideographs
+            | 0x20000..=0x2A6DF // CJK Extension B
+            | 0x2A700..=0x2B73F // CJK Extension C
+            | 0x2B740..=0x2B81F // CJK Extension D
+            | 0x2B820..=0x2CEAF // CJK Extension E
+            | 0x2CEB0..=0x2EBE0 // CJK Extension F
+            | 0x2F800..=0x2FA1F // CJK Compatibility Ideographs Supplement
+            | 0x30000..=0x3134F // CJK Extension G
+            | 0x31350..=0x323AF // CJK Extension H
+        )
+    })
+}
+
+/// Determine the tokenizer strategy for a text.
+/// Uses character-based heuristics so it works on short queries.
+/// For mixed text (Latin + CJK), uses the dominant script to choose.
+fn tokenizer_for_text(text: &str) -> TextCategory {
+    if has_japanese_kana(text) {
+        return TextCategory::Japanese;
+    }
+    let total_chars = text.chars().count();
+    let cjk_count = text.chars().filter(|c| {
+        let cp = *c as u32;
+        matches!(
+            cp,
+            0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2B73F
+            | 0x2B740..=0x2B81F
+            | 0x2B820..=0x2CEAF
+            | 0x2CEB0..=0x2EBE0
+            | 0x2F800..=0x2FA1F
+            | 0x30000..=0x3134F
+            | 0x31350..=0x323AF
+        )
+    }).count();
+    if total_chars > 0 && cjk_count as f64 / total_chars as f64 > 0.5 {
+        TextCategory::Chinese
+    } else {
+        TextCategory::Default
+    }
+}
+
+enum TextCategory {
+    Japanese,
+    Chinese,
+    Default,
+}
+
+#[derive(Clone)]
+pub struct LanguageAwareTokenizer;
+
+impl Tokenizer for LanguageAwareTokenizer {
+    type TokenStream<'a> = BoxTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
+        match tokenizer_for_text(text) {
+            TextCategory::Japanese => {
+                if let Some(jp) = jp_tokenizer() {
+                    let mut jp = jp.clone();
+                    let tokens = collect_tokens_lowered(&mut jp.token_stream(text));
+                    BoxTokenStream::new(TokenVecStream::new(tokens))
+                } else {
+                    // Japanese tokenizer unavailable — fall back to default regex
+                    fallback_token_stream(text)
+                }
+            }
+            TextCategory::Chinese => {
+                let mut zh = ChineseBigramTokenizer;
+                let tokens = collect_tokens_lowered(&mut zh.token_stream(text));
+                BoxTokenStream::new(TokenVecStream::new(tokens))
+            }
+            TextCategory::Default => {
+                if let Some(re) = math_tokenizer() {
+                    let mut re = re.clone();
+                    let tokens = collect_tokens_lowered(&mut re.token_stream(text));
+                    BoxTokenStream::new(TokenVecStream::new(tokens))
+                } else {
+                    // Regex tokenizer unavailable — use simple whitespace split
+                    fallback_token_stream(text)
+                }
+            }
+        }
+    }
+}
+
+/// Fallback tokenizer that splits on whitespace, used when the primary
+/// tokenizer fails to initialize.
+fn fallback_token_stream<'a>(text: &'a str) -> BoxTokenStream<'a> {
+    let tokens: Vec<Token> = text
+        .split_whitespace()
+        .enumerate()
+        .map(|(i, word)| Token {
+            offset_from: 0,
+            offset_to: 0,
+            position: i,
+            position_length: 1,
+            text: word.to_lowercase(),
+        })
+        .collect();
+    BoxTokenStream::new(TokenVecStream::new(tokens))
 }
 
 #[cfg(test)]

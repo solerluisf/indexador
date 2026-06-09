@@ -11,3 +11,5 @@ pub mod lang;
 pub mod tokenizers;
 pub mod math_tokenizer;
 pub mod registry;
+pub mod pdfium;
+pub mod worker_ipc;

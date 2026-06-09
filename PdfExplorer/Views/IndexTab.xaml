@@ -1,7 +1,8 @@
 <Page x:Class="PdfExplorer.Views.IndexTab"
       xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-      Title="Index Creation">
+      Title="Index Creation"
+      Background="{DynamicResource PageBackground}" Foreground="{DynamicResource PageForeground}">
     <Grid Margin="10">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -38,6 +39,12 @@
                     </ListView.View>
                 </ListView>
             </Expander>
+
+            <!-- Error log -->
+            <TextBox x:Name="ErrorLogBox" IsReadOnly="True" TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto" Height="150" Margin="0,10,0,0"
+                     Visibility="Collapsed" FontFamily="Consolas" FontSize="11"
+                     Background="{DynamicResource ErrorBackground}" Foreground="{DynamicResource ErrorForeground}" BorderThickness="1" />
         </StackPanel>
 
         <!-- Actions -->

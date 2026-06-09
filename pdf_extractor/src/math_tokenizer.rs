@@ -231,11 +231,15 @@ impl TokenStream for TokenVecStream {
 /// Returns the raw LaTeX content if math regions are found, or None otherwise.
 /// Detects: $...$$, ...$$, \(...\), \[...\]
 pub fn extract_math_source(text: &str) -> Option<String> {
+    // Quick-filter: skip regex entirely if no math delimiters are present
+    if !text.contains('$') && !text.contains('\\') {
+        return None;
+    }
+
     // Try display math first: $$...$$, \[...\]
     let re_display = Regex::new(r"\$\$(.+?)\$\$|\\\[(.+?)\\\]").ok()?;
     // Then inline: $...$, \(...\)
     let re_inline = Regex::new(r"\$(.+?)\$|\\\((.+?)\\\)").ok()?;
-
     let mut parts: Vec<String> = Vec::new();
 
     for cap in re_display.captures_iter(text) {
@@ -454,4 +458,53 @@ mod tests {
         let result = extract_math_source(text);
         assert!(result.is_some());
     }
+
+    // ── Regression: extract_math_source quick-filter equivalence ──
+
+    #[test]
+    fn test_extract_math_source_backslash_path_no_math() {
+        // Backslash present but not a math delimiter — quick-filter passes it through
+        let text = r"file\path\name.txt";
+        let result = extract_math_source(text);
+        // Quick-filter: text contains '\' → regex runs → no math patterns → None
+        assert!(result.is_none(), "backslash-only path should return None");
+    }
+
+    #[test]
+    fn test_extract_math_source_very_long_no_math() {
+        let text = "This is plain text without any math delimiters. ".repeat(100);
+        let result = extract_math_source(&text);
+        assert!(result.is_none(), "long text without math should return None (hits quick-filter)");
+    }
+
+    #[test]
+    fn test_extract_math_source_empty_string() {
+        let result = extract_math_source("");
+        assert!(result.is_none(), "empty string should return None");
+    }
+
+    #[test]
+    fn test_extract_math_source_whitespace_only() {
+        let result = extract_math_source("   \n  \t  ");
+        assert!(result.is_none(), "whitespace-only should return None (hits quick-filter)");
+    }
+
+    #[test]
+    fn test_extract_math_source_only_backslash() {
+        // Single backslash triggers quick-filter pass-through; regex finds no math
+        let result = extract_math_source("\\");
+        assert!(result.is_none(), "single backslash has no math delimiters");
+    }
+
+    #[test]
+    fn test_extract_math_source_quick_filter_still_detects_inline_math() {
+        // Dollar sign present AND valid inline math — quick-filter must
+        // pass it through to regex, which must detect it.
+        let text = r"Solve $\int_{0}^{1} x^2 dx$ for the area.";
+        let result = extract_math_source(text);
+        assert!(result.is_some(), "quick-filter should still detect inline math");
+        let source = result.unwrap();
+        assert!(source.contains("inline:"), "should contain inline math content");
+    }
+
 }

@@ -1,5 +1,4 @@
 use unicode_normalization::UnicodeNormalization;
-const MAX_LINE_LENGTH: usize = 10_000;
 
 pub fn normalize_text(text: &str) -> String {
     let nfkc: String = text.nfkc().collect();
@@ -23,21 +22,7 @@ pub fn normalize_text(text: &str) -> String {
 
     collapsed
         .lines()
-        .map(|line| {
-            let trimmed = line.trim();
-            if trimmed.len() > MAX_LINE_LENGTH {
-                let mut end = MAX_LINE_LENGTH;
-                while !trimmed.is_char_boundary(end) {
-                    end -= 1;
-                }
-                let mut truncated = String::with_capacity(end + 3);
-                truncated.push_str(&trimmed[..end]);
-                truncated.push_str("...");
-                truncated
-            } else {
-                trimmed.to_string()
-            }
-        })
+        .map(|line| line.trim().to_string())
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
@@ -133,71 +118,22 @@ mod tests {
         assert_eq!(result, "a b");
     }
 
-    // --- Boundary / edge ---
+    // --- No truncation: long lines are preserved for correct word-position alignment ---
 
     #[test]
-    fn test_exactly_max_line_length() {
-        let input = "a".repeat(MAX_LINE_LENGTH);
+    fn test_long_line_preserved() {
+        let input = "a".repeat(15_000);
         let result = normalize_text(&input);
-        assert_eq!(result.len(), MAX_LINE_LENGTH);
-        assert!(!result.ends_with("..."));
+        assert_eq!(result.len(), 15_000);
+        assert!(!result.contains("..."));
     }
 
     #[test]
-    fn test_one_byte_over_max_line_length() {
-        let input = "a".repeat(MAX_LINE_LENGTH + 1);
-        let result = normalize_text(&input);
-        assert_eq!(result.len(), MAX_LINE_LENGTH + 3);
-        assert!(result.ends_with("..."));
-    }
-
-    #[test]
-    fn test_long_line_truncation() {
-        let long = "a".repeat(15_000);
-        let result = normalize_text(&long);
-        assert_eq!(result.len(), MAX_LINE_LENGTH + 3);
-        assert!(result.ends_with("..."));
-    }
-
-    #[test]
-    fn test_multi_byte_truncation_no_panic() {
-        let input = "é".repeat(6_000);
-        let result = normalize_text(&input);
-        assert!(result.ends_with("..."));
-        assert!(result.len() <= input.len());
-    }
-
-    #[test]
-    fn test_truncate_at_3byte_char_boundary() {
-        let ascii_count = MAX_LINE_LENGTH - 3;
-        let input = "a".repeat(ascii_count) + "∑";
-        let result = normalize_text(&input);
-        assert!(!result.is_empty());
-        assert!(result.len() <= MAX_LINE_LENGTH + 3);
-    }
-
-    #[test]
-    fn test_truncate_at_4byte_char_boundary() {
-        let ascii_count = MAX_LINE_LENGTH - 4;
-        let input = "a".repeat(ascii_count) + "𒀀";
-        let result = normalize_text(&input);
-        assert!(!result.is_empty());
-        assert!(result.len() <= MAX_LINE_LENGTH + 3);
-    }
-
-    #[test]
-    fn test_truncate_mixed_multi_byte_longer_than_max() {
-        let input = "a".repeat(2_000) + &"ñ".repeat(5_000) + &"é".repeat(3_000);
-        let result = normalize_text(&input);
-        assert!(result.ends_with("..."));
-        assert!(result.len() <= MAX_LINE_LENGTH + 3);
-    }
-
-    #[test]
-    fn test_truncate_preserves_valid_utf8() {
+    fn test_very_long_text_preserves_utf8() {
         let input = "áéíóú".repeat(4_000);
         let result = normalize_text(&input);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        assert!(result.len() > 10_000);
     }
 
     #[test]
@@ -209,11 +145,11 @@ mod tests {
         let lines: Vec<&str> = result.lines().collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], short);
-        assert!(lines[1].ends_with("..."));
+        assert_eq!(lines[1].len(), long.len());
     }
 
     #[test]
-    fn test_truncate_empty_after_char_boundary() {
+    fn test_emoji_preserved() {
         let input = "\u{1F600}".repeat(7_500);
         let result = normalize_text(&input);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
@@ -226,7 +162,7 @@ mod tests {
         let lines: Vec<&str> = result.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "short");
-        assert!(lines[1].ends_with("..."));
+        assert!(lines[1].len() >= 12_000);
         assert_eq!(lines[2], "end");
     }
 

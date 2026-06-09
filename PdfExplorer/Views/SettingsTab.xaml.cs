@@ -47,10 +47,13 @@ public partial class SettingsTab : Page
 
     private void WireEvents()
     {
-        FuzzyDistance.SelectionChanged += (_, _) => { ApplyFuzzyDistance(); _engine.SaveSettings(); };
-        StemEnabled.Checked += (_, _) => { _engine.StemEnabled = true; _engine.SaveSettings(); };
-        StemEnabled.Unchecked += (_, _) => { _engine.StemEnabled = false; _engine.SaveSettings(); };
-        RecencyWeight.ValueChanged += (_, e) => { _engine.RecencyWeight = (float)e.NewValue; _engine.SaveSettings(); };
+        var theme = _engine.ThemeName ?? "Light";
+        ThemeSelector.SelectedIndex = theme switch
+        {
+            "Dark" => 1,
+            "LightBlue" => 2,
+            _ => 0
+        };
 
         TesseractPath.LostFocus += (_, _) => { _engine.TesseractPath = TesseractPath.Text; _engine.SaveSettings(); };
         OcrLanguage.LostFocus += (_, _) => { _engine.OcrLanguage = OcrLanguage.Text; _engine.SaveSettings(); };
@@ -65,12 +68,19 @@ public partial class SettingsTab : Page
         ChannelCapacity.ValueChanged += (_, e) => { _engine.ChannelCapacity = (uint)e.NewValue; _engine.SaveSettings(); };
     }
 
+    private void OnThemeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        var name = ThemeSelector.SelectedIndex switch
+        {
+            1 => "Dark",
+            2 => "LightBlue",
+            _ => "Light"
+        };
+        App.ApplyTheme(name);
+    }
+
     private void ApplyDefaults()
     {
-        ApplyFuzzyDistance();
-        _engine.StemEnabled = StemEnabled.IsChecked == true;
-        _engine.RecencyWeight = (float)RecencyWeight.Value;
-
         _engine.TesseractPath = TesseractPath.Text;
         _engine.OcrLanguage = OcrLanguage.Text;
         _engine.OcrWorkers = (uint)OcrWorkers.Value;
@@ -84,14 +94,9 @@ public partial class SettingsTab : Page
         _engine.ChannelCapacity = (uint)ChannelCapacity.Value;
     }
 
-    private void ApplyFuzzyDistance()
-    {
-        _engine.FuzzyDistance = (uint)FuzzyDistance.SelectedIndex;
-    }
-
     private void ApplyRamBuffer()
     {
-        var values = new ulong[] { 268_435_456, 536_870_912, 1_073_741_824, 2_147_483_648, 4_294_967_296 };
+        var values = new ulong[] { 268_435_456, 536_870_912, 1_073_741_824, 2_147_483_648, 3_000_000_000, 4_294_967_296 };
         _engine.RamBuffer = values[RamBuffer.SelectedIndex];
     }
 }

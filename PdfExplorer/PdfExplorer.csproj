@@ -7,6 +7,8 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
     <PlatformTarget>x64</PlatformTarget>
     <LangVersion>14</LangVersion>
   </PropertyGroup>
@@ -16,6 +18,62 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Visible>false</Visible>
     </Content>
+    <Content Include="..\target\$(Configuration)\pdf_worker.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="..\target\$(Configuration)\tesseract_worker.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
   </ItemGroup>
+
+  <!-- Compile Rust artifacts before building the C# project -->
+  <Target Name="CompileRustDll" BeforeTargets="BeforeBuild">
+    <Exec
+      Command="cargo build -p pdf_extractor_capi --target-dir target"
+      WorkingDirectory="$(MSBuildProjectDirectory)\.."
+      ConsoleToMSBuild="true"
+      StandardOutputImportance="low"
+      Condition="Exists('$(MSBuildProjectDirectory)\..\pdf_extractor_capi\Cargo.toml')" />
+    <Exec
+      Command="cargo build -p pdf_extractor --bin pdf_worker --target-dir target"
+      WorkingDirectory="$(MSBuildProjectDirectory)\.."
+      ConsoleToMSBuild="true"
+      StandardOutputImportance="low"
+      Condition="Exists('$(MSBuildProjectDirectory)\..\pdf_extractor\Cargo.toml')" />
+    <Exec
+      Command="cargo build -p pdf_extractor --bin tesseract_worker --target-dir target"
+      WorkingDirectory="$(MSBuildProjectDirectory)\.."
+      ConsoleToMSBuild="true"
+      StandardOutputImportance="low"
+      Condition="Exists('$(MSBuildProjectDirectory)\..\pdf_extractor\Cargo.toml')" />
+  </Target>
+
+  <ItemGroup>
+    <PackageReference Include="bblanchon.PDFium.Win32" Version="150.0.7869" />
+  </ItemGroup>
+
+  <!--
+    pdfium.dll is deployed by the NuGet package to runtimes/win-x64/native/,
+    which .NET Core's native P/Invoke resolver finds automatically.
+    But the Rust DLL loads pdfium.dll via LoadLibrary (libloading),
+    which only searches the process EXE directory and system paths.
+    This target copies pdfium.dll to the output root so LoadLibrary finds it.
+  -->
+  <PropertyGroup>
+    <_PdfiumSrc>$([MSBuild]::NormalizePath('$(TargetDir)runtimes\win-x64\native\pdfium.dll'))</_PdfiumSrc>
+    <_PdfiumDst>$([MSBuild]::NormalizePath('$(TargetDir)pdfium.dll'))</_PdfiumDst>
+  </PropertyGroup>
+  <Target Name="CopyPdfiumToRoot"
+          AfterTargets="Build"
+          Inputs="$(_PdfiumSrc)"
+          Outputs="$(_PdfiumDst)">
+    <Copy
+      SourceFiles="$(_PdfiumSrc)"
+      DestinationFiles="$(_PdfiumDst)"
+      SkipUnchangedFiles="true"
+      Condition="Exists('$(_PdfiumSrc)')" />
+  </Target>
 
 </Project>

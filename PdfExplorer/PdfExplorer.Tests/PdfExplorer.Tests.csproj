@@ -5,11 +5,14 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PlatformTarget>x64</PlatformTarget>
     <IsTestProject>true</IsTestProject>
     <LangVersion>14</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="bblanchon.PDFium.Win32" Version="150.0.7869" />
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
@@ -23,5 +26,20 @@
   <ItemGroup>
     <ProjectReference Include="..\PdfExplorer.csproj" />
   </ItemGroup>
+
+  <PropertyGroup>
+    <_PdfiumSrc>$([MSBuild]::NormalizePath('$(TargetDir)..\runtimes\win-x64\native\pdfium.dll'))</_PdfiumSrc>
+    <_PdfiumDst>$([MSBuild]::NormalizePath('$(TargetDir)..\pdfium.dll'))</_PdfiumDst>
+  </PropertyGroup>
+  <Target Name="CopyPdfiumToRoot"
+          AfterTargets="Build"
+          Inputs="$(_PdfiumSrc)"
+          Outputs="$(_PdfiumDst)">
+    <Copy
+      SourceFiles="$(_PdfiumSrc)"
+      DestinationFiles="$(_PdfiumDst)"
+      SkipUnchangedFiles="true"
+      Condition="Exists('$(_PdfiumSrc)')" />
+  </Target>
 
 </Project>

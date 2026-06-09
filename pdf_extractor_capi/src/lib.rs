@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use image::GenericImageView;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tantivy::query::Occur;
 use tantivy::schema::Value;
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::canonical_combining_class;
 
 use pdf_extractor::indexer::{Indexer, SearchIndex};
 use pdf_extractor::metrics::Metrics;
@@ -18,7 +19,7 @@ use pdf_extractor::scanner::JobStore;
 pub const PDF_EXTRACTOR_API_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
-// Global state (Mutex<Option<..>> so tests can reset)
+// Global state (RwLock so reads are concurrent; write is exclusive)
 // ---------------------------------------------------------------------------
 
 struct AppContext {
@@ -26,7 +27,6 @@ struct AppContext {
     indexer: Option<Arc<Indexer>>,
     db_path: Option<PathBuf>,
     index_path: Option<PathBuf>,
-    last_error: Option<String>,
     channel_capacity: Option<u32>,
     tesseract_path: Option<String>,
     ocr_language: Option<String>,
@@ -37,6 +37,7 @@ struct AppContext {
     commit_interval: Option<u32>,
     commit_timeout: Option<u32>,
     extract_workers: Option<u32>,
+    num_indexer_threads: Option<u32>,
     fuzzy_distance: u32,
     stem_enabled: u32,
     search_field: Option<String>,
@@ -47,21 +48,50 @@ struct AppContext {
     boolean_query: Option<Vec<(String, String)>>,
 }
 
-fn app_guard() -> Result<std::sync::MutexGuard<'static, Option<AppContext>>, i32> {
-    static APP: OnceLock<Mutex<Option<AppContext>>> = OnceLock::new();
-    APP.get_or_init(|| Mutex::new(None))
-        .lock()
-        .map_err(|_| -1)
+static APP: OnceLock<RwLock<Option<AppContext>>> = OnceLock::new();
+static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LOG_CALLBACK: OnceLock<Mutex<Option<extern "C" fn(*const u8, u32)>>> = OnceLock::new();
+static PROCESS_CALLBACK: OnceLock<Mutex<Option<extern "C" fn(*const u8, u32)>>> = OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// Error codes
+// ---------------------------------------------------------------------------
+const ERR_POISONED: i32 = -100;
+const ERR_NOT_INIT: i32 = -101;
+const ERR_REG_NOT_INIT: i32 = -102;
+const ERR_INVALID_UTF8: i32 = -103;
+const ERR_CHANNEL_CAPACITY: i32 = -104;
+const ERR_NULL_PTR: i32 = -105;
+const ERR_BUFFER_TOO_SMALL: i32 = -106;
+const ERR_COLLECTION_NOT_FOUND: i32 = -107;
+
+// ---------------------------------------------------------------------------
+// Safe accessors — read (shared) / write (exclusive)
+// ---------------------------------------------------------------------------
+
+/// Acquire a **read** lock.  Multiple readers can run concurrently.
+/// Returns an error if `AppContext` has not been initialised yet.
+fn with_app_read<R>(f: impl FnOnce(&AppContext) -> R) -> Result<R, i32> {
+    let guard = APP
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .map_err(|_| ERR_POISONED)?;
+    let app = guard.as_ref().ok_or(ERR_NOT_INIT)?;
+    Ok(f(app))
 }
 
-fn with_app<R>(f: impl FnOnce(&mut AppContext) -> R) -> Result<R, i32> {
-    let mut guard = app_guard()?;
+/// Acquire a **write** lock (exclusive).  Also initialises `AppContext`
+/// on first call (lazily).
+fn with_app_mut<R>(f: impl FnOnce(&mut AppContext) -> R) -> Result<R, i32> {
+    let mut guard = APP
+        .get_or_init(|| RwLock::new(None))
+        .write()
+        .map_err(|_| ERR_POISONED)?;
     let app = guard.get_or_insert_with(|| AppContext {
         jobs: None,
         indexer: None,
         db_path: None,
         index_path: None,
-        last_error: None,
         channel_capacity: None,
         tesseract_path: None,
         ocr_language: None,
@@ -72,6 +102,7 @@ fn with_app<R>(f: impl FnOnce(&mut AppContext) -> R) -> Result<R, i32> {
         commit_interval: None,
         commit_timeout: None,
         extract_workers: None,
+        num_indexer_threads: None,
         fuzzy_distance: 0,
         stem_enabled: 0,
         search_field: None,
@@ -85,18 +116,104 @@ fn with_app<R>(f: impl FnOnce(&mut AppContext) -> R) -> Result<R, i32> {
 }
 
 fn set_error(msg: String) {
-    let _ = with_app(|app| app.last_error = Some(msg));
+    let mut guard = LAST_ERROR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = Some(msg);
 }
 
-static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Per-collection cancellation tokens so concurrent indexing operations
+/// don't interfere with each other.
+static CANCEL_TOKENS: OnceLock<Mutex<HashMap<u32, Arc<AtomicBool>>>> = OnceLock::new();
+fn cancel_tokens() -> &'static Mutex<HashMap<u32, Arc<AtomicBool>>> {
+    CANCEL_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[cfg(test)]
 fn reset_state() {
-    CANCEL_REQUESTED.store(false, Ordering::Relaxed);
-    *app_guard().unwrap() = None;
+    if let Ok(mut guard) = cancel_tokens().lock() {
+        guard.clear();
+    }
+    if let Ok(mut guard) = APP.get_or_init(|| RwLock::new(None)).write() {
+        *guard = None;
+    }
     if let Ok(mut guard) = COLLECTION_REGISTRY.get_or_init(|| Mutex::new(None)).lock() {
         *guard = None;
     }
+    if let Some(lock) = LAST_ERROR.get() {
+        if let Ok(mut guard) = lock.lock() {
+            *guard = None;
+        }
+    }
+    if let Some(lock) = LOG_CALLBACK.get() {
+        if let Ok(mut guard) = lock.lock() {
+            *guard = None;
+        }
+    }
+    if let Some(lock) = PROCESS_CALLBACK.get() {
+        if let Ok(mut guard) = lock.lock() {
+            *guard = None;
+        }
+    }
+}
+
+/// Locate `pdf_worker.exe` relative to the current executable.
+///
+/// Resolution order:
+/// 1. Same directory as the host executable (production layout)
+/// 2. `CARGO_BIN_DIR` environment variable (set by `cargo test`)
+/// 3. Walk up from the host directory, checking each ancestor;
+///    specifically handles `deps/` subdirectory (test layout:
+///    `target/<profile>/deps/test-<hash>.exe` → `target/<profile>/pdf_worker.exe`)
+fn resolve_worker_path() -> Option<PathBuf> {
+    resolve_worker_path_from(&std::env::current_exe().ok()?)
+}
+
+/// Resolve `pdf_worker.exe` starting from a given executable path.
+///
+/// This is a testable core: given any exe path, it searches for the worker
+/// using the same strategies as `resolve_worker_path()`.
+fn resolve_worker_path_from(exe: &Path) -> Option<PathBuf> {
+    let exe_parent = exe.parent()?;
+
+    // Strategy 1: same directory as host executable
+    let same_dir = exe_parent.join("pdf_worker.exe");
+    if same_dir.exists() {
+        return Some(same_dir);
+    }
+
+    // Strategy 2: CARGO_BIN_DIR env var (set by `cargo test`)
+    if let Ok(bin_dir) = std::env::var("CARGO_BIN_DIR") {
+        let candidate = PathBuf::from(bin_dir).join("pdf_worker.exe");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    // Strategy 3: walk up from host directory, checking for deps/ → profile
+    let mut dir = exe_parent;
+    loop {
+        if dir.file_name().and_then(|n| n.to_str()) == Some("deps") {
+            if let Some(parent) = dir.parent() {
+                let candidate = parent.join("pdf_worker.exe");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+        if let Some(parent) = dir.parent() {
+            dir = parent;
+            let candidate = dir.join("pdf_worker.exe");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        } else {
+            break;
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -105,13 +222,13 @@ fn reset_state() {
 
 unsafe fn write_to_buffer(data: &[u8], out: *mut c_char, out_len: *mut u32) -> i32 {
     if out.is_null() || out_len.is_null() {
-        return -3;
+        return ERR_NULL_PTR;
     }
     let capacity = *out_len as usize;
     let needed = data.len();
     if capacity < needed {
         *out_len = needed as u32;
-        return -4;
+        return ERR_BUFFER_TOO_SMALL;
     }
     std::ptr::copy_nonoverlapping(data.as_ptr(), out as *mut u8, needed);
     *out_len = needed as u32;
@@ -120,11 +237,11 @@ unsafe fn write_to_buffer(data: &[u8], out: *mut c_char, out_len: *mut u32) -> i
 
 unsafe fn cstr_to_str(ptr: *const c_char) -> Result<&'static str, i32> {
     if ptr.is_null() {
-        return Err(-3);
+        return Err(ERR_NULL_PTR);
     }
     CStr::from_ptr(ptr).to_str().map_err(|_| {
         set_error("Invalid UTF-8 input".into());
-        -1
+        ERR_INVALID_UTF8
     })
 }
 
@@ -156,7 +273,7 @@ pub unsafe extern "C" fn pdf_init(
         Err(e) => { return e; }
     };
 
-    let rc = with_app(|app| {
+    let rc = with_app_mut(|app| {
         if app.jobs.is_some() {
             return 0;
         }
@@ -203,7 +320,7 @@ pub unsafe extern "C" fn pdf_search(
         Err(e) => { return e; }
     };
 
-    let index_path = with_app(|app| {
+    let index_path = with_app_read(|app| {
         if app.indexer.is_some() {
             app.index_path.clone()
         } else {
@@ -230,21 +347,14 @@ pub unsafe extern "C" fn pdf_search(
 
     let settings = load_search_settings();
 
-    let (results_json, result_count) = match do_search_with_index(&search_index, query_str, limit, offset, None, &settings) {
+    let (entries, total) = match do_search_with_index(&search_index, query_str, limit, offset, None, &settings) {
         Ok(t) => t,
         Err(e) => { return e; }
     };
 
-    let _total = result_count as u64;
-    let count = search_index.search_count(query_str).unwrap_or(result_count as u64);
-
     let wrapped = serde_json::json!({
-        "total": count,
-        "results": if result_count == 0 {
-            serde_json::Value::Array(vec![])
-        } else {
-            serde_json::from_str(&results_json).unwrap_or(serde_json::Value::Array(vec![]))
-        }
+        "total": total,
+        "results": entries,
     });
     let json_str = serde_json::to_string(&wrapped).unwrap_or_else(|_| "{}".into());
     let rc = unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) };
@@ -268,7 +378,7 @@ pub unsafe extern "C" fn pdf_snippet(
         Err(e) => return e,
     };
 
-    let index_path = with_app(|app| app.index_path.clone()).unwrap_or(None);
+    let index_path = with_app_read(|app| app.index_path.clone()).unwrap_or(None);
     let index_path = match index_path {
         Some(p) => p,
         None => {
@@ -345,25 +455,67 @@ pub unsafe extern "C" fn pdf_snippet(
 // ---------------------------------------------------------------------------
 // pdf_get_term_positions
 // ---------------------------------------------------------------------------
-// Helper: detect phrase-matching pages using Tantivy offsets (aligned
-// offsets required — new indexes only).
-fn detect_phrase_pages_tantivy(
+// Helper: merge phrase positions into one bounding box per line.
+// Uses vertical overlap to detect line breaks.
+fn merge_by_line(
+    positions: &[pdf_extractor::positions::StoredPosition],
+    words: &[&str],
+) -> Vec<pdf_extractor::positions::StoredPosition> {
+    let mut sorted = positions.to_vec();
+    sorted.sort_by_key(|p| p.word_offset);
+
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let page = sorted[i].page;
+        let mut j = i + 1;
+        while j < sorted.len() && sorted[j].page == page {
+            if sorted[j].y_min > sorted[j - 1].y_max || sorted[j - 1].y_min > sorted[j].y_max {
+                break;
+            }
+            j += 1;
+        }
+        let x_min = sorted[i..j].iter().map(|p| p.x_min).reduce(f32::min).unwrap();
+        let y_min = sorted[i..j].iter().map(|p| p.y_min).reduce(f32::min).unwrap();
+        let x_max = sorted[i..j].iter().map(|p| p.x_max).reduce(f32::max).unwrap();
+        let y_max = sorted[i..j].iter().map(|p| p.y_max).reduce(f32::max).unwrap();
+        result.push(pdf_extractor::positions::StoredPosition {
+            word_offset: sorted[i].word_offset,
+            page,
+            x_min,
+            y_min,
+            x_max,
+            y_max,
+            word_text: words.join(" "),
+        });
+        i = j;
+    }
+    result
+}
+
+// Helper: get phrase positions via Tantivy term positions. Finds
+// phrase-consecutive offsets in the Tantivy token stream, then maps them
+// to bounding boxes via the SQLite position store (by offset).
+fn get_phrase_positions_via_tantivy(
     index_path: &Path,
     doc_id: i64,
     words: &[&str],
     position_store: &pdf_extractor::positions::PositionStore,
-) -> Option<HashSet<u32>> {
+) -> Option<Vec<pdf_extractor::positions::StoredPosition>> {
     let search_index = SearchIndex::new(index_path).ok()?;
-    let word_offsets: Vec<Vec<usize>> = words.iter()
-        .filter(|w| !w.is_empty())
-        .filter_map(|w| search_index.search_term_positions(doc_id as u64, w).ok())
-        .collect();
 
-    if word_offsets.len() < 2 || word_offsets.iter().any(|v| v.is_empty()) {
+    let mut word_offsets: Vec<Vec<usize>> = Vec::new();
+    for &word in words {
+        match search_index.search_term_positions(doc_id as u64, word) {
+            Ok(offsets) if !offsets.is_empty() => word_offsets.push(offsets),
+            _ => return None,
+        }
+    }
+
+    if word_offsets.len() < 2 {
         return None;
     }
 
-    // Find Tantivy offsets that form the phrase
     let mut phrase_starts: HashSet<usize> = word_offsets[0].iter().copied().collect();
     for (i, offsets) in word_offsets.iter().enumerate().skip(1) {
         let next_set: HashSet<usize> = offsets.iter().copied().collect();
@@ -377,38 +529,32 @@ fn detect_phrase_pages_tantivy(
         return None;
     }
 
-    // Map phrase start offsets to pages via SQLite (offsets now aligned)
-    let mut pages = HashSet::new();
+    let mut result = Vec::new();
+
     for &start in &phrase_starts {
         let offsets: Vec<usize> = (0..word_offsets.len()).map(|i| start + i).collect();
         if let Ok(positions) = position_store.get_positions(doc_id, &offsets) {
-            if positions.len() == word_offsets.len() {
-                let all_same_page: HashSet<u32> =
-                    positions.iter().map(|p| p.page).collect();
-                if all_same_page.len() == 1 {
-                    pages.insert(*all_same_page.iter().next().unwrap());
-                }
+            if positions.is_empty() {
+                continue;
             }
-        } else {
-            // Fallback: try with just the first offset
-            if let Ok(single) = position_store.get_positions(doc_id, &[start]) {
-                if let Some(p) = single.first() {
-                    pages.insert(p.page);
-                }
-            }
+            // Group by page first, then by line (vertical overlap), creating
+            // one merged bounding box per line within the phrase.  This avoids
+            // a giant rectangle spanning from the end of one line to the
+            // beginning of the next when a phrase wraps across lines.
+            result.extend(merge_by_line(&positions, words));
         }
     }
 
-    Some(pages)
+    if result.is_empty() { None } else { Some(result) }
 }
 
-// Helper: detect phrase-matching pages using SQLite-only word_offset
-// adjacency. Works with any index (old or new).
-fn detect_phrase_pages_sqlite(
+// Helper: get phrase positions using SQLite-only word_offset adjacency
+// within the same page. Uses per-word position data by text matching.
+fn get_phrase_positions_via_sqlite(
     doc_id: i64,
     words: &[&str],
     position_store: &pdf_extractor::positions::PositionStore,
-) -> Option<HashSet<u32>> {
+) -> Option<Vec<pdf_extractor::positions::StoredPosition>> {
     let mut word_positions: Vec<Vec<pdf_extractor::positions::StoredPosition>> = Vec::new();
     for word in words.iter().filter(|w| !w.is_empty()) {
         if let Ok(positions) = position_store.get_positions_by_term(doc_id, word) {
@@ -422,7 +568,9 @@ fn detect_phrase_pages_sqlite(
         return None;
     }
 
-    let mut pages = HashSet::new();
+    // Find phrase start offsets (word_offset of the first word) where all
+    // subsequent words appear at consecutive offsets on the same page.
+    let mut phrase_starts: Vec<(usize, u32)> = Vec::new();
     for first in &word_positions[0] {
         let mut all_adjacent = true;
         for (i, positions) in word_positions.iter().enumerate().skip(1) {
@@ -436,11 +584,33 @@ fn detect_phrase_pages_sqlite(
             }
         }
         if all_adjacent {
-            pages.insert(first.page);
+            phrase_starts.push((first.word_offset, first.page));
         }
     }
 
-    if pages.is_empty() { None } else { Some(pages) }
+    if phrase_starts.is_empty() {
+        return None;
+    }
+
+    let mut result = Vec::new();
+    for &(start_offset, page) in &phrase_starts {
+        let expected_offsets: Vec<usize> = (0..word_positions.len())
+            .map(|i| start_offset + i)
+            .collect();
+        let mut candidates: Vec<pdf_extractor::positions::StoredPosition> = Vec::new();
+        for (i, positions) in word_positions.iter().enumerate() {
+            let expected = expected_offsets[i];
+            if let Some(pos) = positions.iter().find(|p| p.page == page && p.word_offset == expected) {
+                candidates.push(pos.clone());
+            }
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+        result.extend(merge_by_line(&candidates, words));
+    }
+
+    if result.is_empty() { None } else { Some(result) }
 }
 
 /// Get word-level term positions for a specific document.
@@ -448,15 +618,18 @@ fn detect_phrase_pages_sqlite(
 /// Returns a JSON array of bounding-box objects with page numbers, e.g.
 /// `[{"page":1,"x_min":100.0,"y_min":700.0,"x_max":120.0,"y_max":712.0}]`.
 ///
-/// For multi-word (phrase) queries, returns positions only from pages where
-/// the words appear adjacent in the Tantivy token stream. Uses Tantivy
-/// offsets first (requires aligned offsets — new indexes), falls back to
-/// SQLite-only word_offset adjacency (works with any index).
+/// For multi-word (phrase) queries, returns positions only from
+/// phrase-matched pages. Uses Tantivy term positions to find
+/// phrase-consecutive offsets and maps them to bounding boxes via the
+/// SQLite position store. Falls back to SQLite-only word_offset adjacency
+/// on the same page (works with any index).
 ///
 /// `coll_id` — 0 uses the legacy `pdf_init` index; non-zero uses the
 /// collection with that ID from the registry.
 ///
 /// Returns empty array `[]` if the doc or term is not found.
+///
+/// On failure returns a negative error code and sets `last_error`.
 #[no_mangle]
 pub unsafe extern "C" fn pdf_get_term_positions(
     coll_id: u32,
@@ -472,13 +645,13 @@ pub unsafe extern "C" fn pdf_get_term_positions(
         };
 
         let index_path = if coll_id == 0 {
-            with_app(|app| app.index_path.clone()).unwrap_or(None)
+            with_app_read(|app| app.index_path.clone()).unwrap_or(None)
         } else {
             match with_registry(|reg| reg.get_collection(coll_id as i64)) {
                 Ok(Ok(c)) => Some(PathBuf::from(&c.data_dir).join(".pdf_extractor").join("index")),
                 Ok(Err(_)) => {
                     set_error("Collection not found".into());
-                    return -8;
+                    return ERR_COLLECTION_NOT_FOUND;
                 }
                 Err(e) => return e,
             }
@@ -503,31 +676,29 @@ pub unsafe extern "C" fn pdf_get_term_positions(
 
         let stripped: String = term_str.trim_matches('"').to_string();
         let words: Vec<&str> = stripped.split_whitespace().collect();
-        let mut seen = HashSet::new();
-        let mut all_positions: Vec<pdf_extractor::positions::StoredPosition> = Vec::new();
-        for word in words.iter().filter(|w| !w.is_empty()) {
-            if let Ok(positions) = position_store.get_positions_by_term(doc_id, word) {
-                for pos in &positions {
-                    let key = (pos.page, (pos.x_min * 100.0) as i32, (pos.y_min * 100.0) as i32);
-                    if seen.insert(key) {
-                        all_positions.push(pos.clone());
+
+        let all_positions: Vec<pdf_extractor::positions::StoredPosition> = if words.len() > 1 {
+            // Multi-word phrase: try Tantivy term positions first, then SQLite adjacency
+            get_phrase_positions_via_tantivy(&index_path, doc_id, &words, &position_store)
+                .or_else(|| get_phrase_positions_via_sqlite(doc_id, &words, &position_store))
+                .unwrap_or_default()
+        } else {
+            // Single word: return all positions
+            let mut seen = HashSet::new();
+            let mut positions = Vec::new();
+            let word = words.first().copied().unwrap_or("");
+            if !word.is_empty() {
+                if let Ok(found) = position_store.get_positions_by_term(doc_id, word) {
+                    for pos in &found {
+                        let key = (pos.page, (pos.x_min * 100.0) as i32, (pos.y_min * 100.0) as i32);
+                        if seen.insert(key) {
+                            positions.push(pos.clone());
+                        }
                     }
                 }
             }
-        }
-
-        // For phrase queries (multi-word), filter to only pages where the words
-        // appear adjacent in the Tantivy token stream. Try Tantivy-based
-        // detection first (requires aligned offsets — new indexes). Falls back
-        // to SQLite-only adjacency (works with any index).
-        if words.len() > 1 && !all_positions.is_empty() {
-            let matching_pages = detect_phrase_pages_tantivy(&index_path, doc_id, &words, &position_store)
-                .or_else(|| detect_phrase_pages_sqlite(doc_id, &words, &position_store));
-
-            if let Some(pages) = matching_pages {
-                all_positions.retain(|p| pages.contains(&p.page));
-            }
-        }
+            positions
+        };
 
         let json_entries: Vec<serde_json::Value> = all_positions.iter().map(|sp| {
             serde_json::json!({
@@ -536,6 +707,7 @@ pub unsafe extern "C" fn pdf_get_term_positions(
                 "y_min": sp.y_min,
                 "x_max": sp.x_max,
                 "y_max": sp.y_max,
+                "word_text": sp.word_text,
             })
         }).collect();
 
@@ -546,8 +718,295 @@ pub unsafe extern "C" fn pdf_get_term_positions(
 }
 
 // ---------------------------------------------------------------------------
+// pdf_search_text_in_pdf
+// Searches for `term` inside the PDF at `path` using PDFium's text search API
+// (FPDFText_FindStart / FPDFText_FindNext), then returns per-character
+// bounding boxes merged by line — one highlight rectangle per text line per
+// match.  This completely replaces the old PositionStore‑based approach and
+// correctly handles multi‑word phrases that span across lines.
+// ---------------------------------------------------------------------------
+
+/// Normalize text with NFKC, returning a mapping from each normalized char
+/// back to (first_raw_idx, last_raw_idx) in the original raw string.
+/// Handles expanded ligatures (ﬁ→fi), composed combining chars (e+´→é),
+/// and simple substitutions (fullwidth→ASCII).
+fn normalize_with_mapping(raw: &str) -> (String, Vec<(usize, usize)>) {
+    // Step 1: NFKD (full decomposition) — easy per-char mapping
+    let mut nfkd = String::new();
+    let mut nfkd_to_raw: Vec<usize> = Vec::new();
+    for (ri, rc) in raw.chars().enumerate() {
+        for dc in rc.nfkd() {
+            nfkd.push(dc);
+            nfkd_to_raw.push(ri);
+        }
+    }
+
+    // Step 2: Canonical composition (NFC step of NFKC)
+    let chars: Vec<char> = nfkd.chars().collect();
+    let mut result = String::with_capacity(chars.len());
+    let mut mapping: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let cc = canonical_combining_class(c);
+        if cc == 0 {
+            let mut starter = c;
+            let first_raw = nfkd_to_raw[i];
+            let mut last_raw = nfkd_to_raw[i];
+            let mut j = i + 1;
+            while j < chars.len() {
+                let next = chars[j];
+                let next_cc = canonical_combining_class(next);
+                if next_cc == 0 {
+                    break;
+                }
+                if let Some(composed) = unicode_normalization::char::compose(starter, next) {
+                    starter = composed;
+                    last_raw = nfkd_to_raw[j];
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            result.push(starter);
+            mapping.push((first_raw, last_raw));
+            i = j;
+        } else {
+            result.push(c);
+            mapping.push((nfkd_to_raw[i], nfkd_to_raw[i]));
+            i += 1;
+        }
+    }
+    (result, mapping)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_search_text_in_pdf(
+    path: *const c_char,
+    term: *const c_char,
+    out_json: *mut c_char,
+    out_len: *mut u32,
+) -> i32 {
+    let rc = (|| -> i32 {
+        let path_str = match unsafe { cstr_to_str(path) } {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let term_str = match unsafe { cstr_to_str(term) } {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+
+        if out_len.is_null() {
+            return -3;
+        }
+
+        let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+            Some(pdf) => pdf,
+            None => {
+                set_error("pdfium.dll not available".into());
+                return -1;
+            }
+        };
+
+        let pdf_data = match std::fs::read(path_str) {
+            Ok(d) => d,
+            Err(e) => {
+                set_error(format!("Failed to read PDF: {}", e));
+                return -1;
+            }
+        };
+        let doc = unsafe { (pdfium.FPDF_LoadMemDocument)(pdf_data.as_ptr(), pdf_data.len() as i32, std::ptr::null()) };
+        if doc.is_null() {
+            let err = unsafe { (pdfium.FPDF_GetLastError)() };
+            set_error(format!("PDFium error {}: {}", err, pdf_extractor::pdfium::error_str(err)));
+            return -1;
+        }
+
+        let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+        let normalized_term: String = term_str.nfkc().collect();
+
+        // Collect all per‑character positions, grouped by page later
+        let mut all_positions: Vec<pdf_extractor::positions::StoredPosition> = Vec::new();
+
+        for page_idx in 0..page_count {
+            let pdf_page = unsafe { (pdfium.FPDF_LoadPage)(doc, page_idx) };
+            if pdf_page.is_null() {
+                continue;
+            }
+
+            let text_page = unsafe { (pdfium.FPDFText_LoadPage)(pdf_page) };
+            if text_page.is_null() {
+                unsafe { (pdfium.FPDF_ClosePage)(pdf_page) };
+                continue;
+            }
+
+            let char_count = unsafe { (pdfium.FPDFText_CountChars)(text_page) };
+
+            // Collect all chars with their unicode values and bounding boxes
+            struct CharInfo {
+                left: f64,
+                right: f64,
+                bottom: f64,
+                top: f64,
+            }
+            let mut page_chars: Vec<CharInfo> = Vec::with_capacity(char_count as usize);
+            let mut raw_text = String::with_capacity(char_count as usize);
+
+            for i in 0..char_count {
+                let ch = unsafe { (pdfium.FPDFText_GetUnicode)(text_page, i) };
+                if ch == 0 {
+                    raw_text.push('\u{FFFD}');
+                    page_chars.push(CharInfo {
+                        left: 0.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        top: 0.0,
+                    });
+                    continue;
+                }
+                match char::from_u32(ch) {
+                    Some(c) => raw_text.push(c),
+                    None => raw_text.push('\u{FFFD}'),
+                }
+                let mut left = 0.0f64;
+                let mut right = 0.0f64;
+                let mut bottom = 0.0f64;
+                let mut top = 0.0f64;
+                unsafe {
+                    (pdfium.FPDFText_GetCharBox)(text_page, i, &mut left, &mut right, &mut bottom, &mut top);
+                }
+                page_chars.push(CharInfo { left, right, bottom, top });
+            }
+
+            // Normalize the raw page text and build the char mapping
+            let (norm_text, norm_to_raw) = normalize_with_mapping(&raw_text);
+
+            // Find all occurrences of normalized_term in norm_text
+            if normalized_term.is_empty() {
+                unsafe {
+                    (pdfium.FPDFText_ClosePage)(text_page);
+                    (pdfium.FPDF_ClosePage)(pdf_page);
+                }
+                continue;
+            }
+
+            // Case‑insensitive search: lower‑case both the normalized page text
+            // and the user query so that "Machine" matches "machine", etc.
+            let term_lower: Vec<char> = normalized_term.chars().flat_map(|c| c.to_lowercase()).collect();
+            let norm_chars: Vec<char> = norm_text.chars().collect();
+            let norm_lower: Vec<char> = norm_chars.iter().flat_map(|c| c.to_lowercase()).collect();
+            let term_len = term_lower.len();
+            if term_len > 0 {
+                let mut search_char: usize = 0;
+                while search_char + term_len <= norm_lower.len() {
+                    if norm_lower[search_char..search_char + term_len] == term_lower[..] {
+                        let norm_end_char = search_char + normalized_term.chars().count();
+                        if norm_end_char > norm_to_raw.len() {
+                            break;
+                        }
+                        let raw_start = norm_to_raw[search_char].0;
+                        let raw_end = norm_to_raw[norm_end_char.saturating_sub(1)].1;
+
+                        for raw_i in raw_start..=raw_end {
+                            if raw_i >= page_chars.len() {
+                                break;
+                            }
+                            let info = &page_chars[raw_i];
+                            all_positions.push(pdf_extractor::positions::StoredPosition {
+                                word_offset: raw_i,
+                                page: page_idx as u32 + 1,
+                                x_min: info.left as f32,
+                                y_min: info.bottom as f32,
+                                x_max: info.right as f32,
+                                y_max: info.top as f32,
+                                word_text: term_str.to_string(),
+                            });
+                        }
+
+                        search_char += 1;
+                    } else {
+                        search_char += 1;
+                    }
+                }
+            }
+
+            unsafe {
+                (pdfium.FPDFText_ClosePage)(text_page);
+                (pdfium.FPDF_ClosePage)(pdf_page);
+            }
+        }
+
+        unsafe { (pdfium.FPDF_CloseDocument)(doc) };
+
+        // Group per‑character boxes by page and line, merge into one per line
+        all_positions.sort_by_key(|p| (p.page, p.word_offset));
+        let merged = merge_by_line_from_chars(&all_positions);
+
+        let json_str = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
+        unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
+    })();
+    rc
+}
+
+// Helper: merge per‑character positions into one bounding box per text line.
+// Characters on the same page with vertical overlap are grouped together.
+fn merge_by_line_from_chars(
+    positions: &[pdf_extractor::positions::StoredPosition],
+) -> Vec<serde_json::Value> {
+    if positions.is_empty() {
+        return Vec::new();
+    }
+
+    #[derive(Clone)]
+    struct LineGroup {
+        page: u32,
+        x_min: f32,
+        y_min: f32,
+        x_max: f32,
+        y_max: f32,
+        word_text: String,
+    }
+
+    let mut groups: Vec<LineGroup> = Vec::new();
+    for p in positions {
+        if let Some(last) = groups.last_mut() {
+            if last.page == p.page
+                && !(p.y_min > last.y_max || last.y_min > p.y_max)
+            {
+                // Same page, overlapping vertically → same line
+                last.x_min = last.x_min.min(p.x_min);
+                last.y_min = last.y_min.min(p.y_min);
+                last.x_max = last.x_max.max(p.x_max);
+                last.y_max = last.y_max.max(p.y_max);
+                continue;
+            }
+        }
+        groups.push(LineGroup {
+            page: p.page,
+            x_min: p.x_min,
+            y_min: p.y_min,
+            x_max: p.x_max,
+            y_max: p.y_max,
+            word_text: p.word_text.clone(),
+        });
+    }
+
+    groups.into_iter().map(|g| {
+        serde_json::json!({
+            "page": g.page,
+            "x_min": g.x_min,
+            "y_min": g.y_min,
+            "x_max": g.x_max,
+            "y_max": g.y_max,
+            "word_text": g.word_text,
+        })
+    }).collect()
+}
+
+// ---------------------------------------------------------------------------
 // pdf_search_term_offsets
-// Returns a JSON integer array of word offsets within the content_norm field,
+// Returns a JSON integer array of word offsets within the content field,
 // using Tantivy's term vectors. These are 0-indexed word positions within the
 // indexed text, unlike pdf_get_term_positions which uses the SQLite position
 // store for page-level bounding boxes.
@@ -568,13 +1027,13 @@ pub unsafe extern "C" fn pdf_search_term_offsets(
         };
 
         let index_path = if coll_id == 0 {
-            with_app(|app| app.index_path.clone()).unwrap_or(None)
+            with_app_read(|app| app.index_path.clone()).unwrap_or(None)
         } else {
             match with_registry(|reg| reg.get_collection(coll_id as i64)) {
                 Ok(Ok(c)) => Some(PathBuf::from(&c.data_dir).join(".pdf_extractor").join("index")),
                 Ok(Err(_)) => {
                     set_error("Collection not found".into());
-                    return -8;
+                    return ERR_COLLECTION_NOT_FOUND;
                 }
                 Err(e) => return e,
             }
@@ -619,20 +1078,103 @@ pub unsafe extern "C" fn pdf_page_count(path: *const c_char) -> i32 {
         Err(_) => return -3,
     };
 
-    let rc = (|| -> i32 {
-        let clean = p.strip_prefix(r"\\?\").unwrap_or(p);
-        match lopdf::Document::load(clean) {
-            Ok(doc) => {
-                let pages = doc.get_pages();
-                pages.len() as i32
-            }
-            Err(e) => match e {
-                lopdf::Error::IO { .. } => -2,
-                _ => -1,
-            },
+    let pdf_data = match std::fs::read(p) {
+        Ok(data) => data,
+        Err(e) => {
+            set_error(format!("Failed to read PDF file: {}", e));
+            return -2;
         }
-    })();
-    rc
+    };
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(pdf) => pdf,
+        None => {
+            set_error("pdfium.dll not available".into());
+            return -1;
+        }
+    };
+
+    let doc = unsafe { (pdfium.FPDF_LoadMemDocument)(pdf_data.as_ptr(), pdf_data.len() as i32, std::ptr::null()) };
+    if doc.is_null() {
+        let err = unsafe { (pdfium.FPDF_GetLastError)() };
+        let msg = format!("PDFium error {}: {}", err, pdf_extractor::pdfium::error_str(err));
+        set_error(msg);
+        return -1;
+    }
+
+    let count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+    unsafe { (pdfium.FPDF_CloseDocument)(doc); }
+    count
+}
+
+// ---------------------------------------------------------------------------
+// pdf_page_dimensions — returns page dimensions as two f64 values into out_buf
+// Returns: 0 on success, -1 on error
+// out_len must point to a u32 set to 16 (sizeof two f64) before calling
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_page_dimensions(
+    path: *const c_char,
+    page_index: u32,
+    out_buf: *mut u8,
+    out_len: *mut u32,
+) -> i32 {
+    let p = match unsafe { cstr_to_str(path) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    if out_len.is_null() || *out_len < 16 {
+        if !out_len.is_null() { *out_len = 16; }
+        return -4;
+    }
+    *out_len = 16;
+
+    let pdf_data = match std::fs::read(p) {
+        Ok(data) => data,
+        Err(e) => {
+            set_error(format!("Failed to read PDF file: {}", e));
+            return -1;
+        }
+    };
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(pdf) => pdf,
+        None => {
+            set_error("pdfium.dll not available".into());
+            return -1;
+        }
+    };
+
+    let doc = unsafe { (pdfium.FPDF_LoadMemDocument)(pdf_data.as_ptr(), pdf_data.len() as i32, std::ptr::null()) };
+    if doc.is_null() {
+        set_error("Failed to load document for dimension query".into());
+        return -1;
+    }
+
+    let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+    if page_index as i32 >= page_count {
+        set_error("Page index out of range".into());
+        unsafe { (pdfium.FPDF_CloseDocument)(doc); }
+        return -1;
+    }
+
+    let pdf_page = unsafe { (pdfium.FPDF_LoadPage)(doc, page_index as i32) };
+    if pdf_page.is_null() {
+        unsafe { (pdfium.FPDF_CloseDocument)(doc); }
+        set_error("Failed to load page".into());
+        return -1;
+    }
+
+    let w = unsafe { (pdfium.FPDF_GetPageWidthF)(pdf_page) } as f64;
+    let h = unsafe { (pdfium.FPDF_GetPageHeightF)(pdf_page) } as f64;
+
+    unsafe { (pdfium.FPDF_ClosePage)(pdf_page); (pdfium.FPDF_CloseDocument)(doc); }
+
+    // Write dimensions as two little-endian f64 values
+    let buf = std::slice::from_raw_parts_mut(out_buf, 16);
+    buf[0..8].copy_from_slice(&w.to_le_bytes());
+    buf[8..16].copy_from_slice(&h.to_le_bytes());
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +1189,6 @@ pub unsafe extern "C" fn pdf_render_thumbnail(
     out_buf: *mut u8,
     out_len: *mut u32,
 ) -> i32 {
-    (|| -> i32 {
     let p = match unsafe { cstr_to_str(path) } {
         Ok(s) => s,
         Err(e) => return e,
@@ -657,96 +1198,125 @@ pub unsafe extern "C" fn pdf_render_thumbnail(
         return -3;
     }
 
-    let pdf_path = PathBuf::from(p);
-    if !pdf_path.exists() {
-        set_error("File not found".into());
-        return -2;
+    // Page numbers are 1-based in the API; PDFium uses 0-based
+    if page == 0 {
+        set_error("Page number must be >= 1".into());
+        return -3;
     }
+    let pdfium_page = (page - 1) as i32;
 
-    let temp_dir = std::env::temp_dir().join("pdf_extractor_capi_thumbs");
-    let _ = std::fs::create_dir_all(&temp_dir);
-    let png_path = temp_dir.join(format!("page_{}.png", page));
-    let _ = std::fs::remove_file(&png_path);
-
-    let page_str = page.to_string();
-    let rendered = {
-        let r1 = std::process::Command::new("mutool")
-            .args(["draw", "-o"])
-            .arg(&png_path)
-            .args(["-r", "150"])
-            .arg(&pdf_path)
-            .arg(&page_str)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|_| png_path.exists())
-            .unwrap_or(false);
-        if r1 {
-            true
-        } else {
-            let ppm_path = temp_dir.join(format!("page_{}.ppm", page));
-            let _ = std::fs::remove_file(&ppm_path);
-            let r2 = std::process::Command::new("pdftoppm")
-                .args(["-r", "150", "-gray", "-f", &page_str, "-l", &page_str, "-singlefile"])
-                .arg(&pdf_path)
-                .arg(&ppm_path.with_extension(""))
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|_| {
-                    if ppm_path.exists() {
-                        // Convert PPM to PNG using the image crate
-                        let img = image::open(&ppm_path).ok()?;
-                        let _ = std::fs::remove_file(&ppm_path);
-                        img.save(&png_path).ok()
-                    } else {
-                        None
-                    }
-                })
-                .is_some();
-            r2
+    let clean = p.strip_prefix(r"\\?\").unwrap_or(p);
+    let pdf_data = match std::fs::read(std::path::Path::new(clean)) {
+        Ok(d) => d,
+        Err(e) => {
+            set_error(format!("Cannot read file: {}", e));
+            return -2;
+        }
+    };
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(pdf) => pdf,
+        None => {
+            set_error("pdfium.dll not available".into());
+            return -1;
         }
     };
 
-    if !rendered || !png_path.exists() {
-        set_error("No PDF renderer available (install mutool or pdftoppm)".into());
+    let doc = unsafe { (pdfium.FPDF_LoadMemDocument)(pdf_data.as_ptr(), pdf_data.len() as i32, std::ptr::null()) };
+    if doc.is_null() {
+        set_error("Failed to load PDF via PDFium".into());
         return -1;
     }
 
-    // Load and optionally resize the image
-    let img_data = if max_w > 0 {
-        match image::open(&png_path) {
-            Ok(img) => {
-                let (w, h) = img.dimensions();
-                if w > max_w {
-                    let new_h = (h as f64 * max_w as f64 / w as f64) as u32;
-                    let resized = image::imageops::resize(
-                        &img,
-                        max_w,
-                        new_h.max(1),
-                        image::imageops::FilterType::Lanczos3,
-                    );
-                    let mut buf = std::io::Cursor::new(Vec::new());
-                    let _ = resized.write_to(&mut buf, image::ImageFormat::Png);
-                    buf.into_inner()
-                } else {
-                    std::fs::read(&png_path).unwrap_or_default()
-                }
-            }
-            Err(_) => std::fs::read(&png_path).unwrap_or_default(),
+    let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+    if pdfium_page >= page_count {
+        set_error(format!("Page {} out of range (document has {} pages)", page, page_count).into());
+        unsafe { (pdfium.FPDF_CloseDocument)(doc); }
+        return -1;
+    }
+
+    let pdf_page = unsafe { (pdfium.FPDF_LoadPage)(doc, pdfium_page) };
+    if pdf_page.is_null() {
+        set_error("Failed to load PDF page".into());
+        unsafe { (pdfium.FPDF_CloseDocument)(doc); }
+        return -1;
+    }
+
+    // Get page dimensions in points (1/72 inch)
+    let page_width_pts = unsafe { (pdfium.FPDF_GetPageWidthF)(pdf_page) };
+    let page_height_pts = unsafe { (pdfium.FPDF_GetPageHeightF)(pdf_page) };
+
+    // Calculate render size: default 150 DPI, cap width at max_w if set
+    let default_dpi = 150.0;
+    let dest_width = {
+        let w = (page_width_pts as f64 * default_dpi / 72.0) as i32;
+        if max_w > 0 { w.min(max_w as i32) } else { w }
+    };
+    let dest_height = (dest_width as f64 * page_height_pts as f64 / page_width_pts as f64).round() as i32;
+
+    if dest_width <= 0 || dest_height <= 0 {
+        set_error("Invalid render dimensions".into());
+        unsafe { (pdfium.FPDF_ClosePage)(pdf_page); (pdfium.FPDF_CloseDocument)(doc); }
+        return -1;
+    }
+
+    // Create BGRA bitmap
+    let bitmap = unsafe { (pdfium.FPDFBitmap_CreateEx)(dest_width, dest_height, pdf_extractor::pdfium::FPDFBITMAP_BGRA, std::ptr::null_mut(), 0) };
+    if bitmap.is_null() {
+        set_error("Failed to create PDFium bitmap".into());
+        unsafe { (pdfium.FPDF_ClosePage)(pdf_page); (pdfium.FPDF_CloseDocument)(doc); }
+        return -1;
+    }
+
+    // Fill with white background
+    unsafe { (pdfium.FPDFBitmap_FillRect)(bitmap, 0, 0, dest_width, dest_height, 0xFFFFFFFF); }
+
+    // Render page to bitmap (no annotations, no special flags)
+    unsafe { (pdfium.FPDF_RenderPageBitmap)(bitmap, pdf_page, 0, 0, dest_width, dest_height, 0, pdf_extractor::pdfium::FPDF_NONE); }
+
+    // Get pixel buffer (BGRA format, 4 bytes per pixel)
+    let buf_ptr = unsafe { (pdfium.FPDFBitmap_GetBuffer)(bitmap) };
+    let stride = unsafe { (pdfium.FPDFBitmap_GetStride)(bitmap) };
+    if buf_ptr.is_null() || stride <= 0 {
+        unsafe { (pdfium.FPDFBitmap_Destroy)(bitmap); (pdfium.FPDF_ClosePage)(pdf_page); (pdfium.FPDF_CloseDocument)(doc); }
+        set_error("Failed to get PDFium bitmap buffer".into());
+        return -1;
+    }
+
+    // Copy buffer — but skip the alpha channel for PNG
+    let total_pixels = (dest_width * dest_height) as usize;
+    let mut rgba_data = vec![0u8; total_pixels * 3]; // RGB only
+
+    // PDFium gives BGRA; we need RGB for PNG
+    let src = std::slice::from_raw_parts(buf_ptr, total_pixels * 4);
+    for i in 0..total_pixels {
+        let si = i * 4;
+        let di = i * 3;
+        rgba_data[di] = src[si + 2];     // R ← B
+        rgba_data[di + 1] = src[si + 1]; // G ← G
+        rgba_data[di + 2] = src[si];     // R ← G
+    }
+
+    unsafe { (pdfium.FPDFBitmap_Destroy)(bitmap); (pdfium.FPDF_ClosePage)(pdf_page); (pdfium.FPDF_CloseDocument)(doc); }
+
+    // Encode as PNG
+    let img = match image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(dest_width as u32, dest_height as u32, rgba_data) {
+        Some(img) => img,
+        None => {
+            set_error("Failed to create image buffer".into());
+            return -1;
         }
-    } else {
-        std::fs::read(&png_path).unwrap_or_default()
     };
 
-    let _ = std::fs::remove_file(&png_path);
-
-    if img_data.is_empty() {
-        set_error("Rendered image is empty".into());
+    let dyn_img = image::DynamicImage::ImageRgb8(img);
+    let mut png_buf = std::io::Cursor::new(Vec::new());
+    if dyn_img.write_to(&mut png_buf, image::ImageFormat::Png).is_err() {
+        set_error("Failed to encode PNG".into());
         return -1;
     }
 
-    let needed = img_data.len() as u32;
+    let png_data = png_buf.into_inner();
+    let needed = png_data.len() as u32;
+
     if out_buf.is_null() {
         *out_len = needed;
         return 0;
@@ -755,10 +1325,341 @@ pub unsafe extern "C" fn pdf_render_thumbnail(
         *out_len = needed;
         return -4;
     }
-    std::ptr::copy_nonoverlapping(img_data.as_ptr(), out_buf, needed as usize);
+    std::ptr::copy_nonoverlapping(png_data.as_ptr(), out_buf, needed as usize);
     *out_len = needed;
     0
-    })()
+}
+
+// ---------------------------------------------------------------------------
+// pdf_render_page
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_render_page(
+    path: *const c_char,
+    page_index: u32,
+    target_width: u32,
+    out_buf: *mut u8,
+    out_len: *mut u32,
+) -> i32 {
+    let p = match unsafe { cstr_to_str(path) } {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    if out_len.is_null() {
+        return -3;
+    }
+
+    let pdf_data = match std::fs::read(p) {
+        Ok(data) => data,
+        Err(e) => {
+            set_error(format!("Failed to read PDF file: {}", e));
+            return -1;
+        }
+    };
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(pdf) => pdf,
+        None => {
+            set_error("pdfium.dll not available".into());
+            return -1;
+        }
+    };
+
+    let doc = unsafe { (pdfium.FPDF_LoadMemDocument)(pdf_data.as_ptr(), pdf_data.len() as i32, std::ptr::null()) };
+    if doc.is_null() {
+        let err = unsafe { (pdfium.FPDF_GetLastError)() };
+        let msg = format!("PDFium error {}: {}", err, pdf_extractor::pdfium::error_str(err));
+        set_error(msg);
+        return -1;
+    }
+
+    let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+    if page_index as i32 >= page_count {
+        set_error(format!("Page {} out of range (document has {} pages)", page_index + 1, page_count).into());
+        unsafe { (pdfium.FPDF_CloseDocument)(doc); }
+        return -1;
+    }
+
+    let pdf_page = unsafe { (pdfium.FPDF_LoadPage)(doc, page_index as i32) };
+    if pdf_page.is_null() {
+        set_error("Failed to load PDF page".into());
+        unsafe { (pdfium.FPDF_CloseDocument)(doc); }
+        return -1;
+    }
+
+    // Get page dimensions in points (1/72 inch)
+    let page_width_pts = unsafe { (pdfium.FPDF_GetPageWidthF)(pdf_page) };
+    let page_height_pts = unsafe { (pdfium.FPDF_GetPageHeightF)(pdf_page) };
+
+    // Calculate render size: target_width pixels wide at appropriate DPI
+    let dest_width = if target_width > 0 {
+        target_width as i32
+    } else {
+        let default_dpi = 150.0;
+        (page_width_pts as f64 * default_dpi / 72.0) as i32
+    };
+    let dest_height = (dest_width as f64 * page_height_pts as f64 / page_width_pts as f64).round() as i32;
+
+    if dest_width <= 0 || dest_height <= 0 {
+        set_error("Invalid render dimensions".into());
+        unsafe { (pdfium.FPDF_ClosePage)(pdf_page); (pdfium.FPDF_CloseDocument)(doc); }
+        return -1;
+    }
+
+    // Create BGRA bitmap
+    let bitmap = unsafe { (pdfium.FPDFBitmap_CreateEx)(dest_width, dest_height, pdf_extractor::pdfium::FPDFBITMAP_BGRA, std::ptr::null_mut(), 0) };
+    if bitmap.is_null() {
+        set_error("Failed to create PDFium bitmap".into());
+        unsafe { (pdfium.FPDF_ClosePage)(pdf_page); (pdfium.FPDF_CloseDocument)(doc); }
+        return -1;
+    }
+
+    // Fill with white background
+    unsafe { (pdfium.FPDFBitmap_FillRect)(bitmap, 0, 0, dest_width, dest_height, 0xFFFFFFFF); }
+
+    // Render page to bitmap (no annotations, no special flags)
+    unsafe { (pdfium.FPDF_RenderPageBitmap)(bitmap, pdf_page, 0, 0, dest_width, dest_height, 0, pdf_extractor::pdfium::FPDF_NONE); }
+
+    // Get pixel buffer (BGRA format, 4 bytes per pixel)
+    let buf_ptr = unsafe { (pdfium.FPDFBitmap_GetBuffer)(bitmap) };
+    let stride = unsafe { (pdfium.FPDFBitmap_GetStride)(bitmap) };
+    if buf_ptr.is_null() || stride <= 0 {
+        unsafe { (pdfium.FPDFBitmap_Destroy)(bitmap); (pdfium.FPDF_ClosePage)(pdf_page); (pdfium.FPDF_CloseDocument)(doc); }
+        set_error("Failed to get PDFium bitmap buffer".into());
+        return -1;
+    }
+
+    // Copy buffer — convert BGRA to RGB for PNG encoding
+    let total_pixels = (dest_width * dest_height) as usize;
+    let mut rgba_data = vec![0u8; total_pixels * 3];
+
+    let src = std::slice::from_raw_parts(buf_ptr, total_pixels * 4);
+    for i in 0..total_pixels {
+        let si = i * 4;
+        let di = i * 3;
+        rgba_data[di] = src[si + 2];     // R ← B
+        rgba_data[di + 1] = src[si + 1]; // G ← G
+        rgba_data[di + 2] = src[si];     // B ← R
+    }
+
+    unsafe { (pdfium.FPDFBitmap_Destroy)(bitmap); (pdfium.FPDF_ClosePage)(pdf_page); (pdfium.FPDF_CloseDocument)(doc); }
+
+    // Encode as PNG
+    let img = match image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(dest_width as u32, dest_height as u32, rgba_data) {
+        Some(img) => img,
+        None => {
+            set_error("Failed to create image buffer".into());
+            return -1;
+        }
+    };
+
+    let dyn_img = image::DynamicImage::ImageRgb8(img);
+    let mut png_buf = std::io::Cursor::new(Vec::new());
+    if dyn_img.write_to(&mut png_buf, image::ImageFormat::Png).is_err() {
+        set_error("Failed to encode PNG".into());
+        return -1;
+    }
+
+    let png_data = png_buf.into_inner();
+    let needed = png_data.len() as u32;
+
+    if out_buf.is_null() {
+        *out_len = needed;
+        return 0;
+    }
+    if *out_len < needed {
+        *out_len = needed;
+        return -4;
+    }
+    std::ptr::copy_nonoverlapping(png_data.as_ptr(), out_buf, needed as usize);
+    *out_len = needed;
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Stateful PDF rendering (open → render raw BGRA → close)
+// ---------------------------------------------------------------------------
+
+static OPEN_DOCS: OnceLock<Mutex<HashMap<i32, (usize, i32)>>> = OnceLock::new();
+static ACTIVE_BITMAPS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+static NEXT_DOC_HANDLE: AtomicI32 = AtomicI32::new(1);
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_open_document_mem(data: *const u8, len: i32) -> i32 {
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(p) => p,
+        None => {
+            set_error("pdfium.dll not available".into());
+            return -1;
+        }
+    };
+    if data.is_null() || len <= 0 {
+        set_error("Invalid PDF data".into());
+        return -1;
+    }
+    let slice = std::slice::from_raw_parts(data, len as usize);
+    let doc = unsafe { (pdfium.FPDF_LoadMemDocument)(slice.as_ptr(), len, std::ptr::null()) };
+    if doc.is_null() {
+        let err = unsafe { (pdfium.FPDF_GetLastError)() };
+        set_error(format!("PDFium error {}: {}", err, pdf_extractor::pdfium::error_str(err)));
+        return -1;
+    }
+    let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+    let handle = NEXT_DOC_HANDLE.fetch_add(1, Ordering::SeqCst);
+    let mut map = OPEN_DOCS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    map.insert(handle, (doc as usize, page_count));
+    handle
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_document_page_count(handle: i32) -> i32 {
+    let map = OPEN_DOCS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    match map.get(&handle) {
+        Some((_, count)) => *count,
+        None => {
+            set_error("Invalid document handle".into());
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_render_page_bgra(
+    handle: i32,
+    page_index: i32,
+    dpi: f64,
+    _highlight_json: *const u8,
+    out_width: *mut i32,
+    out_height: *mut i32,
+    out_stride: *mut i32,
+    out_width_pts: *mut f64,
+    out_height_pts: *mut f64,
+    out_pixels: *mut *mut u8,
+) -> i32 {
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(p) => p,
+        None => {
+            set_error("pdfium.dll not available".into());
+            return -1;
+        }
+    };
+    if out_width.is_null() || out_height.is_null() || out_stride.is_null()
+        || out_width_pts.is_null() || out_height_pts.is_null() || out_pixels.is_null()
+    {
+        set_error("Null output pointer".into());
+        return -3;
+    }
+
+    let map = OPEN_DOCS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let (doc_ptr, _) = match map.get(&handle) {
+        Some(entry) => *entry,
+        None => {
+            set_error("Invalid document handle".into());
+            return -1;
+        }
+    };
+    let doc = doc_ptr as *mut std::ffi::c_void;
+
+    let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+    if page_index < 0 || page_index >= page_count {
+        set_error(format!("Page {} out of range ({} pages)", page_index, page_count));
+        return -1;
+    }
+
+    let page = unsafe { (pdfium.FPDF_LoadPage)(doc, page_index) };
+    if page.is_null() {
+        set_error("Failed to load page".into());
+        return -1;
+    }
+
+    let w_pts = unsafe { (pdfium.FPDF_GetPageWidthF)(page) };
+    let h_pts = unsafe { (pdfium.FPDF_GetPageHeightF)(page) };
+
+    let scale = dpi / 72.0;
+    let dest_width = ((w_pts as f64) * scale).round() as i32;
+    let dest_height = ((h_pts as f64) * scale).round() as i32;
+
+    if dest_width <= 0 || dest_height <= 0 {
+        unsafe { (pdfium.FPDF_ClosePage)(page); }
+        set_error("Invalid render dimensions".into());
+        return -1;
+    }
+
+    let bitmap = unsafe {
+        (pdfium.FPDFBitmap_CreateEx)(
+            dest_width,
+            dest_height,
+            pdf_extractor::pdfium::FPDFBITMAP_BGRA,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if bitmap.is_null() {
+        unsafe { (pdfium.FPDF_ClosePage)(page); }
+        set_error("Failed to create bitmap".into());
+        return -1;
+    }
+
+    unsafe {
+        (pdfium.FPDFBitmap_FillRect)(bitmap, 0, 0, dest_width, dest_height, 0xFFFFFFFF);
+        (pdfium.FPDF_RenderPageBitmap)(bitmap, page, 0, 0, dest_width, dest_height, 0, pdf_extractor::pdfium::FPDF_NONE);
+    }
+
+    let buf_ptr = unsafe { (pdfium.FPDFBitmap_GetBuffer)(bitmap) };
+    let stride = unsafe { (pdfium.FPDFBitmap_GetStride)(bitmap) };
+
+    unsafe { (pdfium.FPDF_ClosePage)(page); }
+
+    if buf_ptr.is_null() || stride <= 0 {
+        unsafe { (pdfium.FPDFBitmap_Destroy)(bitmap); }
+        set_error("Failed to get bitmap buffer".into());
+        return -1;
+    }
+
+    let mut bmp_map = ACTIVE_BITMAPS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    bmp_map.insert(buf_ptr as usize, bitmap as usize);
+
+    unsafe {
+        *out_width = dest_width;
+        *out_height = dest_height;
+        *out_stride = stride;
+        *out_width_pts = w_pts as f64;
+        *out_height_pts = h_pts as f64;
+        *out_pixels = buf_ptr;
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_free_bitmap(pixels: *mut u8) {
+    if pixels.is_null() {
+        return;
+    }
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(p) => p,
+        None => return,
+    };
+    let mut bmp_map = ACTIVE_BITMAPS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    if let Some(bitmap_ptr) = bmp_map.remove(&(pixels as usize)) {
+        unsafe { (pdfium.FPDFBitmap_Destroy)(bitmap_ptr as *mut std::ffi::c_void); }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_close_document(handle: i32) -> i32 {
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(p) => p,
+        None => return -1,
+    };
+    let mut map = OPEN_DOCS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    if let Some((doc_ptr, _)) = map.remove(&handle) {
+        unsafe { (pdfium.FPDF_CloseDocument)(doc_ptr as *mut std::ffi::c_void); }
+        0
+    } else {
+        set_error("Invalid document handle".into());
+        -1
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -777,7 +1678,13 @@ pub unsafe extern "C" fn pdf_free_string(_ptr: *mut c_char) {
 #[no_mangle]
 pub unsafe extern "C" fn pdf_last_error(out: *mut c_char, out_len: *mut u32) -> i32 {
     (|| -> i32 {
-    let msg = with_app(|app| app.last_error.clone().unwrap_or_default()).unwrap_or_default();
+    let msg = LAST_ERROR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
     unsafe { write_to_buffer(msg.as_bytes(), out, out_len) }
     })()
 }
@@ -813,7 +1720,7 @@ pub unsafe extern "C" fn pdf_set_channel_capacity(capacity: u32) -> i32 {
         set_error("Channel capacity must be > 0".into());
         return -3;
     }
-    match with_app(|app| {
+    match with_app_mut(|app| {
         app.channel_capacity = Some(capacity);
         Ok::<_, i32>(())
     }) {
@@ -854,7 +1761,7 @@ pub unsafe extern "C" fn pdf_extract(
         }
     };
 
-    let (jobs, indexer) = with_app(|app| {
+    let (jobs, indexer) = with_app_read(|app| {
         let jobs = app.jobs.as_ref().map(Arc::clone);
         let indexer = app.indexer.as_ref().map(Arc::clone);
         (jobs, indexer)
@@ -879,9 +1786,10 @@ pub unsafe extern "C" fn pdf_extract(
     let total = jobs.count_pending().unwrap_or(0) as u64;
     let metrics = Arc::new(Metrics::new());
 
-    let channel_capacity = with_app(|app| app.channel_capacity).unwrap_or(None);
+    let channel_capacity = with_app_read(|app| app.channel_capacity).unwrap_or(None);
     let config = PipelineConfig {
         channel_capacity: channel_capacity.map(|v| v as usize),
+        num_indexer_threads: with_app_read(|app| app.num_indexer_threads).unwrap_or(None).map(|v| v as usize),
         ..Default::default()
     };
 
@@ -916,7 +1824,7 @@ pub unsafe extern "C" fn pdf_extract(
 #[no_mangle]
 pub unsafe extern "C" fn pdf_stats(out_json: *mut c_char, out_len: *mut u32) -> i32 {
     (|| -> i32 {
-    let index_path = with_app(|app| app.index_path.clone()).unwrap_or(None);
+    let index_path = with_app_read(|app| app.index_path.clone()).unwrap_or(None);
     let index_path = match index_path {
         Some(p) => p,
         None => {
@@ -961,7 +1869,7 @@ fn registry_guard() -> Result<std::sync::MutexGuard<'static, Option<CollectionRe
     COLLECTION_REGISTRY
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .map_err(|_| -1)
+        .map_err(|_| ERR_POISONED)
 }
 
 fn with_registry<F, R>(f: F) -> Result<R, i32>
@@ -969,7 +1877,7 @@ where
     F: FnOnce(&CollectionRegistry) -> R,
 {
     let guard = registry_guard()?;
-    let reg = guard.as_ref().ok_or(-7)?;
+    let reg = guard.as_ref().ok_or(ERR_REG_NOT_INIT)?;
     Ok(f(reg))
 }
 
@@ -1008,7 +1916,7 @@ macro_rules! define_u32_setter {
         #[no_mangle]
         pub unsafe extern "C" fn $name(value: u32) -> i32 {
             (|| -> i32 {
-            match with_app(|app| { app.$field = Some(value); Ok::<_, i32>(()) }) {
+            match with_app_mut(|app| { app.$field = Some(value); Ok::<_, i32>(()) }) {
                 Ok(_) => 0,
                 Err(e) => e,
             }
@@ -1022,7 +1930,7 @@ macro_rules! define_u32_direct_setter {
         #[no_mangle]
         pub unsafe extern "C" fn $name(value: u32) -> i32 {
             (|| -> i32 {
-            match with_app(|app| { app.$field = value; Ok::<_, i32>(()) }) {
+            match with_app_mut(|app| { app.$field = value; Ok::<_, i32>(()) }) {
                 Ok(_) => 0,
                 Err(e) => e,
             }
@@ -1037,7 +1945,7 @@ macro_rules! define_string_setter {
         pub unsafe extern "C" fn $name(value: *const c_char) -> i32 {
             (|| -> i32 {
             if value.is_null() {
-                match with_app(|app| { app.$field = None; Ok::<_, i32>(()) }) {
+                match with_app_mut(|app| { app.$field = None; Ok::<_, i32>(()) }) {
                     Ok(_) => 0,
                     Err(e) => e,
                 }
@@ -1046,7 +1954,7 @@ macro_rules! define_string_setter {
                     Ok(s) => s.to_string(),
                     Err(e) => return e,
                 };
-                match with_app(|app| { app.$field = Some(s); Ok::<_, i32>(()) }) {
+                match with_app_mut(|app| { app.$field = Some(s); Ok::<_, i32>(()) }) {
                     Ok(_) => 0,
                     Err(e) => e,
                 }
@@ -1062,6 +1970,7 @@ define_u32_setter!(pdf_set_indexer_batch_size, indexer_batch_size);
 define_u32_setter!(pdf_set_commit_interval, commit_interval);
 define_u32_setter!(pdf_set_commit_timeout, commit_timeout);
 define_u32_setter!(pdf_set_extract_workers, extract_workers);
+define_u32_setter!(pdf_set_indexer_threads, num_indexer_threads);
 define_u32_direct_setter!(pdf_set_fuzzy_distance, fuzzy_distance);
 define_u32_direct_setter!(pdf_set_stem, stem_enabled);
 define_string_setter!(pdf_set_tesseract_path, tesseract_path);
@@ -1070,9 +1979,33 @@ define_string_setter!(pdf_set_search_field, search_field);
 define_string_setter!(pdf_set_path_filter, path_filter);
 
 #[no_mangle]
+pub unsafe extern "C" fn pdf_set_log_callback(cb: Option<extern "C" fn(*const u8, u32)>) -> i32 {
+    let lock = LOG_CALLBACK.get_or_init(|| Mutex::new(None));
+    match lock.lock() {
+        Ok(mut guard) => {
+            *guard = cb;
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_set_process_callback(cb: Option<extern "C" fn(*const u8, u32)>) -> i32 {
+    let lock = PROCESS_CALLBACK.get_or_init(|| Mutex::new(None));
+    match lock.lock() {
+        Ok(mut guard) => {
+            *guard = cb;
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pdf_set_ram_buffer(value: u64) -> i32 {
     (|| -> i32 {
-    match with_app(|app| { app.ram_buffer = Some(value); Ok::<_, i32>(()) }) {
+    match with_app_mut(|app| { app.ram_buffer = Some(value); Ok::<_, i32>(()) }) {
         Ok(_) => 0,
         Err(e) => e,
     }
@@ -1082,7 +2015,7 @@ pub unsafe extern "C" fn pdf_set_ram_buffer(value: u64) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn pdf_set_recency_weight(value: f32) -> i32 {
     (|| -> i32 {
-    match with_app(|app| { app.recency_weight = value; Ok::<_, i32>(()) }) {
+    match with_app_mut(|app| { app.recency_weight = value; Ok::<_, i32>(()) }) {
         Ok(_) => 0,
         Err(e) => e,
     }
@@ -1092,18 +2025,17 @@ pub unsafe extern "C" fn pdf_set_recency_weight(value: f32) -> i32 {
 /// Set per-field weight boosts for ranked search.
 ///
 /// `json` is a JSON object mapping Tantivy field names to float weights:
-/// e.g. `{"content_norm": 1.0, "math_source": 3.0}`.
+/// e.g. `{"content": 1.0, "path": 3.0}`.
 ///
 /// Pass `null` to reset to unweighted (default) search. On success the
 /// next call to any search function will use BoostQuery for each field.
 ///
-/// Valid field names: content_norm, content_raw, math_source,
-/// normalized_text, content_stem, content_jp, content_zh, path.
+/// Valid field names: content, path, math_tokens.
 #[no_mangle]
 pub unsafe extern "C" fn pdf_set_field_weights(json: *const c_char) -> i32 {
     (|| -> i32 {
     if json.is_null() {
-        return match with_app(|app| { app.field_weights = None; Ok::<_, i32>(()) }) {
+        return match with_app_mut(|app| { app.field_weights = None; Ok::<_, i32>(()) }) {
             Ok(_) => 0,
             Err(e) => e,
         };
@@ -1134,7 +2066,7 @@ pub unsafe extern "C" fn pdf_set_field_weights(json: *const c_char) -> i32 {
         set_error("Field weights object must have at least one entry".into());
         return -3;
     }
-    match with_app(|app| { app.field_weights = Some(weights); Ok::<_, i32>(()) }) {
+    match with_app_mut(|app| { app.field_weights = Some(weights); Ok::<_, i32>(()) }) {
         Ok(_) => 0,
         Err(e) => e,
     }
@@ -1155,7 +2087,7 @@ pub unsafe extern "C" fn pdf_set_collection_boost(coll_id: u32, weight: f32) -> 
         set_error("Collection boost must be > 0.0".into());
         return -3;
     }
-    match with_app(|app| { app.collection_boosts.insert(coll_id as i64, weight); Ok::<_, i32>(()) }) {
+    match with_app_mut(|app| { app.collection_boosts.insert(coll_id as i64, weight); Ok::<_, i32>(()) }) {
         Ok(_) => 0,
         Err(e) => e,
     }
@@ -1181,7 +2113,7 @@ pub unsafe extern "C" fn pdf_set_collection_boost(coll_id: u32, weight: f32) -> 
 pub unsafe extern "C" fn pdf_set_boolean_query(json: *const c_char) -> i32 {
     (|| -> i32 {
     if json.is_null() {
-        return match with_app(|app| { app.boolean_query = None; Ok::<_, i32>(()) }) {
+        return match with_app_mut(|app| { app.boolean_query = None; Ok::<_, i32>(()) }) {
             Ok(_) => 0,
             Err(e) => e,
         };
@@ -1221,7 +2153,7 @@ pub unsafe extern "C" fn pdf_set_boolean_query(json: *const c_char) -> i32 {
         };
         clauses.push((term, occur.to_string()));
     }
-    match with_app(|app| { app.boolean_query = Some(clauses); Ok::<_, i32>(()) }) {
+    match with_app_mut(|app| { app.boolean_query = Some(clauses); Ok::<_, i32>(()) }) {
         Ok(_) => 0,
         Err(e) => e,
     }
@@ -1287,23 +2219,31 @@ pub unsafe extern "C" fn pdf_index_collection(
     flags: u32,
     progress_callback: Option<extern "C" fn(u64, u64)>,
 ) -> i32 {
+    eprintln!("[pdf_index_collection] ENTER coll_id={}", coll_id);
     (|| -> i32 {
-    CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    struct DropToken(u32);
+    impl Drop for DropToken { fn drop(&mut self) { cancel_tokens().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0); } }
+
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    cancel_tokens().lock().unwrap_or_else(|e| e.into_inner()).insert(coll_id, cancel_token.clone());
+    let _guard = DropToken(coll_id);
 
     let collection = match with_registry(|reg| reg.get_collection(coll_id as i64)) {
         Ok(Ok(c)) => c,
-        Ok(Err(_)) => { set_error("Collection not found".into()); return -8; }
-        Err(e) => return e,
+        Ok(Err(_)) => { eprintln!("[pdf_index_collection] collection not found"); set_error("Collection not found".into()); return ERR_COLLECTION_NOT_FOUND; }
+        Err(e) => { eprintln!("[pdf_index_collection] reg error: {}", e); return e; }
     };
+    eprintln!("[pdf_index_collection] collection={:?} folder={:?}", coll_id, collection.books_folder);
     let canonical = match std::fs::canonicalize(Path::new(&collection.books_folder)) {
         Ok(p) => p,
-        Err(e) => { set_error(format!("Books folder not accessible: {}", e)); return -1; }
+        Err(e) => { eprintln!("[pdf_index_collection] canonicalize error: {}", e); set_error(format!("Books folder not accessible: {}", e)); return -1; }
     };
+    eprintln!("[pdf_index_collection] canonical={:?}", canonical);
 
     match with_registry(|reg| reg.ensure_data_dirs(coll_id as i64)) {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => { set_error(format!("{}", e)); return -1; }
-        Err(e) => return e,
+        Ok(Err(e)) => { eprintln!("[pdf_index_collection] ensure dirs error: {}", e); set_error(format!("{}", e)); return -1; }
+        Err(e) => { eprintln!("[pdf_index_collection] reg error: {}", e); return e; }
     }
 
     let db_path = match with_registry(|reg| reg.db_path(coll_id as i64)) {
@@ -1339,7 +2279,7 @@ pub unsafe extern "C" fn pdf_index_collection(
     let indexer = if no_index {
         None
     } else {
-        match with_app(|app| app.ram_buffer) {
+        match with_app_read(|app| app.ram_buffer) {
             Ok(Some(buf)) => match Indexer::with_ram_buffer(&index_path, buf) {
                 Ok(idx) => Some(Arc::new(idx)),
                 Err(e) => {
@@ -1359,34 +2299,72 @@ pub unsafe extern "C" fn pdf_index_collection(
 
     let metrics = Arc::new(Metrics::new());
 
-    let channel_capacity = with_app(|app| app.channel_capacity).unwrap_or(None);
-    let extract_workers = with_app(|app| app.extract_workers).unwrap_or(None);
-    let indexer_batch_size = with_app(|app| app.indexer_batch_size).unwrap_or(None);
-    let commit_interval = with_app(|app| app.commit_interval).unwrap_or(None);
-    let commit_timeout = with_app(|app| app.commit_timeout).unwrap_or(None);
+    let channel_capacity = with_app_read(|app| app.channel_capacity).unwrap_or(None);
+    let extract_workers = with_app_read(|app| app.extract_workers).unwrap_or(None);
+    let indexer_batch_size = with_app_read(|app| app.indexer_batch_size).unwrap_or(None);
+    let commit_interval = with_app_read(|app| app.commit_interval).unwrap_or(None);
+    let commit_timeout = with_app_read(|app| app.commit_timeout).unwrap_or(None);
+    let num_indexer_threads = with_app_read(|app| app.num_indexer_threads).unwrap_or(None);
+
+    // Resolve worker binary path relative to the current executable
+    // (handles both production layout and test binary layout).
+    // build.rs ensures pdf_worker.exe is always compiled alongside the library.
+    let worker_path = match resolve_worker_path() {
+        Some(wp) => Some(wp),
+        None => {
+            let exe_path = std::env::current_exe().unwrap_or_default();
+            set_error(format!(
+                "Worker binary 'pdf_worker.exe' not found near '{}'. \
+                 The pdf_worker.exe must be deployed alongside the library. \
+                 Run 'cargo build -p pdf_extractor --bin pdf_worker' to build it.",
+                exe_path.display()
+            ));
+            return -1;
+        }
+    };
+
+    let log_cb = LOG_CALLBACK
+        .get()
+        .and_then(|lock| lock.lock().ok())
+        .and_then(|guard| *guard);
+
+    let process_cb = PROCESS_CALLBACK
+        .get()
+        .and_then(|lock| lock.lock().ok())
+        .and_then(|guard| *guard);
+
     let config = PipelineConfig {
         channel_capacity: channel_capacity.map(|v| v as usize),
         num_extract_workers: extract_workers.map(|v| v as usize),
+        num_indexer_threads: num_indexer_threads.map(|v| v as usize),
         indexer_batch_size: indexer_batch_size.map(|v| v as usize),
         commit_interval: commit_interval.map(|v| v as u64),
         commit_timeout: commit_timeout.map(|v| v as u64),
+        worker_path,
         progress_cb: progress_callback.map(|cb| {
             Box::new(move |current: u64, total: u64| cb(current, total)) as Box<dyn Fn(u64, u64) + Send>
         }),
-        cancel_flag: Some(&CANCEL_REQUESTED),
+        cancel_flag: Some(cancel_token.clone()),
+        log_cb,
+        process_cb,
     };
 
+    eprintln!("[pdf_index_collection] calling run_pipeline with canonical={:?}", canonical);
+    let indexer_for_ocr = indexer.clone();
     match run_pipeline(Arc::clone(&jobs), &writer, Arc::clone(&metrics), &canonical, indexer, &config) {
         Ok(()) => {
             let processed = metrics.processed();
-            let _ = with_registry(|reg| reg.update_index_metadata(coll_id as i64, processed));
+            eprintln!("[pdf_index_collection] run_pipeline OK, processed={}", processed);
+            if let Err(e) = with_registry(|reg| reg.update_index_metadata(coll_id as i64, processed)) {
+                eprintln!("[pdf_index_collection] failed to update registry metadata: {}", e);
+            }
 
             // Run OCR post-processing if flag (1) is set
             if (flags & 1) != 0 {
                 // Drop the JSONL writer before we re-open it for OCR output
                 drop(writer);
 
-                let tesseract_path = with_app(|app| app.tesseract_path.clone()).unwrap_or(None)
+                let tesseract_path = with_app_read(|app| app.tesseract_path.clone()).unwrap_or(None)
                     .map(PathBuf::from)
                     .or_else(|| find_tesseract());
 
@@ -1401,11 +2379,11 @@ pub unsafe extern "C" fn pdf_index_collection(
                     }
                 };
 
-                let ocr_language = with_app(|app| app.ocr_language.clone()).unwrap_or(None)
+                let ocr_language = with_app_read(|app| app.ocr_language.clone()).unwrap_or(None)
                     .unwrap_or_else(|| "eng".to_string());
 
-                let ocr_max_dim = with_app(|app| app.ocr_max_dim).unwrap_or(None).unwrap_or(3000);
-                let num_workers = with_app(|app| app.ocr_workers).unwrap_or(None).map(|v| v as usize);
+                let ocr_max_dim = with_app_read(|app| app.ocr_max_dim).unwrap_or(None).unwrap_or(3000);
+                let num_workers = with_app_read(|app| app.ocr_workers).unwrap_or(None).map(|v| v as usize);
 
                 let ocr_config = ocr::OcrConfig {
                     tesseract_path,
@@ -1416,16 +2394,19 @@ pub unsafe extern "C" fn pdf_index_collection(
 
                 match run_ocr_post_processing(
                     jobs,
+                    indexer_for_ocr,
                     &ocr_config,
                     Some(output_path),
                     num_workers,
+                    Some(cancel_token.clone()),
+                    log_cb,
                 ) {
                     Ok(_ocr_count) => {
                         processed as i32
                     }
                     Err(e) => {
-                        set_error(format!("OCR post-processing failed: {}", e));
-                        -1
+                        eprintln!("[pdf_index_collection] OCR post-processing failed (non-fatal): {}", e);
+                        processed as i32
                     }
                 }
             } else {
@@ -1433,6 +2414,7 @@ pub unsafe extern "C" fn pdf_index_collection(
             }
         }
         Err(e) => {
+            eprintln!("[pdf_index_collection] run_pipeline ERROR: {}", e);
             set_error(format!("Indexing failed: {}", e));
             -1
         }
@@ -1441,15 +2423,39 @@ pub unsafe extern "C" fn pdf_index_collection(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pdf_cancel_indexing() {
-    CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+pub unsafe extern "C" fn pdf_cancel_indexing(coll_id: u32) {
+    if let Some(token) = cancel_tokens().lock().unwrap_or_else(|e| e.into_inner()).get(&coll_id) {
+        token.store(true, Ordering::Relaxed);
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pdf_is_cancel_requested() -> i32 {
+pub unsafe extern "C" fn pdf_is_cancel_requested(coll_id: u32) -> i32 {
     (|| -> i32 {
-    if CANCEL_REQUESTED.load(Ordering::Relaxed) { 1 } else { 0 }
+    cancel_tokens().lock().unwrap_or_else(|e| e.into_inner()).get(&coll_id)
+        .map_or(0, |t| if t.load(Ordering::Relaxed) { 1 } else { 0 })
     })()
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_close_collection(_coll_id: u32) -> i32 {
+    // Currently no per-collection state to clean up
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_close_all() -> i32 {
+    // Clear global app state
+    if let Some(rw) = APP.get() {
+        if let Ok(mut guard) = rw.write() {
+            *guard = None;
+        }
+    }
+    0
 }
 
 /// Settings read from AppContext once, to avoid mutex contention in parallel search.
@@ -1465,7 +2471,7 @@ struct SearchSettings {
 }
 
 fn load_search_settings() -> SearchSettings {
-    with_app(|app| SearchSettings {
+    with_app_read(|app| SearchSettings {
         fuzzy: app.fuzzy_distance,
         stem: app.stem_enabled != 0,
         field: app.search_field.clone(),
@@ -1484,7 +2490,7 @@ fn do_search_with_index(
     offset: u32,
     coll_id: Option<i64>,
     settings: &SearchSettings,
-) -> Result<(String, i32), i32> {
+) -> Result<(Vec<serde_json::Value>, u64), i32> {
     let results = if let Some(ref bool_clauses) = settings.boolean_query {
         let refs: Vec<(&str, Occur)> = bool_clauses.iter()
             .map(|(term, occur_str)| {
@@ -1508,10 +2514,6 @@ fn do_search_with_index(
         search_index.search_fuzzy_stem(
             query, limit as usize, settings.path_filter.as_deref(), offset as usize, settings.fuzzy as u8, settings.stem,
         )
-    } else if settings.stem {
-        search_index.search_stem(
-            query, limit as usize, settings.path_filter.as_deref(), offset as usize, true,
-        )
     } else {
         search_index.search(query, limit as usize, settings.path_filter.as_deref(), offset as usize)
     };
@@ -1532,6 +2534,35 @@ fn do_search_with_index(
         results
     };
 
+    // Build snippet infra ONCE (reader, searcher, query, generator) —
+    // reused for all results instead of creating one per result.
+    let infra_reader = search_index.index
+        .reader_builder()
+        .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+        .try_into()
+        .ok();
+    let infra_searcher = infra_reader.as_ref().map(|r| r.searcher());
+    let infra_query = if !query.trim().is_empty() {
+        let qp = tantivy::query::QueryParser::for_index(&search_index.index, vec![search_index.content_field]);
+        qp.parse_query(query).ok()
+    } else {
+        None
+    };
+
+    // Get total count from the same searcher + query
+    let total_count: u64 = infra_searcher.as_ref()
+        .and_then(|s| infra_query.as_ref().and_then(|q| {
+            s.search(q.as_ref(), &tantivy::collector::Count).ok()
+        }))
+        .unwrap_or(0) as u64;
+
+    // Build snippet generator once and reuse
+    let snippet_gen = infra_searcher.as_ref().and_then(|s| {
+        infra_query.as_ref().and_then(|q| {
+            tantivy::SnippetGenerator::create(s, q.as_ref(), search_index.content_field).ok()
+        })
+    });
+
     let json_entries: Vec<serde_json::Value> = results
         .iter()
         .map(|(score, doc)| {
@@ -1543,8 +2574,11 @@ fn do_search_with_index(
                 .get_first(search_index.path_field)
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let snippet = search_index
-                .generate_snippet(doc, query)
+            let snippet = snippet_gen.as_ref()
+                .and_then(|gen| {
+                    let s = gen.snippet_from_doc(doc);
+                    Some(s.to_html())
+                })
                 .unwrap_or_default();
             let mut entry = serde_json::json!({
                 "id": id_val,
@@ -1559,8 +2593,7 @@ fn do_search_with_index(
         })
         .collect();
 
-    let json_str = serde_json::to_string(&json_entries).unwrap_or_else(|_| "[]".into());
-    Ok((json_str, json_entries.len() as i32))
+    Ok((json_entries, total_count))
 }
 
 #[no_mangle]
@@ -1580,7 +2613,7 @@ pub unsafe extern "C" fn pdf_search_collection(
 
     let collection = match with_registry(|reg| reg.get_collection(coll_id as i64)) {
         Ok(Ok(c)) => c,
-        Ok(Err(_)) => { set_error("Collection not found".into()); return -8; }
+        Ok(Err(_)) => { set_error("Collection not found".into()); return ERR_COLLECTION_NOT_FOUND; }
         Err(e) => return e,
     };
 
@@ -1597,20 +2630,14 @@ pub unsafe extern "C" fn pdf_search_collection(
 
     let settings = load_search_settings();
 
-    let (results_json, result_count) = match do_search_with_index(&search_index, query_str, limit, offset, Some(coll_id as i64), &settings) {
+    let (entries, total) = match do_search_with_index(&search_index, query_str, limit, offset, Some(coll_id as i64), &settings) {
         Ok(t) => t,
         Err(e) => return e,
     };
 
-    let count = search_index.search_count(query_str).unwrap_or(result_count as u64);
-
     let wrapped = serde_json::json!({
-        "total": count,
-        "results": if result_count == 0 {
-            serde_json::Value::Array(vec![])
-        } else {
-            serde_json::from_str(&results_json).unwrap_or(serde_json::Value::Array(vec![]))
-        }
+        "total": total,
+        "results": entries,
     });
     let json_str = serde_json::to_string(&wrapped).unwrap_or_else(|_| "{}".into());
     unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
@@ -1639,9 +2666,7 @@ pub unsafe extern "C" fn pdf_search_all(
 
     let settings = load_search_settings();
 
-    let collection_boosts = settings.boolean_query.as_ref().map(|_| HashMap::new()).unwrap_or_else(|| {
-        with_app(|app| app.collection_boosts.clone()).unwrap_or_default()
-    });
+    let collection_boosts = with_app_read(|app| app.collection_boosts.clone()).unwrap_or_default();
 
     use rayon::prelude::*;
     let coll_results: Vec<(Vec<serde_json::Value>, u64, bool)> = collections.par_iter().map(|coll| {
@@ -1655,14 +2680,8 @@ pub unsafe extern "C" fn pdf_search_all(
             Err(_) => return (Vec::new(), 0u64, true),
         };
 
-        let count = search_index.search_count(query_str).unwrap_or(0);
-
-        let results = do_search_with_index(&search_index, query_str, limit, offset, Some(coll.id), &settings);
-
-        let mut entries = match results {
-            Ok((json_str, _)) => {
-                serde_json::from_str::<Vec<serde_json::Value>>(&json_str).unwrap_or_default()
-            }
+        let (mut entries, count) = match do_search_with_index(&search_index, query_str, limit, offset, Some(coll.id), &settings) {
+            Ok(t) => t,
             Err(_) => return (Vec::new(), 0u64, true),
         };
 
@@ -1726,7 +2745,7 @@ pub unsafe extern "C" fn pdf_search_count(
         Ok(s) => s,
         Err(e) => return e,
     };
-    let index_path = with_app(|app| {
+    let index_path = with_app_read(|app| {
         if app.indexer.is_some() {
             app.index_path.clone()
         } else {
@@ -1802,6 +2821,58 @@ pub unsafe extern "C" fn pdf_search_count_all(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pdf_get_problematic_jobs(
+    coll_id: u32,
+    out_json: *mut c_char,
+    out_len: *mut u32,
+) -> i32 {
+    (|| -> i32 {
+    let _collection = match with_registry(|reg| reg.get_collection(coll_id as i64)) {
+        Ok(Ok(c)) => c,
+        Ok(Err(_)) => { set_error("Collection not found".into()); return ERR_COLLECTION_NOT_FOUND; }
+        Err(e) => return e,
+    };
+
+    let db_path = match with_registry(|reg| reg.db_path(coll_id as i64)) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let jobs = match JobStore::open(&db_path) {
+        Ok(j) => j,
+        Err(e) => {
+            set_error(format!("Failed to open job store: {}", e));
+            return -1;
+        }
+    };
+
+    match jobs.fetch_errored() {
+        Ok(rows) => {
+            let list: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(id, path, status, ocr_flag, error)| {
+                    serde_json::json!({
+                        "id": id,
+                        "path": path,
+                        "status": status,
+                        "ocr_flag": ocr_flag != 0,
+                        "error": error,
+                        "no_positions": false,
+                    })
+                })
+                .collect();
+            let json_str = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+            unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
+        }
+        Err(e) => {
+            set_error(format!("Failed to query errored jobs: {}", e));
+            -1
+        }
+    }
+    })()
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pdf_collection_stats(
     coll_id: u32,
     out_json: *mut c_char,
@@ -1810,7 +2881,7 @@ pub unsafe extern "C" fn pdf_collection_stats(
     (|| -> i32 {
     let collection = match with_registry(|reg| reg.get_collection(coll_id as i64)) {
         Ok(Ok(c)) => c,
-        Ok(Err(_)) => { set_error("Collection not found".into()); return -8; }
+        Ok(Err(_)) => { set_error("Collection not found".into()); return ERR_COLLECTION_NOT_FOUND; }
         Err(e) => return e,
     };
 
@@ -2210,23 +3281,6 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
     }
 
     #[test]
-    fn test_add_duplicate_collection() {
-        reset_state();
-        let reg_dir_n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let reg_dir = std::env::temp_dir().join(format!("pdf_capi_reg_dup_{}", reg_dir_n));
-        let _ = std::fs::remove_dir_all(&reg_dir);
-        let reg_c = CString::new(reg_dir.to_string_lossy().as_ref()).unwrap();
-        assert_eq!(unsafe { pdf_create_registry(reg_c.as_ptr()) }, 0);
-
-        let books_dir = reg_dir.join("books");
-        std::fs::create_dir_all(&books_dir).unwrap();
-        let books_c = CString::new(books_dir.to_string_lossy().as_ref()).unwrap();
-        let id1 = unsafe { pdf_add_collection(books_c.as_ptr()) };
-        let id2 = unsafe { pdf_add_collection(books_c.as_ptr()) };
-        assert_eq!(id1, id2);
-    }
-
-    #[test]
     fn test_remove_collection() {
         reset_state();
         let reg_dir_n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2329,6 +3383,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         assert_eq!(unsafe { pdf_set_commit_interval(1000) }, 0);
         assert_eq!(unsafe { pdf_set_commit_timeout(60) }, 0);
         assert_eq!(unsafe { pdf_set_extract_workers(4) }, 0);
+        assert_eq!(unsafe { pdf_set_indexer_threads(2) }, 0);
 
         // String setters
         let lang = CString::new("por").unwrap();
@@ -2337,7 +3392,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let tesseract = CString::new("C:\\tools\\tesseract.exe").unwrap();
         assert_eq!(unsafe { pdf_set_tesseract_path(tesseract.as_ptr()) }, 0);
 
-        let field = CString::new("normalized_text").unwrap();
+        let field = CString::new("content").unwrap();
         assert_eq!(unsafe { pdf_set_search_field(field.as_ptr()) }, 0);
 
         let filter = CString::new("science").unwrap();
@@ -2351,7 +3406,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
     #[test]
     fn test_set_field_weights_valid() {
         reset_state();
-        let json = CString::new(r#"{"content_norm": 1.0, "math_source": 3.0}"#).unwrap();
+        let json = CString::new(r#"{"content": 1.0, "path": 3.0}"#).unwrap();
         let rc = unsafe { pdf_set_field_weights(json.as_ptr()) };
         assert_eq!(rc, 0);
     }
@@ -2359,7 +3414,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
     #[test]
     fn test_set_field_weights_null_resets() {
         reset_state();
-        let json = CString::new(r#"{"content_norm": 2.0}"#).unwrap();
+        let json = CString::new(r#"{"content": 2.0}"#).unwrap();
         assert_eq!(unsafe { pdf_set_field_weights(json.as_ptr()) }, 0);
         assert_eq!(unsafe { pdf_set_field_weights(std::ptr::null()) }, 0);
     }
@@ -2375,7 +3430,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
     #[test]
     fn test_set_field_weights_zero_weight() {
         reset_state();
-        let json = CString::new(r#"{"content_norm": 0.0}"#).unwrap();
+        let json = CString::new(r#"{"content": 0.0}"#).unwrap();
         let rc = unsafe { pdf_set_field_weights(json.as_ptr()) };
         assert_eq!(rc, -3);
     }
@@ -2570,18 +3625,79 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
     #[test]
     fn test_cancel_not_requested() {
         reset_state();
-        assert_eq!(unsafe { pdf_is_cancel_requested() }, 0);
+        assert_eq!(unsafe { pdf_is_cancel_requested(0) }, 0);
     }
 
     #[test]
     fn test_cancel_requested() {
         reset_state();
-        unsafe { pdf_cancel_indexing() };
-        assert_eq!(unsafe { pdf_is_cancel_requested() }, 1);
+        cancel_tokens().lock().unwrap().insert(0, Arc::new(AtomicBool::new(false)));
+        unsafe { pdf_cancel_indexing(0) };
+        assert_eq!(unsafe { pdf_is_cancel_requested(0) }, 1);
         // Reset after cancel
         reset_state();
-        assert_eq!(unsafe { pdf_is_cancel_requested() }, 0);
+        cancel_tokens().lock().unwrap().insert(0, Arc::new(AtomicBool::new(false)));
+        assert_eq!(unsafe { pdf_is_cancel_requested(0) }, 0);
     }
+
+    // ── Cancellation flag reset tests ──
+
+    #[test]
+    fn test_cancel_flag_reset_by_index_collection() {
+        reset_state();
+
+        let reg_dir_n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reg_dir = std::env::temp_dir().join(format!("pdf_capi_cancel_reset_{}", reg_dir_n));
+        let _ = std::fs::remove_dir_all(&reg_dir);
+        let reg_c = CString::new(reg_dir.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(unsafe { pdf_create_registry(reg_c.as_ptr()) }, 0);
+
+        let books_dir = reg_dir.join("books");
+        std::fs::create_dir_all(&books_dir).unwrap();
+        let books_c = CString::new(books_dir.to_string_lossy().as_ref()).unwrap();
+        let coll_id = unsafe { pdf_add_collection(books_c.as_ptr()) };
+
+        // pdf_index_collection should create a fresh cancel token
+        let _rc = unsafe { pdf_index_collection(coll_id as u32, 0, None) };
+        assert_eq!(unsafe { pdf_is_cancel_requested(coll_id as u32) }, 0,
+            "flag should be 0 after pdf_index_collection (fresh token)");
+    }
+
+    #[test]
+    fn test_cancel_then_extract_resets_flag() {
+        reset_state();
+
+        let empty_dir_n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let empty_dir = std::env::temp_dir().join(format!("pdf_capi_extract_cancel_{}", empty_dir_n));
+        let _ = std::fs::remove_dir_all(&empty_dir);
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let dir_c = CString::new(empty_dir.to_string_lossy().as_ref()).unwrap();
+        let _rc = unsafe { pdf_extract(dir_c.as_ptr(), None) };
+    }
+
+    #[test]
+    fn test_cancel_multiple_times() {
+        reset_state();
+        cancel_tokens().lock().unwrap().insert(0, Arc::new(AtomicBool::new(false)));
+        unsafe { pdf_cancel_indexing(0) };
+        unsafe { pdf_cancel_indexing(0) };
+
+        let reg_dir_n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reg_dir = std::env::temp_dir().join(format!("pdf_capi_cancel_multi_{}", reg_dir_n));
+        let _ = std::fs::remove_dir_all(&reg_dir);
+        let reg_c = CString::new(reg_dir.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(unsafe { pdf_create_registry(reg_c.as_ptr()) }, 0);
+        let books_dir = reg_dir.join("books");
+        std::fs::create_dir_all(&books_dir).unwrap();
+        let books_c = CString::new(books_dir.to_string_lossy().as_ref()).unwrap();
+        let coll_id = unsafe { pdf_add_collection(books_c.as_ptr()) };
+        let _rc = unsafe { pdf_index_collection(coll_id as u32, 0, None) };
+        assert_eq!(unsafe { pdf_is_cancel_requested(coll_id as u32) }, 0,
+            "flag should reset after multiple cancels");
+    }
+
+
+
 
     #[test]
     fn test_search_count_before_init() {
@@ -2718,11 +3834,27 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         assert_eq!(unsafe { pdf_init(db_c.as_ptr(), idx_c.as_ptr()) }, 0);
 
         // Index a document
-        let _ = with_app(|app| {
+        let _ = with_app_mut(|app| {
             let indexer = app.indexer.as_ref().unwrap();
             indexer.index_document(1, "/doc.pdf", "hello world hello").unwrap();
             Ok::<_, i32>(())
         }).unwrap();
+
+        // Store positions manually (normally done by pipeline's flush_batch)
+        let index_path = std::path::PathBuf::from(&idx);
+        let positions_db_path = index_path.join("positions.sqlite");
+        let store = pdf_extractor::positions::PositionStore::open(&positions_db_path).unwrap();
+        let word_positions = vec![
+            (0usize, pdf_extractor::extractor::WordPosition {
+                page: 1, x_min: 10.0, y_min: 20.0, x_max: 50.0, y_max: 30.0,
+                text: "hello".to_string(),
+            }),
+            (2usize, pdf_extractor::extractor::WordPosition {
+                page: 1, x_min: 60.0, y_min: 20.0, x_max: 100.0, y_max: 30.0,
+                text: "hello".to_string(),
+            }),
+        ];
+        store.store_positions(1, &word_positions).unwrap();
 
         // Search for term positions
         let mut buf = [0u8; 4096];
@@ -2733,9 +3865,15 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         };
         assert_eq!(rc, 0);
         let result = std::str::from_utf8(&buf[..len as usize]).unwrap();
-        let positions: Vec<usize> = serde_json::from_str(result).unwrap();
-        assert!(positions.contains(&0), "Position 0 should contain 'hello'");
-        assert!(positions.contains(&2), "Position 2 should contain 'hello'");
+        let positions: Vec<serde_json::Value> = serde_json::from_str(result).unwrap();
+        assert_eq!(positions.len(), 2, "Should return positions for both 'hello' occurrences");
+        for pos in &positions {
+            assert_eq!(pos["page"], 1, "All positions should be on page 1");
+            assert!(pos["x_min"].as_f64().unwrap() >= 0.0, "x_min should be valid");
+            assert!(pos["y_min"].as_f64().unwrap() >= 0.0, "y_min should be valid");
+            assert!(pos["x_max"].as_f64().unwrap() > pos["x_min"].as_f64().unwrap(), "x_max > x_min");
+            assert!(pos["y_max"].as_f64().unwrap() > pos["y_min"].as_f64().unwrap(), "y_max > y_min");
+        }
     }
 
     #[test]
@@ -2746,7 +3884,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let idx_c = CString::new(idx.clone()).unwrap();
         assert_eq!(unsafe { pdf_init(db_c.as_ptr(), idx_c.as_ptr()) }, 0);
 
-        let _ = with_app(|app| {
+        let _ = with_app_mut(|app| {
             let indexer = app.indexer.as_ref().unwrap();
             indexer.index_document(1, "/doc.pdf", "hello world").unwrap();
             Ok::<_, i32>(())
@@ -2771,7 +3909,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let idx_c = CString::new(idx.clone()).unwrap();
         assert_eq!(unsafe { pdf_init(db_c.as_ptr(), idx_c.as_ptr()) }, 0);
 
-        let _ = with_app(|app| {
+        let _ = with_app_mut(|app| {
             let indexer = app.indexer.as_ref().unwrap();
             indexer.index_document(1, "/doc.pdf", "hello world").unwrap();
             Ok::<_, i32>(())
@@ -2822,8 +3960,8 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let idx_c = CString::new(idx.clone()).unwrap();
         assert_eq!(unsafe { pdf_init(db_c.as_ptr(), idx_c.as_ptr()) }, 0);
 
-        // Index 3 docs in the content_norm field
-        let _ = with_app(|app| {
+        // Index 3 docs in the content field
+        let _ = with_app_mut(|app| {
             let indexer = app.indexer.as_ref().unwrap();
             indexer.index_document(1, "/doc1.pdf", "Introduction to algebra").unwrap();
             indexer.index_document(2, "/doc2.pdf", "Advanced calculus topics").unwrap();
@@ -2901,7 +4039,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let idx_c = CString::new(idx.clone()).unwrap();
         assert_eq!(unsafe { pdf_init(db_c.as_ptr(), idx_c.as_ptr()) }, 0);
 
-        let _ = with_app(|app| {
+        let _ = with_app_mut(|app| {
             let indexer = app.indexer.as_ref().unwrap();
             indexer.index_document(1, "/doc1.pdf", "algebra").unwrap();
             indexer.index_document(2, "/doc2.pdf", "calculus").unwrap();
@@ -2909,7 +4047,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         }).unwrap();
 
         // --- Basic flow ---
-        let w = CString::new(r#"{"content_norm": 2.0}"#).unwrap();
+        let w = CString::new(r#"{"content": 2.0}"#).unwrap();
         assert_eq!(unsafe { pdf_set_field_weights(w.as_ptr()) }, 0);
         let mut buf = [0u8; 4096];
         let mut len = 4096u32;
@@ -2995,6 +4133,93 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
             results[0]["score"].as_f64().unwrap() >= results[1]["score"].as_f64().unwrap(),
             "Boosted score >= unboosted"
         );
+    }
+
+    // ── Worker path resolution tests ──
+
+    #[test]
+    fn test_resolve_worker_path_integration() {
+        // During `cargo test`, pdf_worker.exe lives at target/<profile>/pdf_worker.exe.
+        let found = resolve_worker_path();
+        assert!(found.is_some(),
+            "resolve_worker_path() should find pdf_worker.exe during cargo test");
+        let path = found.unwrap();
+        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("pdf_worker.exe"));
+        assert!(path.exists(), "resolved worker path must exist on disk");
+    }
+
+    #[test]
+    fn test_resolve_worker_path_from_same_dir() {
+        let dir_n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("pdf_capi_wp_same_{}", dir_n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let exe = dir.join("host.exe");
+        let worker = dir.join("pdf_worker.exe");
+        std::fs::write(&worker, b"mock").unwrap();
+        std::fs::write(&exe, b"mock").unwrap();
+
+        let result = resolve_worker_path_from(&exe);
+        assert_eq!(result.as_ref().and_then(|p| p.file_name()), Some(std::ffi::OsStr::new("pdf_worker.exe")));
+        assert_eq!(result, Some(worker));
+    }
+
+    #[test]
+    fn test_resolve_worker_path_from_deps() {
+        let dir_n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("pdf_capi_wp_deps_{}", dir_n));
+        let _ = std::fs::remove_dir_all(&dir);
+        let profile = dir.join("debug");
+        let deps = profile.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+
+        let exe = deps.join("test-abc123.exe");
+        let worker = profile.join("pdf_worker.exe");
+        std::fs::write(&worker, b"mock").unwrap();
+        std::fs::write(&exe, b"mock").unwrap();
+
+        let result = resolve_worker_path_from(&exe);
+        assert_eq!(result.as_ref().and_then(|p| p.file_name()), Some(std::ffi::OsStr::new("pdf_worker.exe")));
+        assert_eq!(result, Some(worker));
+    }
+
+    #[test]
+    fn test_resolve_worker_path_from_walk_up() {
+        let dir_n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("pdf_capi_wp_walk_{}", dir_n));
+        let _ = std::fs::remove_dir_all(&dir);
+        let deeper = dir.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deeper).unwrap();
+
+        let exe = deeper.join("host.exe");
+        let worker = dir.join("pdf_worker.exe");
+        std::fs::write(&worker, b"mock").unwrap();
+        std::fs::write(&exe, b"mock").unwrap();
+
+        let result = resolve_worker_path_from(&exe);
+        assert_eq!(result.as_ref().and_then(|p| p.file_name()), Some(std::ffi::OsStr::new("pdf_worker.exe")));
+        assert_eq!(result, Some(worker));
+    }
+
+    #[test]
+    fn test_resolve_worker_path_from_not_found() {
+        let dir_n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("pdf_capi_wp_notfound_{}", dir_n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("host.exe");
+        std::fs::write(&exe, b"mock").unwrap();
+        // No pdf_worker.exe anywhere in the tree
+        let result = resolve_worker_path_from(&exe);
+        assert!(result.is_none(), "no worker anywhere in tree");
+    }
+
+    #[test]
+    fn test_resolve_worker_path_from_exe_no_parent() {
+        // Engine-level paths (like \\?\) often have no parent
+        let result = resolve_worker_path_from(std::path::Path::new("\\\\?\\C:\\"));
+        assert!(result.is_none(), "root/UNC path has no meaningful parent");
     }
 }
 

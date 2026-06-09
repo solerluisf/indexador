@@ -1,5 +1,18 @@
+use std::ffi::OsStr;
 use std::io::{self, BufRead, Write};
 use std::process::Command;
+
+/// Create a Command that suppresses console window creation on Windows.
+fn cmd_no_window<S: AsRef<OsStr>>(program: S) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_DEFAULT_ERROR_MODE
+        cmd.creation_flags(0x08000000 | 0x00000400 | 0x04000000);
+    }
+    cmd
+}
 
 const END_MARKER: &str = "---END---";
 
@@ -39,7 +52,7 @@ fn main() {
             break;
         }
 
-        let output = match Command::new(&tesseract_path)
+        let output = match cmd_no_window(&tesseract_path)
             .arg(&path)
             .arg("stdout")
             .arg("-l")

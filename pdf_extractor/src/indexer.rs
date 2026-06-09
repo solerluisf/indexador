@@ -5,16 +5,16 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::query::{BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser, RegexQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery};
 #[cfg(test)]
 use tantivy::query::TermQuery;
 use tantivy::schema::*;
-use tantivy::tokenizer::{Stemmer, StopWordFilter, TextAnalyzer};
+use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDocument, Term};
 use tantivy::{DocSet, Postings, TERMINATED};
 
 use crate::math_tokenizer::MathAwareTokenizer;
-use crate::tokenizers::{ChineseBigramTokenizer, JapaneseTokenizer};
+use crate::tokenizers::LanguageAwareTokenizer;
 
 #[allow(dead_code)]
 pub struct SearchIndex {
@@ -22,17 +22,8 @@ pub struct SearchIndex {
     pub schema: Schema,
     pub id_field: Field,
     pub path_field: Field,
-    pub content_norm_field: Field,
-    pub content_raw_field: Field,
-    pub checksum_field: Field,
-    pub content_stem_field: Option<Field>,
-    pub content_jp_field: Option<Field>,
-    pub content_zh_field: Option<Field>,
-    pub math_source_field: Field,
+    pub content_field: Field,
     pub math_tokens_field: Option<Field>,
-    pub normalized_text_field: Option<Field>,
-    pub language_field: Field,
-    pub ingested_at_field: Option<Field>,
     ram_buffer: u64,
 }
 
@@ -74,44 +65,12 @@ impl SearchIndex {
                 .context("Failed to create index directory")?
         };
 
-        // Register custom tokenizer that preserves Unicode math symbols (e.g., âˆ‘, âˆ«).
-        // SimpleTokenizer treats non-alphanumeric chars as separators and discards them;
-        // RegexTokenizer with [\p{L}\p{N}\p{S}]+ keeps letters, numbers, and symbols together.
-        let math_tokenizer = TextAnalyzer::builder(
-            tantivy::tokenizer::RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
-                .expect("Invalid regex for math tokenizer"),
-        )
-        .filter(tantivy::tokenizer::LowerCaser)
-        .build();
-        index.tokenizers().register("math", math_tokenizer);
-
-        // Register English tokenizer with stemming and stop-word removal.
-        let english_tokenizer = TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
-            .filter(tantivy::tokenizer::LowerCaser)
-            .filter(Stemmer::default())
-            .filter(StopWordFilter::new(tantivy::tokenizer::Language::English).unwrap_or_else(|| {
-                StopWordFilter::remove(vec![])
-            }))
+        // Register the unified multilingual tokenizer that auto-detects language
+        // and dispatches to the correct tokenizer (Lindera for Japanese, bigram for Chinese,
+        // regex for all others).
+        let multilang_analyzer = TextAnalyzer::builder(LanguageAwareTokenizer)
             .build();
-        index.tokenizers().register("english", english_tokenizer);
-
-        // Register Japanese tokenizer (Lindera IPADIC).
-        match JapaneseTokenizer::new() {
-            Ok(jp) => {
-                let jp_analyzer = TextAnalyzer::builder(jp)
-                    .filter(tantivy::tokenizer::LowerCaser)
-                    .build();
-                index.tokenizers().register("ja", jp_analyzer);
-            }
-            Err(_e) => {}
-
-        }
-
-        // Register Chinese bigram tokenizer.
-        let zh_analyzer = TextAnalyzer::builder(ChineseBigramTokenizer)
-            .filter(tantivy::tokenizer::LowerCaser)
-            .build();
-        index.tokenizers().register("zh", zh_analyzer);
+        index.tokenizers().register("multilang", multilang_analyzer);
 
         // Register math-aware tokenizer for math_tokens field.
         let math_tokens_analyzer = TextAnalyzer::builder(MathAwareTokenizer)
@@ -120,37 +79,19 @@ impl SearchIndex {
         index.tokenizers().register("math_tokens", math_tokens_analyzer);
 
         let schema = index.schema();
-        let id_field = schema.get_field("id").unwrap();
-        let path_field = schema.get_field("path").unwrap();
-        let content_norm_field = schema.get_field("content_norm").unwrap();
-        let content_raw_field = schema.get_field("content_raw").unwrap();
-        let checksum_field = schema.get_field("checksum").unwrap();
-        let content_stem_field = schema.get_field("content_stem").ok();
-        let content_jp_field = schema.get_field("content_jp").ok();
-        let content_zh_field = schema.get_field("content_zh").ok();
-        let math_source_field = schema.get_field("math_source").unwrap();
+        let id_field = schema.get_field("id").map_err(|_| anyhow::anyhow!("Missing 'id' field in index schema"))?;
+        let path_field = schema.get_field("path").map_err(|_| anyhow::anyhow!("Missing 'path' field in index schema"))?;
+        let content_field = schema.get_field("content").map_err(|_| anyhow::anyhow!("Missing 'content' field — index was created with an older schema version; please re-index"))?;
         let math_tokens_field = schema.get_field("math_tokens").ok();
-        let normalized_text_field = schema.get_field("normalized_text").ok();
-        let language_field = schema.get_field("language").unwrap();
-        let ingested_at_field = schema.get_field("ingested_at").ok();
 
         Ok(Self {
             index,
             schema,
             id_field,
             path_field,
-            content_norm_field,
-            content_raw_field,
-            checksum_field,
-            content_stem_field,
-            content_jp_field,
-            content_zh_field,
-            math_source_field,
+            content_field,
             math_tokens_field,
-            normalized_text_field,
-            language_field,
-            ingested_at_field,
-            ram_buffer: 500_000_000,
+            ram_buffer: 3_000_000_000,
         })
     }
 
@@ -176,75 +117,29 @@ impl SearchIndex {
             .context("Failed to create index writer")
     }
 
+    pub fn writer_with_num_threads(&self, num_threads: usize) -> Result<IndexWriter> {
+        self.index
+            .writer_with_num_threads(num_threads, self.ram_buffer as usize)
+            .context("Failed to create index writer with num_threads")
+    }
+
     pub fn add_document(
         &self,
         writer: &mut IndexWriter,
         id: i64,
         path: &str,
-        checksum: &str,
-        content_norm: &str,
-        content_raw: &str,
-        language: &str,
-        math_source: &str,
+        text: &str,
+        math_source: Option<&str>,
     ) -> Result<()> {
-        self.add_document_with_ts(writer, id, path, checksum, content_norm, content_raw, language, math_source, 0)
-    }
-
-    pub fn add_document_with_ts(
-        &self,
-        writer: &mut IndexWriter,
-        id: i64,
-        path: &str,
-        checksum: &str,
-        content_norm: &str,
-        content_raw: &str,
-        language: &str,
-        math_source: &str,
-        ingested_at: u64,
-    ) -> Result<()> {
-        // Dedup: remove any existing document with the same checksum.
-        let term = Term::from_field_text(self.checksum_field, checksum);
-        writer.delete_term(term);
-
         let mut doc = TantivyDocument::from(doc!(
             self.id_field => id as u64,
             self.path_field => path,
-            self.checksum_field => checksum,
-            self.content_norm_field => content_norm,
-            self.content_raw_field => content_raw,
-            self.math_source_field => math_source,
-            self.language_field => language,
+            self.content_field => text,
         ));
-        if let Some(f) = self.ingested_at_field {
-            doc.add_u64(f, ingested_at);
-        }
-        if let Some(stem_field) = self.content_stem_field {
-            doc.add_text(stem_field, content_norm);
-        }
-        // Index math_tokens with the math-aware analyzer.
         if let Some(math_field) = self.math_tokens_field {
-            if !math_source.is_empty() {
-                doc.add_text(math_field, math_source);
-            }
-        }
-        // Route text to the appropriate language-specific field.
-        match language {
-            "jpn" | "ja" => {
-                if let Some(jp_field) = self.content_jp_field {
-                    doc.add_text(jp_field, content_norm);
-                }
-            }
-            "cmn" | "zh" | "wuu" | "yue" | "nan" => {
-                if let Some(zh_field) = self.content_zh_field {
-                    doc.add_text(zh_field, content_norm);
-                }
-            }
-            _ => {
-                // Latin and other non-CJK languages get routed to normalized_text.
-                if let Some(nt_field) = self.normalized_text_field {
-                    if !content_norm.is_empty() {
-                        doc.add_text(nt_field, content_norm);
-                    }
+            if let Some(src) = math_source {
+                if !src.is_empty() {
+                    doc.add_text(math_field, src);
                 }
             }
         }
@@ -254,36 +149,20 @@ impl SearchIndex {
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn search(
+    /// Unified search using Tantivy's QueryParser.
+    ///
+    /// QueryParser natively handles:
+    ///   - `"frase exacta"`       → PhraseQuery
+    ///   - `palabra1 palabra2`     → BooleanQuery (SHOULD)
+    ///   - `+obligatorio -excluir` → BooleanQuery (MUST / MUST_NOT)
+    ///   - `palabra*`              → (if wildcard enabled)
+    ///
+    /// The parser applies the registered `"multilang"` tokenizer to the query,
+    /// so tokenization (lowercasing, Lindera, bigram, regex) is consistent
+    /// between indexing and search time.
+    fn search_parsed(
         &self,
         query_str: &str,
-        limit: usize,
-        path_filter: Option<&str>,
-        offset: usize,
-    ) -> Result<Vec<(f32, TantivyDocument)>> {
-        if Self::is_quoted(query_str) {
-            self.search_phrase(Self::unquote(query_str), limit, path_filter, offset)
-        } else {
-            self.search_stem(query_str, limit, path_filter, offset, false)
-        }
-    }
-
-    /// Returns true if `s` is wrapped in ASCII double-quotes.
-    fn is_quoted(s: &str) -> bool {
-        s.len() >= 2 && s.as_bytes()[0] == b'"' && s.as_bytes()[s.len() - 1] == b'"'
-    }
-
-    /// Strips surrounding double-quotes from `s`.
-    fn unquote<'a>(s: &'a str) -> &'a str {
-        if Self::is_quoted(s) { &s[1..s.len() - 1] } else { s }
-    }
-
-    /// Searches using a Tantivy `PhraseQuery` built directly from whitespace-separated words.
-    /// The caller must have already stripped surrounding quotes from `phrase`.
-    fn search_phrase(
-        &self,
-        phrase: &str,
         limit: usize,
         path_filter: Option<&str>,
         offset: usize,
@@ -295,23 +174,17 @@ impl SearchIndex {
             .try_into()?;
         let searcher = reader.searcher();
 
-        let words: Vec<&str> = phrase.split_whitespace().collect();
-        if words.is_empty() {
-            return Ok(Vec::new());
-        }
-        if words.len() == 1 {
-            return self.search_stem(phrase, limit, path_filter, offset, false);
-        }
-
-        let terms: Vec<Term> = words
-            .iter()
-            .map(|w| Term::from_field_text(self.content_norm_field, w))
-            .collect();
-
-        let phrase_query = PhraseQuery::new(terms);
+        let mut query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
+        query_parser.set_conjunction_by_default();
 
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        clauses.push((Occur::Must, Box::new(phrase_query)));
+
+        if !query_str.trim().is_empty() {
+            let boxed = query_parser
+                .parse_query(query_str)
+                .context("Failed to parse search query")?;
+            clauses.push((Occur::Must, boxed));
+        }
 
         if let Some(pattern) = path_filter {
             if !pattern.is_empty() {
@@ -319,6 +192,10 @@ impl SearchIndex {
                     .context("Invalid path filter regex")?;
                 clauses.push((Occur::Must, Box::new(re_query)));
             }
+        }
+
+        if clauses.is_empty() {
+            return Ok(Vec::new());
         }
 
         let query: Box<dyn Query> = if clauses.len() == 1 {
@@ -330,7 +207,7 @@ impl SearchIndex {
         let fetch_count = limit.checked_add(offset).unwrap_or(limit);
         let top_docs = searcher
             .search(&*query, &TopDocs::with_limit(fetch_count))
-            .context("Phrase search failed")?;
+            .context("Search failed")?;
 
         let mut results = Vec::new();
         for (score, doc_addr) in top_docs.iter().skip(offset) {
@@ -343,30 +220,16 @@ impl SearchIndex {
         Ok(results)
     }
 
-    /// Phrase-aware count: returns total matching documents for a PhraseQuery.
-    fn search_count_phrase(&self, phrase: &str) -> Result<u64> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()?;
-        let searcher = reader.searcher();
-
-        let words: Vec<&str> = phrase.split_whitespace().collect();
-        if words.len() <= 1 {
-            let query_parser = QueryParser::for_index(&self.index, vec![self.content_norm_field]);
-            let parsed = query_parser.parse_query(phrase)?;
-            let count = searcher.search(&parsed, &Count)?;
-            return Ok(count as u64);
-        }
-
-        let terms: Vec<Term> = words
-            .iter()
-            .map(|w| Term::from_field_text(self.content_norm_field, w))
-            .collect();
-        let phrase_query = PhraseQuery::new(terms);
-        let count = searcher.search(&phrase_query, &Count)?;
-        Ok(count as u64)
+    /// Public search entry-point — delegates to `search_parsed`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn search(
+        &self,
+        query_str: &str,
+        limit: usize,
+        path_filter: Option<&str>,
+        offset: usize,
+    ) -> Result<Vec<(f32, TantivyDocument)>> {
+        self.search_parsed(query_str, limit, path_filter, offset)
     }
 
     /// Returns the word offsets where `term` appears in document `doc_id`.
@@ -384,12 +247,12 @@ impl SearchIndex {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
         let searcher = reader.searcher();
-        let content_term = tantivy::Term::from_field_text(self.content_norm_field, term);
+        let content_term = tantivy::Term::from_field_text(self.content_field, term);
         let segment_readers = searcher.segment_readers();
         let mut all_offsets = Vec::new();
 
         for seg in segment_readers.iter() {
-            let inv_index = match seg.inverted_index(self.content_norm_field) {
+            let inv_index = match seg.inverted_index(self.content_field) {
                 Ok(idx) => idx,
                 Err(_) => continue,
             };
@@ -432,11 +295,7 @@ impl SearchIndex {
     }
 
     /// Returns the total number of matching documents (ignoring limit/offset).
-    /// For quoted phrase queries it uses `PhraseQuery` directly.
     pub fn search_count(&self, query_str: &str) -> Result<u64> {
-        if Self::is_quoted(query_str) {
-            return self.search_count_phrase(Self::unquote(query_str));
-        }
         let reader = self
             .index
             .reader_builder()
@@ -444,7 +303,7 @@ impl SearchIndex {
             .try_into()?;
         let searcher = reader.searcher();
 
-        let query_parser = QueryParser::for_index(&self.index, vec![self.content_norm_field]);
+        let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
         let parsed = query_parser.parse_query(query_str)
             .context("Failed to parse search query for count")?;
 
@@ -452,73 +311,17 @@ impl SearchIndex {
         Ok(count as u64)
     }
 
+    /// Backward-compat wrapper — delegates to `search_parsed`.
+    /// The `_stem` parameter is ignored (no stemming in the tokenizer).
     pub fn search_stem(
         &self,
         query_str: &str,
         limit: usize,
         path_filter: Option<&str>,
         offset: usize,
-        stem: bool,
+        _stem: bool,
     ) -> Result<Vec<(f32, TantivyDocument)>> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()?;
-        let searcher = reader.searcher();
-
-        let search_field = if stem && self.content_stem_field.is_some() {
-            self.content_stem_field.unwrap()
-        } else {
-            self.content_norm_field
-        };
-
-        let query_parser = QueryParser::for_index(&self.index, vec![
-            search_field,
-        ]);
-
-        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-
-        if !query_str.trim().is_empty() {
-            let boxed = query_parser
-                .parse_query(query_str)
-                .context("Failed to parse search query")?;
-            clauses.push((Occur::Must, boxed));
-        }
-
-        if let Some(pattern) = path_filter {
-            if !pattern.is_empty() {
-                let re_query = RegexQuery::from_pattern(pattern, self.path_field)
-                    .context("Invalid path filter regex")?;
-                clauses.push((Occur::Must, Box::new(re_query)));
-            }
-        }
-
-        if clauses.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let query: Box<dyn Query> = if clauses.len() == 1 {
-            clauses.into_iter().next().unwrap().1
-        } else {
-            Box::new(BooleanQuery::new(clauses))
-        };
-
-        // Fetch limit + offset, then drop the first `offset` results for pagination
-        let fetch_count = limit.checked_add(offset).unwrap_or(limit);
-        let top_docs = searcher
-            .search(&*query, &TopDocs::with_limit(fetch_count))
-            .context("Search failed")?;
-
-        let mut results = Vec::new();
-        for (score, doc_addr) in top_docs.iter().skip(offset) {
-            let doc = searcher.doc::<TantivyDocument>(*doc_addr)?;
-            results.push((*score, doc));
-            if results.len() >= limit {
-                break;
-            }
-        }
-        Ok(results)
+        self.search_parsed(query_str, limit, path_filter, offset)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -540,7 +343,7 @@ impl SearchIndex {
         path_filter: Option<&str>,
         offset: usize,
         fuzzy_distance: u8,
-        stem: bool,
+        _stem: bool,
     ) -> Result<Vec<(f32, TantivyDocument)>> {
         let reader = self
             .index
@@ -549,18 +352,12 @@ impl SearchIndex {
             .try_into()?;
         let searcher = reader.searcher();
 
-        let search_field = if stem && self.content_stem_field.is_some() {
-            self.content_stem_field.unwrap()
-        } else {
-            self.content_norm_field
-        };
-
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
         if !query_str.trim().is_empty() {
             let mut fuzzy_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
             for token in query_str.split_whitespace() {
-                let term = Term::from_field_text(search_field, token);
+                let term = Term::from_field_text(self.content_field, token);
                 let fuzzy_query = FuzzyTermQuery::new(term, fuzzy_distance, true);
                 fuzzy_clauses.push((Occur::Should, Box::new(fuzzy_query)));
             }
@@ -770,7 +567,7 @@ impl SearchIndex {
         let searcher = reader.searcher();
 
         let query_parser = QueryParser::for_index(&self.index, vec![
-            self.content_norm_field,
+            self.content_field,
         ]);
         if query_str.trim().is_empty() {
             return Ok(String::new());
@@ -779,7 +576,7 @@ impl SearchIndex {
             .parse_query(query_str)
             .context("Failed to parse snippet query")?;
 
-        let snippet_generator = SnippetGenerator::create(&searcher, &query, self.content_norm_field)
+        let snippet_generator = SnippetGenerator::create(&searcher, &query, self.content_field)
             .context("Failed to create snippet generator")?;
 
         let snippet = snippet_generator.snippet_from_doc(doc);
@@ -864,35 +661,14 @@ impl SearchIndex {
         &self,
         results: Vec<(f32, TantivyDocument)>,
         recency_weight: f32,
-        max_days: u64,
+        _max_days: u64,
     ) -> Vec<(f32, TantivyDocument)> {
-        if recency_weight <= 0.0 || self.ingested_at_field.is_none() {
+        if recency_weight <= 0.0 {
             return results;
         }
-        let ingested_at_field = self.ingested_at_field.unwrap();
-        let max_secs = max_days * 86400;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
+        // ingested_at field was removed in the pure-index refactor;
+        // recency boost is no longer available. Return results unchanged.
         results
-            .into_iter()
-            .map(|(score, doc)| {
-                let age_secs = doc
-                    .get_first(ingested_at_field)
-                    .and_then(|v| v.as_u64())
-                    .map(|ts| now.saturating_sub(ts))
-                    .unwrap_or(max_secs);
-                let recency_factor = if age_secs >= max_secs {
-                    0.0
-                } else {
-                    1.0 - age_secs as f32 / max_secs as f32
-                };
-                let boosted_score = score * (1.0 + recency_weight * recency_factor);
-                (boosted_score, doc)
-            })
-            .collect()
     }
 
     pub fn optimize(&self) -> Result<(usize, usize)> {
@@ -966,7 +742,7 @@ impl SearchIndex {
         limit: usize,
         path_filter: Option<&str>,
         offset: usize,
-        stem: bool,
+        _stem: bool,
     ) -> Result<Vec<(f32, TantivyDocument)>> {
         let reader = self
             .index
@@ -975,13 +751,7 @@ impl SearchIndex {
             .try_into()?;
         let searcher = reader.searcher();
 
-        let search_field = if stem && self.content_stem_field.is_some() {
-            self.content_stem_field.unwrap()
-        } else {
-            self.content_norm_field
-        };
-
-        let query_parser = QueryParser::for_index(&self.index, vec![search_field]);
+        let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
 
         let mut bool_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for (term, occur) in clauses {
@@ -1070,44 +840,14 @@ impl SearchIndex {
 
 fn build_schema() -> Schema {
     let mut schema_builder = Schema::builder();
-    schema_builder.add_u64_field("id", INDEXED | STORED | FAST);
+    schema_builder.add_u64_field("id", INDEXED | STORED);
     schema_builder.add_text_field("path", STRING | STORED);
-    schema_builder.add_text_field("checksum", STRING | STORED);
     schema_builder.add_text_field(
-        "content_norm",
-        TextOptions::default()
-            .set_stored()
-            .set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("math")
-                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-            ),
-    );
-    schema_builder.add_text_field(
-        "content_stem",
+        "content",
         TextOptions::default()
             .set_indexing_options(
                 TextFieldIndexing::default()
-                    .set_tokenizer("english")
-                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-            ),
-    );
-    schema_builder.add_text_field("content_raw", STORED);
-    schema_builder.add_text_field(
-        "content_jp",
-        TextOptions::default()
-            .set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("ja")
-                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-            ),
-    );
-    schema_builder.add_text_field(
-        "content_zh",
-        TextOptions::default()
-            .set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("zh")
+                    .set_tokenizer("multilang")
                     .set_index_option(IndexRecordOption::WithFreqsAndPositions),
             ),
     );
@@ -1120,19 +860,6 @@ fn build_schema() -> Schema {
                     .set_index_option(IndexRecordOption::WithFreqsAndPositions),
             ),
     );
-    schema_builder.add_text_field("math_source", STORED);
-    schema_builder.add_text_field(
-        "normalized_text",
-        TextOptions::default()
-            .set_stored()
-            .set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("math")
-                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-            ),
-    );
-    schema_builder.add_text_field("language", STRING | STORED);
-    schema_builder.add_u64_field("ingested_at", INDEXED | STORED | FAST);
     schema_builder.build()
 }
 
@@ -1168,21 +895,7 @@ impl Indexer {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn index_document(&self, id: i64, path: &str, text: &str) -> Result<()> {
         let mut writer = self.search_index.writer()?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.search_index.add_document_with_ts(
-            &mut writer,
-            id,
-            path,
-            path, // use path as checksum for simplicity
-            text,
-            text,
-            "",
-            "",
-            now,
-        )?;
+        self.search_index.add_document(&mut writer, id, path, text, None)?;
         writer.commit()?;
         self.metrics.docs_indexed.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut t) = self.metrics.last_commit.lock() {
@@ -1207,13 +920,21 @@ impl Indexer {
 /// This is the canonical tokenizer — all word_offset values in SQLite should
 /// be derived from these positions so they align with Tantivy's term positions.
 pub fn tokenize_with_math(text: &str) -> Vec<(usize, String)> {
+    use std::sync::{Mutex, PoisonError, OnceLock};
     use tantivy::tokenizer::RegexTokenizer;
-    let mut analyzer = TextAnalyzer::builder(
-        RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
-            .expect("Invalid regex for math tokenizer"),
-    )
-    .filter(tantivy::tokenizer::LowerCaser)
-    .build();
+    static ANALYZER: OnceLock<Mutex<TextAnalyzer>> = OnceLock::new();
+    let mut analyzer = match ANALYZER.get_or_init(|| {
+        let tokenizer = RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
+            .unwrap_or_else(|_| RegexTokenizer::new(r"\S+").unwrap());
+        Mutex::new(
+            TextAnalyzer::builder(tokenizer)
+                .filter(tantivy::tokenizer::LowerCaser)
+                .build(),
+        )
+    }).lock() {
+        Ok(guard) => guard,
+        Err(PoisonError { .. }) => return Vec::new(),
+    };
     let mut stream = analyzer.token_stream(text);
     let mut tokens = Vec::new();
     while stream.advance() {
@@ -1291,6 +1012,11 @@ fn unique_index_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn add_doc(idx: &SearchIndex, writer: &mut IndexWriter, _id: i64, _path: &str, _checksum: &str, text: &str, _raw: &str, _lang: &str, _math: &str) -> Result<()> {
+        let math = if _math.is_empty() { None } else { Some(_math) };
+        idx.add_document(writer, _id, _path, text, math)
+    }
+
     // --- SearchIndex: basic flows ---
 
     #[test]
@@ -1298,16 +1024,8 @@ mod tests {
         let schema = build_schema();
         assert!(schema.get_field("id").is_ok());
         assert!(schema.get_field("path").is_ok());
-        assert!(schema.get_field("checksum").is_ok());
-        assert!(schema.get_field("content_norm").is_ok());
-        assert!(schema.get_field("content_stem").is_ok());
-        assert!(schema.get_field("content_raw").is_ok());
-        assert!(schema.get_field("content_jp").is_ok(), "content_jp field should exist");
-        assert!(schema.get_field("content_zh").is_ok(), "content_zh field should exist");
-        assert!(schema.get_field("math_source").is_ok(), "math_source field should exist");
+        assert!(schema.get_field("content").is_ok());
         assert!(schema.get_field("math_tokens").is_ok(), "math_tokens field should exist");
-        assert!(schema.get_field("normalized_text").is_ok(), "normalized_text field should exist");
-        assert!(schema.get_field("language").is_ok(), "language field should exist");
     }
 
     #[test]
@@ -1315,10 +1033,8 @@ mod tests {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let tokenizers = idx.index.tokenizers();
-        assert!(tokenizers.get("math").is_some(), "math tokenizer should be registered");
-        assert!(tokenizers.get("english").is_some(), "english tokenizer should be registered");
-        assert!(tokenizers.get("ja").is_some(), "ja tokenizer should be registered");
-        assert!(tokenizers.get("zh").is_some(), "zh tokenizer should be registered");
+        assert!(tokenizers.get("multilang").is_some(), "multilang tokenizer should be registered");
+        assert!(tokenizers.get("math_tokens").is_some(), "math_tokens tokenizer should be registered");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1330,11 +1046,11 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
         // fuzzy=0, stem=false -> exact search via QueryParser
-        let results = idx.search_in_field_fuzzy_stem("hello", "normalized_text", 10, None, 0, 0, false).unwrap();
+        let results = idx.search_in_field_fuzzy_stem("hello", "content", 10, None, 0, 0, false).unwrap();
         assert_eq!(results.len(), 1, "Exact search via fuzzy_stem should find match");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1346,15 +1062,15 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
         // fuzzy=2 should match "hxllo" -> "hello"
-        let results = idx.search_in_field_fuzzy_stem("hxllo", "normalized_text", 10, None, 0, 2, false).unwrap();
+        let results = idx.search_in_field_fuzzy_stem("hxllo", "content", 10, None, 0, 2, false).unwrap();
         assert_eq!(results.len(), 1, "Fuzzy search (distance 2) should find match");
 
         // fuzzy=0 should NOT match
-        let results2 = idx.search_in_field_fuzzy_stem("hxllo", "normalized_text", 10, None, 0, 0, false).unwrap();
+        let results2 = idx.search_in_field_fuzzy_stem("hxllo", "content", 10, None, 0, 0, false).unwrap();
         assert_eq!(results2.len(), 0, "Exact search should not find typo");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1366,10 +1082,10 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_in_field_fuzzy_stem("", "normalized_text", 10, None, 0, 2, false).unwrap();
+        let results = idx.search_in_field_fuzzy_stem("", "content", 10, None, 0, 2, false).unwrap();
         assert_eq!(results.len(), 0, "Empty query should return empty results");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1381,7 +1097,7 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
         let result = idx.search_in_field_fuzzy_stem("hello", "bad_field", 10, None, 0, 2, false);
@@ -1397,11 +1113,11 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_in_field_fuzzy_stem("hello", "normalized_text", 10, Some("/a.pdf"), 0, 0, false).unwrap();
+        let results = idx.search_in_field_fuzzy_stem("hello", "content", 10, Some("/a.pdf"), 0, 0, false).unwrap();
         assert_eq!(results.len(), 1, "Path filter + field fuzzy_stem should find only the matching doc");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1409,146 +1125,62 @@ mod tests {
 
 
     #[test]
-    fn test_japanese_text_searchable_via_content_norm() {
+    fn test_japanese_text_searchable_via_content() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        // With Latin chars mixed in, the math tokenizer can match.
-        idx.add_document(&mut writer, 1, "/jp.pdf", "jp1", "hello 猫 world", "hello 猫 world", "jpn", "").unwrap()
-;
+        // With Latin chars mixed in, the LanguageAwareTokenizer detects Japanese
+        // and uses Lindera, which also segments Latin tokens.
+        add_doc(&idx, &mut writer, 1, "/jp.pdf", "jp1", "hello 猫 world", "hello 猫 world", "jpn", "").unwrap();
         writer.commit().unwrap();
 
-        // "猫" alone won't match via content_norm (math tokenizer sees it as part
-        // of a CJK run, but here it's isolated so it should be a standalone token).
         let results = idx.search("hello", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 1, "Latin part of JP doc should be findable via content_norm");
+        assert_eq!(results.len(), 1, "Latin part of JP doc should be findable via content");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn test_chinese_text_routed_to_content_zh() {
+    fn test_multilingual_content_searchable() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/zh.pdf", "zh1", "中文测试", "中文测试", "cmn", "").unwrap()
-;
+        add_doc(&idx, &mut writer, 1, "/en.pdf", "en1", "hello world", "hello world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/jp.pdf", "jp1", "私は猫です", "私は猫です", "jpn", "").unwrap();
+        add_doc(&idx, &mut writer, 3, "/zh.pdf", "zh1", "中文测试", "中文测试", "cmn", "").unwrap();
         writer.commit().unwrap();
 
-        let zh_field = idx.content_zh_field.expect("content_zh field should exist");
-        let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![zh_field]);
-        let query = query_parser.parse_query("中文").unwrap();
-        let reader = idx.index.reader_builder().try_into().unwrap();
-        let searcher = reader.searcher();
-        let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-        assert_eq!(top_docs.len(), 1, "ZH text should be searchable via content_zh");
+        // All docs are searchable via the unified content field
+        let en_results = idx.search("hello", 10, None, 0).unwrap();
+        assert_eq!(en_results.len(), 1, "English doc should be findable via content");
+
+        let jp_results = idx.search("猫", 10, None, 0).unwrap();
+        assert_eq!(jp_results.len(), 1, "Japanese doc should be findable via content");
+
+        let zh_results = idx.search("中文", 10, None, 0).unwrap();
+        assert_eq!(zh_results.len(), 1, "Chinese doc should be findable via content");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn test_english_text_not_routed_to_cjk_fields() {
+    fn test_math_tokens_field_is_searchable() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/en.pdf", "en1", "hello world", "hello world", "eng", "").unwrap()
-;
-        writer.commit().unwrap();
-
-        // Fields exist but should not contain data for non-CJK docs.
-        if let Some(jp_field) = idx.content_jp_field {
-            let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![jp_field]);
-            let query = query_parser.parse_query("hello").unwrap();
-            let reader = idx.index.reader_builder().try_into().unwrap();
-            let searcher = reader.searcher();
-            let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-            assert_eq!(top_docs.len(), 0, "English text should NOT be in content_jp");
-        }
-        if let Some(zh_field) = idx.content_zh_field {
-            let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![zh_field]);
-            let query = query_parser.parse_query("hello").unwrap();
-            let reader = idx.index.reader_builder().try_into().unwrap();
-            let searcher = reader.searcher();
-            let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-            assert_eq!(top_docs.len(), 0, "English text should NOT be in content_zh");
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_mixed_language_documents_indexed_correctly() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        idx.add_document(&mut writer, 1, "/en.pdf", "en1", "hello world", "hello world", "eng", "").unwrap()
-;
-        idx.add_document(&mut writer, 2, "/jp.pdf", "jp1", "私は猫です", "私は猫です", "jpn", "").unwrap()
-;
-        idx.add_document(&mut writer, 3, "/zh.pdf", "zh1", "中文测试", "中文测试", "cmn", "").unwrap()
-;
-        writer.commit().unwrap();
-
-        // content_norm finds only the English doc for Latin terms
-        let all = idx.search("hello", 10, None, 0).unwrap();
-        assert_eq!(all.len(), 1, "Only English doc has 'hello' in content_norm");
-        // content_norm also finds JP/ZH docs when searching across both fields
-        // (the test above just verifies the Latin path still works).
-
-        // JP search on content_jp
-        if let Some(jp_field) = idx.content_jp_field {
-            let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![jp_field]);
-            let query = query_parser.parse_query("猫").unwrap();
-            let reader = idx.index.reader_builder().try_into().unwrap();
-            let searcher = reader.searcher();
-            let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-            assert_eq!(top_docs.len(), 1, "JP doc should be the only match in content_jp");
-        }
-
-        // ZH search on content_zh
-        if let Some(zh_field) = idx.content_zh_field {
-            let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![zh_field]);
-            let query = query_parser.parse_query("中文").unwrap();
-            let reader = idx.index.reader_builder().try_into().unwrap();
-            let searcher = reader.searcher();
-            let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-            assert_eq!(top_docs.len(), 1, "ZH doc should be the only match in content_zh");
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_math_source_stored_in_document() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        idx.add_document(
-            &mut writer, 1, "/math.pdf", "m1",
+        add_doc(&idx, &mut writer, 1, "/math.pdf", "m1",
             "The equation $E = mc^2$ is famous.",
-            "raw",
-            "", r"inline:E = mc^2",
-        ).unwrap();
+            "raw", "", r"inline:E = mc^2").unwrap();
         writer.commit().unwrap();
 
-        // Retrieve the doc and check math_source field.
-        let reader = idx.index.reader_builder().try_into().unwrap();
-        let searcher = reader.searcher();
-        let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![idx.content_norm_field]);
-        let query = query_parser.parse_query("equation").unwrap();
-        let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-        assert!(!top_docs.is_empty(), "Should find the math doc");
-
-        let doc = searcher.doc::<TantivyDocument>(top_docs[0].1).unwrap();
-        let stored_math = doc.get_first(idx.math_source_field).and_then(|v| v.as_str());
-        assert!(stored_math.is_some(), "math_source should be present");
-        assert!(stored_math.unwrap().contains("E = mc^2"),
-            "math_source should contain the extracted LaTeX");
+        // math_tokens is INDEXED only (not STORED), so verify it's searchable.
+        let results = idx.search_in_field("inline", "math_tokens", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "math_tokens field should be searchable");
+        let results2 = idx.search_in_field("display", "math_tokens", 10, None, 0).unwrap();
+        assert_eq!(results2.len(), 0, "No display token in this doc");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1559,12 +1191,9 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(
-            &mut writer, 1, "/sum.pdf", "m2",
+        add_doc(&idx, &mut writer, 1, "/sum.pdf", "m2",
             "The sum $$\\sum_{i=1}^{n} i$$ is computed.",
-            "raw",
-            "", r"display:\sum_{i=1}^{n} i",
-        ).unwrap();
+            "raw", "", r"display:\sum_{i=1}^{n} i").unwrap();
         writer.commit().unwrap();
 
         // Search for the composed MATH_SUM_LIMITS token in math_tokens using a term query.
@@ -1591,31 +1220,19 @@ mod tests {
     }
 
     #[test]
-    fn test_math_source_empty_when_no_math() {
+    fn test_math_tokens_field_empty_when_no_math() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(
-            &mut writer, 1, "/plain.pdf", "m3",
+        add_doc(&idx, &mut writer, 1, "/plain.pdf", "m3",
             "This is plain text without math.",
-            "raw",
-            "", "",
-        ).unwrap();
+            "raw", "", "").unwrap();
         writer.commit().unwrap();
 
-        // Verify math_source is stored as empty.
-        let reader = idx.index.reader_builder().try_into().unwrap();
-        let searcher = reader.searcher();
-        let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![idx.content_norm_field]);
-        let query = query_parser.parse_query("plain").unwrap();
-        let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-        assert!(!top_docs.is_empty());
-
-        let doc = searcher.doc::<TantivyDocument>(top_docs[0].1).unwrap();
-        let stored_math = doc.get_first(idx.math_source_field).and_then(|v| v.as_str());
-        assert_eq!(stored_math, Some(""),
-            "math_source should be empty string for non-math docs");
+        // math_tokens is INDEXED only; no math tokens should be findable.
+        let results = idx.search_in_field("inline", "math_tokens", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 0, "No math tokens for plain text");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1626,7 +1243,7 @@ mod tests {
         {
             let idx = SearchIndex::new(&dir).unwrap();
             let mut writer = idx.writer().unwrap();
-            idx.add_document(&mut writer, 1, "/test.pdf", "cs1", "hello world", "hello world", "", "").unwrap();
+            add_doc(&idx, &mut writer, 1, "/test.pdf", "cs1", "hello world", "hello world", "", "").unwrap();
             writer.commit().unwrap();
         }
         {
@@ -1643,7 +1260,7 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/doc.pdf", "cs1", "the quick brown fox", "the quick brown fox", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", "the quick brown fox", "the quick brown fox", "", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -1671,7 +1288,7 @@ mod tests {
 
         for i in 0..10 {
             let content = format!("document number {}", i);
-            idx.add_document(&mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
+            add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
 ;
         }
         writer.commit().unwrap();
@@ -1688,7 +1305,7 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/doc.pdf", "cs1", "Hello World", "Hello World", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", "Hello World", "Hello World", "", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -1709,9 +1326,9 @@ fn test_search_with_path_filter_filters_by_path() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/reports/2024.pdf", "cs1", "quarterly earnings report", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/reports/2024.pdf", "cs1", "quarterly earnings report", "content", "", "").unwrap()
 ;
-    idx.add_document(&mut writer, 2, "/invoices/2024.pdf", "cs2", "invoice total earnings", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/invoices/2024.pdf", "cs2", "invoice total earnings", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1734,9 +1351,9 @@ fn test_search_path_filter_without_text_query() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/docs/a.pdf", "cs1", "rust language", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/docs/a.pdf", "cs1", "rust language", "content", "", "").unwrap()
 ;
-    idx.add_document(&mut writer, 2, "/docs/b.pdf", "cs2", "python language", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/docs/b.pdf", "cs2", "python language", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1755,9 +1372,9 @@ fn test_search_path_filter_empty_string_no_filtering() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
 ;
-    idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello world", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1774,7 +1391,7 @@ fn test_search_path_filter_no_match_returns_empty() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1790,9 +1407,9 @@ fn test_search_path_filter_matches_all() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/x/a.pdf", "cs1", "hello", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/x/a.pdf", "cs1", "hello", "content", "", "").unwrap()
 ;
-    idx.add_document(&mut writer, 2, "/y/b.pdf", "cs2", "hello", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/y/b.pdf", "cs2", "hello", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1808,7 +1425,7 @@ fn test_search_path_filter_invalid_regex_returns_error() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1828,7 +1445,7 @@ fn test_search_offset_skips_results() {
 
     for i in 0..10 {
         let content = format!("document number {}", i);
-        idx.add_document(&mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
+        add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
 ;
     }
     writer.commit().unwrap();
@@ -1850,7 +1467,7 @@ fn test_search_offset_beyond_total_returns_empty() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1869,7 +1486,7 @@ fn test_search_offset_and_limit_together() {
 
     for i in 0..20 {
         let content = format!("item {}", i);
-        idx.add_document(&mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
+        add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
 ;
     }
     writer.commit().unwrap();
@@ -1901,7 +1518,7 @@ fn test_search_offset_zero_same_as_no_offset() {
 
     for i in 0..5 {
         let content = format!("item {}", i);
-        idx.add_document(&mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
+        add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
 ;
     }
     writer.commit().unwrap();
@@ -1922,7 +1539,7 @@ fn test_search_offset_with_path_filter() {
     for i in 0..6 {
         let sub = if i < 3 { "reports" } else { "invoices" };
         let content = format!("document {}", i);
-        idx.add_document(&mut writer, i, &format!("/{}/{}.pdf", sub, i), &format!("cs{}", i), &content, &content, "", "").unwrap()
+        add_doc(&idx, &mut writer, i, &format!("/{}/{}.pdf", sub, i), &format!("cs{}", i), &content, &content, "", "").unwrap()
 ;
     }
     writer.commit().unwrap();
@@ -1950,9 +1567,9 @@ fn test_search_phrase_query_matches_exact_phrase() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "The quick brown fox jumps over the lazy dog", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "The quick brown fox jumps over the lazy dog", "content", "", "").unwrap()
 ;
-    idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "quick brown fox jumps high", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "quick brown fox jumps high", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1971,7 +1588,7 @@ fn test_search_phrase_query_no_match_when_words_out_of_order() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1988,14 +1605,13 @@ fn test_phrase_learning_machine_does_not_match() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/test_phrase.pdf", "cs1", "support vector machine", "content", "", "").unwrap();
-    idx.add_document(&mut writer, 2, "/test_phrase.pdf", "cs2", "machine learning", "content", "", "").unwrap();
-    idx.add_document(&mut writer, 3, "/test_phrase.pdf", "cs3", "vector machine learning", "content", "", "").unwrap();
+    add_doc(&idx, &mut writer, 1, "/test_phrase.pdf", "cs1", "support vector machine", "content", "", "").unwrap();
+    add_doc(&idx, &mut writer, 2, "/test_phrase.pdf", "cs2", "machine learning", "content", "", "").unwrap();
+    add_doc(&idx, &mut writer, 3, "/test_phrase.pdf", "cs3", "vector machine learning", "content", "", "").unwrap();
     writer.commit().unwrap();
 
     // "learning machine" reversed — should NOT match any doc
     let count = idx.search_count("\"learning machine\"").unwrap();
-    eprintln!("DEBUG search_count(\"learning machine\") = {}", count);
     assert_eq!(count, 0, "search_count for reversed phrase should be 0");
 
     let results = idx.search("\"learning machine\"", 10, None, 0).unwrap();
@@ -2011,14 +1627,13 @@ fn test_phrase_extra_learning_machine_does_not_match() {
     let mut writer = idx.writer().unwrap();
 
     // Same content as test_phrase_extra.pdf
-    idx.add_document(&mut writer, 1, "/test_phrase_extra.pdf", "cse1", "machine learning", "content", "", "").unwrap();
-    idx.add_document(&mut writer, 2, "/test_phrase_extra.pdf", "cse2", "machine", "content", "", "").unwrap();
-    idx.add_document(&mut writer, 3, "/test_phrase_extra.pdf", "cse3", "machine learning", "content", "", "").unwrap();
+    add_doc(&idx, &mut writer, 1, "/test_phrase_extra.pdf", "cse1", "machine learning", "content", "", "").unwrap();
+    add_doc(&idx, &mut writer, 2, "/test_phrase_extra.pdf", "cse2", "machine", "content", "", "").unwrap();
+    add_doc(&idx, &mut writer, 3, "/test_phrase_extra.pdf", "cse3", "machine learning", "content", "", "").unwrap();
     writer.commit().unwrap();
 
     // "learning machine" reversed — should NOT match any doc
     let count = idx.search_count("\"learning machine\"").unwrap();
-    eprintln!("DEBUG search_count(\"learning machine\") (extra) = {}", count);
     assert_eq!(count, 0, "search_count for reversed phrase should be 0");
 
     let results = idx.search("\"learning machine\"", 10, None, 0).unwrap();
@@ -2026,7 +1641,6 @@ fn test_phrase_extra_learning_machine_does_not_match() {
 
     // Also verify "machine learning" DOES match both docs
     let results = idx.search("\"machine learning\"", 10, None, 0).unwrap();
-    eprintln!("DEBUG search(\"machine learning\") returned {} results", results.len());
     assert_eq!(results.len(), 2, "phrase 'machine learning' should match 2 docs in test_phrase_extra.pdf");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -2038,7 +1652,7 @@ fn test_search_phrase_query_empty_string_returns_nothing() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -2063,13 +1677,13 @@ fn test_raw_string_machine_learning_returns_exactly_2_pages() {
     let mut writer = idx.writer().unwrap();
 
     // Page 1: solo "machine" — no tiene "learning" después
-    idx.add_document(&mut writer, 1, "/book.pdf", "cs1", "machine", "raw", "", "").unwrap();
+    add_doc(&idx, &mut writer, 1, "/book.pdf", "cs1", "machine", "raw", "", "").unwrap();
     // Page 2: "machine learning" — frase exacta contigua
-    idx.add_document(&mut writer, 2, "/book.pdf", "cs2", "machine learning", "raw", "", "").unwrap();
+    add_doc(&idx, &mut writer, 2, "/book.pdf", "cs2", "machine learning", "raw", "", "").unwrap();
     // Page 3: "machine learning" — frase exacta contigua
-    idx.add_document(&mut writer, 3, "/book.pdf", "cs3", "machine learning", "raw", "", "").unwrap();
+    add_doc(&idx, &mut writer, 3, "/book.pdf", "cs3", "machine learning", "raw", "", "").unwrap();
     // Page 4: "the machine is learning fast" — palabras sueltas, NO contiguas
-    idx.add_document(&mut writer, 4, "/book.pdf", "cs4", "the machine is learning fast", "raw", "", "").unwrap();
+    add_doc(&idx, &mut writer, 4, "/book.pdf", "cs4", "the machine is learning fast", "raw", "", "").unwrap();
 
     writer.commit().unwrap();
 
@@ -2103,7 +1717,7 @@ fn test_search_fuzzy_matches_with_typo() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -2120,7 +1734,7 @@ fn test_search_fuzzy_edit_distance_2_matches() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "algorithm", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "algorithm", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -2137,7 +1751,7 @@ fn test_search_fuzzy_no_match_when_edit_distance_too_low() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "algorithm", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "algorithm", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -2157,7 +1771,7 @@ fn test_search_fuzzy_empty_query_returns_nothing() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -2173,9 +1787,9 @@ fn test_search_fuzzy_with_path_filter() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    idx.add_document(&mut writer, 1, "/reports/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/reports/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
 ;
-    idx.add_document(&mut writer, 2, "/invoices/b.pdf", "cs2", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/invoices/b.pdf", "cs2", "hello world", "content", "", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -2197,7 +1811,7 @@ fn test_search_fuzzy_with_path_filter() {
 
         // Use simple math expression with âˆ‘ (N-ARY SUMMATION) and âˆ« (INTEGRAL)
         let text = "E = mc^2 and âˆ‘ and âˆ« symbols";
-        idx.add_document(&mut writer, 1, "/math.pdf", "cs1", text, text, "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/math.pdf", "cs1", text, text, "", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2214,22 +1828,21 @@ fn test_search_fuzzy_with_path_filter() {
     // --- Dedup / resumability ---
 
     #[test]
-    fn test_dedup_same_checksum_replaces() {
+    fn test_dedup_same_checksum_both_kept() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "same", "old content", "old content", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "same", "old content", "old content", "", "").unwrap()
+;
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "same", "new content", "new content", "", "").unwrap()
 ;
         writer.commit().unwrap();
 
-        // Index same checksum again â€” should replace, not duplicate
-        idx.add_document(&mut writer, 2, "/b.pdf", "same", "new content", "new content", "", "").unwrap()
-;
-        writer.commit().unwrap();
-
+        // Checksum-based dedup was removed — same checksum no longer replaces.
+        // Path-based dedup in the job store is the true dedup mechanism.
         let results = idx.search("content", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 1, "Dedup should leave exactly one doc");
+        assert_eq!(results.len(), 2, "Both docs kept (no Tantivy checksum dedup)");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2240,9 +1853,9 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "content a", "content a", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "content a", "content a", "", "").unwrap()
 ;
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "content b", "content b", "", "").unwrap()
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "content b", "content b", "", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2255,21 +1868,21 @@ fn test_search_fuzzy_with_path_filter() {
     // --- Snippet generation ---
 
     #[test]
-    fn test_generate_snippet_matches_content() {
+    fn test_generate_snippet_non_stored_returns_empty() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        let text = "This is a very long document about cryptography and security in computer systems.";
-        idx.add_document(&mut writer, 1, "/doc.pdf", "cs1", text, text, "", "").unwrap()
-;
+        let text = "This is a very long document about cryptography.";
+        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", text, text, "", "").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search("cryptography", 10, None, 0).unwrap();
         assert!(!results.is_empty());
 
+        // content field is INDEXED only (not STORED), so snippet should be empty
         let snippet = idx.generate_snippet(&results[0].1, "cryptography").unwrap();
-        assert!(snippet.contains("cryptography"), "Snippet should contain the matched term");
+        assert!(snippet.is_empty(), "Snippet should be empty when content is not stored");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2354,9 +1967,9 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
 ;
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "foo bar", "content", "", "").unwrap()
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "foo bar", "content", "", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2403,7 +2016,7 @@ fn test_search_fuzzy_with_path_filter() {
 
         {
             let mut writer = idx.writer().unwrap();
-            idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
 ;
             writer.commit().unwrap();
         }
@@ -2423,11 +2036,11 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         {
             let mut writer = idx.writer().unwrap();
-            idx.add_document(&mut writer, 1, "/reports/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 1, "/reports/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
 ;
-            idx.add_document(&mut writer, 2, "/invoices/b.pdf", "cs2", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 2, "/invoices/b.pdf", "cs2", "hello", "hello", "", "").unwrap()
 ;
-            idx.add_document(&mut writer, 3, "/reports/c.pdf", "cs3", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 3, "/reports/c.pdf", "cs3", "hello", "hello", "", "").unwrap()
 ;
             writer.commit().unwrap();
         } // writer dropped, lock released
@@ -2449,9 +2062,9 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         {
             let mut writer = idx.writer().unwrap();
-            idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
 ;
-            idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "world", "world", "", "").unwrap()
+            add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "world", "world", "", "").unwrap()
 ;
             writer.commit().unwrap();
         } // writer dropped, lock released
@@ -2474,19 +2087,17 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "running quickly", "running quickly", "", "").unwrap()
-;
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "the cat runs fast", "the cat runs fast", "", "").unwrap()
-;
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "running quickly", "running quickly", "", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "the cat runs fast", "the cat runs fast", "", "").unwrap();
         writer.commit().unwrap();
 
-        // Non-stemmed search should still work
+        // Exact match works
         let results = idx.search("running", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 1, "Non-stemmed search should find exact match");
+        assert_eq!(results.len(), 1, "Search should find exact match");
 
-        // Stemmed search should find "run" stem of "running" and "runs"
-        let results = idx.search_stem("run", 10, None, 0, true).unwrap();
-        assert_eq!(results.len(), 2, "Stemmed search should find both 'running' and 'runs'");
+        // Search for "run" does NOT match "running" without stemming
+        let results = idx.search("run", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 0, "Without stemming, 'run' does not match 'running'");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2497,7 +2108,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "the cat and the dog", "the cat and the dog", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "the cat and the dog", "the cat and the dog", "", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2509,18 +2120,17 @@ fn test_search_fuzzy_with_path_filter() {
     }
 
     #[test]
-    fn test_stem_search_with_phrase() {
+    fn test_search_with_phrase() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "the running cats", "the running cats", "", "").unwrap()
-;
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "the running cats", "the running cats", "", "").unwrap();
         writer.commit().unwrap();
 
-        // Stemmed phrase search should match stemmed terms
-        let results = idx.search_stem("\"running cat\"", 10, None, 0, true).unwrap();
-        assert_eq!(results.len(), 1, "Stemmed phrase search should find stemmed terms");
+        // Phrase search matches exact phrase
+        let results = idx.search("\"running cats\"", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Phrase search should find exact match");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2531,7 +2141,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world hello", "content", "eng", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world hello", "content", "eng", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2571,7 +2181,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "eng", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "eng", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2587,7 +2197,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "eng", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "eng", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2603,7 +2213,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "", "").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_stem("nonexistent", 10, None, 0, true).unwrap();
@@ -2618,7 +2228,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2651,7 +2261,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         {
             let mut writer = idx.writer().unwrap();
-            idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
 ;
             writer.commit().unwrap();
         }
@@ -2672,7 +2282,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         {
             let mut writer = idx.writer().unwrap();
-            idx.add_document(&mut writer, 1, "/reports/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 1, "/reports/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
 ;
             writer.commit().unwrap();
         }
@@ -2713,93 +2323,52 @@ fn test_search_fuzzy_with_path_filter() {
     }
 
     #[test]
-    fn test_normalized_text_populated_for_latin() {
+    fn test_english_text_searchable_via_content() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/en.pdf", "en1", "hello world", "hello world", "eng", "").unwrap()
-;
+        add_doc(&idx, &mut writer, 1, "/en.pdf", "en1", "hello world", "hello world", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        // Latin text should be searchable via normalized_text.
-        if let Some(nt_field) = idx.normalized_text_field {
-            let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![nt_field]);
-            let query = query_parser.parse_query("hello").unwrap();
-            let reader = idx.index.reader_builder().try_into().unwrap();
-            let searcher = reader.searcher();
-            let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-            assert_eq!(top_docs.len(), 1, "English text should be searchable via normalized_text");
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_normalized_text_empty_for_cjk() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        idx.add_document(&mut writer, 1, "/jp.pdf", "jp1", "私は猫です", "私は猫です", "jpn", "").unwrap()
-;
-        idx.add_document(&mut writer, 2, "/zh.pdf", "zh1", "中文测试", "中文测试", "cmn", "").unwrap()
-;
-        writer.commit().unwrap();
-
-        // CJK text should NOT be searchable via normalized_text.
-        if let Some(nt_field) = idx.normalized_text_field {
-            let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![nt_field]);
-            let query = query_parser.parse_query("猫").unwrap();
-            let reader = idx.index.reader_builder().try_into().unwrap();
-            let searcher = reader.searcher();
-            let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-            assert_eq!(top_docs.len(), 0, "Japanese text should NOT be searchable via normalized_text");
-
-            let query2 = query_parser.parse_query("中文").unwrap();
-            let top_docs2 = searcher.search(&query2, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-            assert_eq!(top_docs2.len(), 0, "Chinese text should NOT be searchable via normalized_text");
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_normalized_text_empty_for_empty_lang() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        // Empty language should be treated as non-CJK (routed to normalized_text).
-        idx.add_document(&mut writer, 1, "/plain.pdf", "cs1", "some text", "some text", "", "").unwrap()
-;
-        writer.commit().unwrap();
-
-        if let Some(nt_field) = idx.normalized_text_field {
-            let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![nt_field]);
-            let query = query_parser.parse_query("text").unwrap();
-            let reader = idx.index.reader_builder().try_into().unwrap();
-            let searcher = reader.searcher();
-            let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-            assert_eq!(top_docs.len(), 1, "Empty-lang doc should be searchable via normalized_text");
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_normalized_text_field_none_graceful() {
-        let dir = unique_index_dir();
-        let mut idx = SearchIndex::new(&dir).unwrap();
-        // Simulate an index without the normalized_text field (e.g. old schema).
-        idx.normalized_text_field = None;
-        let mut writer = idx.writer().unwrap();
-        // Should not panic — the if let Some gracefully skips.
-        idx.add_document(&mut writer, 1, "/en.pdf", "en1", "hello world", "hello world", "eng", "").unwrap();
-        writer.commit().unwrap();
-        // Search via content_norm should still work.
+        // English text should be searchable via content.
         let results = idx.search("hello", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 1, "English doc should remain searchable via content_norm");
+        assert_eq!(results.len(), 1, "English text should be searchable via content");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_cjk_text_searchable_via_content() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        add_doc(&idx, &mut writer, 1, "/jp.pdf", "jp1", "私は猫です", "私は猫です", "jpn", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/zh.pdf", "zh1", "中文测试", "中文测试", "cmn", "").unwrap();
+        writer.commit().unwrap();
+
+        let jp_results = idx.search("猫", 10, None, 0).unwrap();
+        assert_eq!(jp_results.len(), 1, "Japanese text should be searchable via content");
+
+        let zh_results = idx.search("中文", 10, None, 0).unwrap();
+        assert_eq!(zh_results.len(), 1, "Chinese text should be searchable via content");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_empty_lang_searchable_via_content() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer().unwrap();
+
+        add_doc(&idx, &mut writer, 1, "/plain.pdf", "cs1", "some text", "some text", "", "").unwrap();
+        writer.commit().unwrap();
+
+        let results = idx.search("text", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Empty-lang doc should be searchable via content");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2811,10 +2380,10 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/en.pdf", "en1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/en.pdf", "en1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_in_field("hello", "normalized_text", 10, None, 0).unwrap();
+        let results = idx.search_in_field("hello", "content", 10, None, 0).unwrap();
         assert_eq!(results.len(), 1, "Should find Latin text in normalized_text");
 
         let path = results[0].1.get_first(idx.path_field).and_then(|v| v.as_str()).unwrap();
@@ -2829,10 +2398,10 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/doc.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_in_field("world", "content_norm", 10, None, 0).unwrap();
+        let results = idx.search_in_field("world", "content", 10, None, 0).unwrap();
         assert_eq!(results.len(), 1, "Should find text in content_norm");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2844,10 +2413,10 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/jp.pdf", "jp1", "私は猫です", "raw", "jpn", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/jp.pdf", "jp1", "私は猫です", "raw", "jpn", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_in_field("猫", "content_jp", 10, None, 0).unwrap();
+        let results = idx.search_in_field("猫", "content", 10, None, 0).unwrap();
         assert_eq!(results.len(), 1, "Should find Japanese text in content_jp");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2859,27 +2428,31 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/zh.pdf", "zh1", "中文测试", "raw", "cmn", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/zh.pdf", "zh1", "中文测试", "raw", "cmn", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_in_field("中文", "content_zh", 10, None, 0).unwrap();
+        let results = idx.search_in_field("中文", "content", 10, None, 0).unwrap();
         assert_eq!(results.len(), 1, "Should find Chinese text in content_zh");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn test_search_in_field_stem() {
+    fn test_search_in_field_exact() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "running quickly", "raw", "", "").unwrap();
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "the cat runs fast", "raw", "", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "running quickly", "raw", "", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "the cat runs fast", "raw", "", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_in_field("run", "content_stem", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 2, "Stemmed search should find both 'running' and 'runs'");
+        // Without stemming, search is exact (no morphological variants).
+        let results = idx.search_in_field("running", "content", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Exact search should find 'running'");
+
+        let results = idx.search_in_field("runs", "content", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "Exact search should find 'runs'");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2890,12 +2463,9 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(
-            &mut writer, 1, "/sum.pdf", "m1",
+        add_doc(&idx, &mut writer, 1, "/sum.pdf", "m1",
             "The sum $$\\sum_{i=1}^{n} i$$ is computed.",
-            "raw", "",
-            r"display:\sum_{i=1}^{n} i",
-        ).unwrap();
+            "raw", "", r"display:\sum_{i=1}^{n} i").unwrap();
         writer.commit().unwrap();
 
         // MathAwareTokenizer splits "math_sum_limits" at '_', so query for
@@ -2916,16 +2486,16 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
         // With matching path filter
-        let results = idx.search_in_field("hello", "normalized_text", 10, Some("/a.pdf"), 0).unwrap();
+        let results = idx.search_in_field("hello", "content", 10, Some("/a.pdf"), 0).unwrap();
         assert_eq!(results.len(), 1, "Should find only the doc matching path filter");
 
         // With non-matching path filter
-        let results2 = idx.search_in_field("hello", "normalized_text", 10, Some("/nope.pdf"), 0).unwrap();
+        let results2 = idx.search_in_field("hello", "content", 10, Some("/nope.pdf"), 0).unwrap();
         assert_eq!(results2.len(), 0, "Path filter excluding all docs should return empty");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2937,21 +2507,21 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
-        idx.add_document(&mut writer, 3, "/c.pdf", "cs3", "hello again", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 3, "/c.pdf", "cs3", "hello again", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
         // Limit
-        let results = idx.search_in_field("hello", "normalized_text", 1, None, 0).unwrap();
+        let results = idx.search_in_field("hello", "content", 1, None, 0).unwrap();
         assert_eq!(results.len(), 1, "Limit should restrict results");
 
         // Offset
-        let results2 = idx.search_in_field("hello", "normalized_text", 10, None, 2).unwrap();
+        let results2 = idx.search_in_field("hello", "content", 10, None, 2).unwrap();
         assert_eq!(results2.len(), 1, "Offset 2 should skip first 2 results");
 
         // Offset beyond total
-        let results3 = idx.search_in_field("hello", "normalized_text", 10, None, 10).unwrap();
+        let results3 = idx.search_in_field("hello", "content", 10, None, 10).unwrap();
         assert_eq!(results3.len(), 0, "Offset beyond total should return empty");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2965,10 +2535,10 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_in_field("nonexistent", "normalized_text", 10, None, 0).unwrap();
+        let results = idx.search_in_field("nonexistent", "content", 10, None, 0).unwrap();
         assert_eq!(results.len(), 0, "Non-matching query should return empty");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2980,10 +2550,10 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_in_field("", "normalized_text", 10, None, 0).unwrap();
+        let results = idx.search_in_field("", "content", 10, None, 0).unwrap();
         assert_eq!(results.len(), 0, "Empty query should return empty results");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2995,7 +2565,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
         // content_raw is stored-only, not indexed. QueryParser requires an
@@ -3012,7 +2582,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/my-path.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/my-path.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
         // path is a STRING field (indexed as raw). Search must match the full string.
@@ -3030,7 +2600,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
         let result = idx.search_in_field("hello", "nonexistent_field", 10, None, 0);
@@ -3047,7 +2617,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
         let result = idx.search_in_field("hello", "", 10, None, 0);
@@ -3062,7 +2632,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        idx.add_document(&mut writer, 42, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 42, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
 
         // id is a u64 field; QueryParser should fail to parse a text query against it.
@@ -3080,7 +2650,7 @@ fn test_search_fuzzy_with_path_filter() {
     fn test_search_index_default_ram_buffer() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
-        assert_eq!(idx.ram_buffer(), 500_000_000, "Default ram_buffer should be 500MB");
+        assert_eq!(idx.ram_buffer(), 3_000_000_000, "Default ram_buffer should be 3GB");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3091,7 +2661,7 @@ fn test_search_fuzzy_with_path_filter() {
         assert_eq!(idx.ram_buffer(), 1_000_000_000, "Custom ram_buffer should be 1GB");
         // Verify the writer uses the custom value (doesn't crash)
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng", "").unwrap();
         writer.commit().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3100,9 +2670,33 @@ fn test_search_fuzzy_with_path_filter() {
     fn test_search_index_set_ram_buffer() {
         let dir = unique_index_dir();
         let mut idx = SearchIndex::new(&dir).unwrap();
-        assert_eq!(idx.ram_buffer(), 500_000_000);
+        assert_eq!(idx.ram_buffer(), 3_000_000_000);
         idx.set_ram_buffer(128_000_000);
         assert_eq!(idx.ram_buffer(), 128_000_000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_writer_with_num_threads_default() {
+        let dir = unique_index_dir();
+        let idx = SearchIndex::new(&dir).unwrap();
+        let mut writer = idx.writer_with_num_threads(2).unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        writer.commit().unwrap();
+        let results = idx.search("hello", 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1, "should index and find doc with writer_with_num_threads");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_writer_with_num_threads_large_value_no_crash() {
+        let dir = unique_index_dir();
+        let mut idx = SearchIndex::new(&dir).unwrap();
+        // Use a larger ram_buffer so per-thread memory stays above tantivy's 15MB minimum
+        idx.set_ram_buffer(500_000_000);
+        let mut writer = idx.writer_with_num_threads(16).unwrap();
+        add_doc(&idx, &mut writer, 1, "/big.pdf", "cs1", "test", "test", "eng", "").unwrap();
+        writer.commit().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3113,14 +2707,14 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "world hello", "world hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "world hello", "world hello", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
         assert_eq!(results.len(), 2, "Should find both docs");
 
-        let results = idx.search_weighted_fields("world", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        let results = idx.search_weighted_fields("world", &[("content", 1.0)], 10, None, 0).unwrap();
         assert_eq!(results.len(), 2, "Should find both docs for world");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3131,7 +2725,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_weighted_fields("hello", &[], 10, None, 0).unwrap();
@@ -3145,11 +2739,11 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello", "eng", "").unwrap();
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello there", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "hello", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, Some("/a\\.pdf"), 0).unwrap();
+        let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, Some("/a\\.pdf"), 0).unwrap();
         assert_eq!(results.len(), 1, "Should filter to /a.pdf only");
         assert!(results[0].1.get_first(idx.path_field).unwrap().as_str().unwrap().contains("a.pdf"));
 
@@ -3161,11 +2755,11 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello", "hello", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 1).unwrap();
+        let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 1).unwrap();
         assert_eq!(results.len(), 1, "Offset 1 should skip first result");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3174,61 +2768,18 @@ fn test_search_fuzzy_with_path_filter() {
     // --- Phase 8: Recency re-ranking ---
 
     #[test]
-    fn test_recency_re_ranking_old_gets_boosted_less() {
+    fn test_recency_noop_when_ingested_at_removed() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        // Add two docs with different ingested_at timestamps
-        if let Some(f) = idx.ingested_at_field {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-            let old_ts = now - 200 * 86400; // ~200 days ago
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
 
-            let mut doc_new = TantivyDocument::new();
-            doc_new.add_u64(idx.id_field, 1);
-            doc_new.add_text(idx.path_field, "/new.pdf");
-            doc_new.add_text(idx.checksum_field, "cs_new");
-            doc_new.add_text(idx.content_norm_field, "hello world");
-            doc_new.add_text(idx.content_stem_field.unwrap(), "hello world");
-            doc_new.add_text(idx.content_raw_field, "hello world");
-            doc_new.add_text(idx.content_jp_field.unwrap(), "");
-            doc_new.add_text(idx.content_zh_field.unwrap(), "");
-            doc_new.add_text(idx.language_field, "eng");
-            doc_new.add_text(idx.math_tokens_field.unwrap(), "");
-            doc_new.add_u64(f, now);
-            writer.add_document(doc_new);
-
-            let mut doc_old = TantivyDocument::new();
-            doc_old.add_u64(idx.id_field, 2);
-            doc_old.add_text(idx.path_field, "/old.pdf");
-            doc_old.add_text(idx.checksum_field, "cs_old");
-            doc_old.add_text(idx.content_norm_field, "hello world");
-            doc_old.add_text(idx.content_stem_field.unwrap(), "hello world");
-            doc_old.add_text(idx.content_raw_field, "hello world");
-            doc_old.add_text(idx.content_jp_field.unwrap(), "");
-            doc_old.add_text(idx.content_zh_field.unwrap(), "");
-            doc_old.add_text(idx.language_field, "eng");
-            doc_old.add_text(idx.math_tokens_field.unwrap(), "");
-            doc_old.add_u64(f, old_ts);
-            writer.add_document(doc_old);
-            writer.commit().unwrap();
-
-            // Search without recency — both should appear, new one likely higher BM25
-            let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
-            assert_eq!(results.len(), 2, "Should find both docs");
-
-            // Apply recency boost — the newer doc should get a larger boost
-            let boosted = idx.apply_recency_boost(results, 0.5, 365);
-            assert_eq!(boosted.len(), 2);
-            // The new doc's boosted score should be higher than the old one's
-            // (new doc has recency factor ~1.0, old doc ~1.0 - 200/365 ≈ 0.45)
-            // new score ≈ score * (1 + 0.5 * 1.0) = score * 1.5
-            // old score ≈ score * (1 + 0.5 * 0.45) = score * 1.225
-            // Since both have same BM25 score, new should rank higher
-            let new_path = boosted[0].1.get_first(idx.path_field).unwrap().as_str().unwrap().to_string();
-            assert!(new_path.contains("new.pdf") || boosted.len() == 2,
-                "Newer doc should be ranked first after recency boost");
-        }
+        // ingested_at_field is None, so apply_recency_boost is a no-op
+        let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
+        assert_eq!(results.len(), 1);
+        let boosted = idx.apply_recency_boost(results, 0.5, 365);
+        assert_eq!(boosted.len(), 1, "Should return same results when ingested_at is None");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3238,10 +2789,10 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
         let original_len = results.len();
         let boosted = idx.apply_recency_boost(results, 0.0, 365);
         assert_eq!(boosted.len(), original_len, "Zero weight should return results unchanged");
@@ -3255,13 +2806,13 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
         // Use add_document (no ingested_at)
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
         writer.commit().unwrap();
 
         // Temporarily clear ingested_at_field to simulate old index
         // We can't mutate private fields, so we test via the public API:
         // apply_recency_boost will short-circuit if ingested_at_field is None
-        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
         let boosted = idx.apply_recency_boost(results, 0.5, 365);
         assert_eq!(boosted.len(), 1, "Should still return results when ingested_at is present");
 
@@ -3269,38 +2820,16 @@ fn test_search_fuzzy_with_path_filter() {
     }
 
     #[test]
-    fn test_recency_max_days_older_than_max_days() {
+    fn test_recency_noop_with_zero_weight() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng", "").unwrap();
+        writer.commit().unwrap();
 
-        if let Some(f) = idx.ingested_at_field {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-            let very_old_ts = now - 1000 * 86400; // 1000 days ago
-
-            let mut doc = TantivyDocument::new();
-            doc.add_u64(idx.id_field, 1);
-            doc.add_text(idx.path_field, "/old.pdf");
-            doc.add_text(idx.checksum_field, "cs_old");
-            doc.add_text(idx.content_norm_field, "hello world");
-            doc.add_text(idx.content_stem_field.unwrap(), "hello world");
-            doc.add_text(idx.content_raw_field, "hello world");
-            doc.add_text(idx.content_jp_field.unwrap(), "");
-            doc.add_text(idx.content_zh_field.unwrap(), "");
-            doc.add_text(idx.language_field, "eng");
-            doc.add_text(idx.math_tokens_field.unwrap(), "");
-            doc.add_u64(f, very_old_ts);
-            writer.add_document(doc);
-            writer.commit().unwrap();
-
-            let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
-            // With max_days=30, this doc is way older, so recency_factor should be 0.0
-            let boosted = idx.apply_recency_boost(results, 1.0, 30);
-            assert_eq!(boosted.len(), 1);
-            // score * (1 + 1.0 * 0.0) = same score
-            // Just verify it doesn't crash and returns result
-        }
+        let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
+        let boosted = idx.apply_recency_boost(results, 0.0, 365);
+        assert_eq!(boosted.len(), 1, "Zero weight should return results unchanged");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3310,10 +2839,10 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_weighted_fields("", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        let results = idx.search_weighted_fields("", &[("content", 1.0)], 10, None, 0).unwrap();
         assert!(results.is_empty(), "Empty query should return no results");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3324,7 +2853,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
         writer.commit().unwrap();
 
         // Nonexistent field names are silently skipped → no query clauses → empty
@@ -3339,8 +2868,8 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
-        idx.add_document(&mut writer, 2, "/b.pdf", "cs2", "world", "world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "world", "world", "eng", "").unwrap();
         writer.commit().unwrap();
 
         // Empty query + path filter should still match via path regex
@@ -3356,10 +2885,10 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
+        let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
         let original_score = results[0].0;
         let boosted = idx.apply_recency_boost(results, -0.5, 365);
         assert_eq!(boosted.len(), 1, "Negative weight should return results unchanged");
@@ -3373,11 +2902,11 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        idx.add_document(&mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
         writer.commit().unwrap();
 
-        let results_low = idx.search_weighted_fields("hello", &[("content_norm", 1.0)], 10, None, 0).unwrap();
-        let results_high = idx.search_weighted_fields("hello", &[("content_norm", 5.0)], 10, None, 0).unwrap();
+        let results_low = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
+        let results_high = idx.search_weighted_fields("hello", &[("content", 5.0)], 10, None, 0).unwrap();
         assert!(
             results_high[0].0 > results_low[0].0,
             "Higher boost should produce higher score ({} vs {})",
@@ -3548,5 +3077,97 @@ fn test_search_fuzzy_with_path_filter() {
         assert_eq!(aligned[0].1.page, 1);
         assert_eq!(aligned[1].0, 1); // "learning" at Tantivy position 1
         assert_eq!(aligned[1].1.page, 2);
+    }
+
+    // ── Regression: tokenize_with_math caches TextAnalyzer (OnceLock<Mutex<>>) ──
+
+    #[test]
+    fn test_tokenize_with_math_cached_idempotent() {
+        let text = "cached tokenizer idempotent test 123 $math$";
+        let first = tokenize_with_math(text);
+        let second = tokenize_with_math(text);
+        assert_eq!(first, second, "cached TextAnalyzer should produce identical output across calls");
+    }
+
+    #[test]
+    fn test_tokenize_with_math_concurrent_safety() {
+        let text = "concurrent safety for cached tokenizer access";
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let t = text.to_string();
+            handles.push(std::thread::spawn(move || tokenize_with_math(&t)));
+        }
+        let results: Vec<Vec<(usize, String)>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for r in &results {
+            assert_eq!(r, &results[0], "all concurrent calls should produce identical tokens");
+        }
+    }
+
+    #[test]
+    fn test_tokenize_with_math_wide_variety() {
+        // Empty
+        assert!(tokenize_with_math("").is_empty());
+        // Whitespace only
+        assert!(tokenize_with_math("   \n  \t  ").is_empty());
+        // Numbers
+        let tokens = tokenize_with_math("42");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].1, "42");
+        // Mixed case
+        let tokens = tokenize_with_math("UPPER lower Mixed");
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0].1, "upper");
+        assert_eq!(tokens[1].1, "lower");
+        assert_eq!(tokens[2].1, "mixed");
+        // Unicode letters
+        let tokens = tokenize_with_math("café résumé");
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().any(|(_, t)| t == "café"));
+        assert!(tokens.iter().any(|(_, t)| t == "résumé"));
+        // Symbols (kept by \p{S})
+        let tokens = tokenize_with_math("x ∈ ℝ");
+        assert!(tokens.iter().any(|(_, t)| t == "x"));
+        assert!(tokens.iter().any(|(_, t)| t == "∈"));
+        assert!(tokens.iter().any(|(_, t)| t == "ℝ"));
+        // Punctuation stripped
+        let tokens = tokenize_with_math("hello, world! (yes)");
+        assert_eq!(tokens.len(), 3, "punctuation should be stripped");
+        assert_eq!(tokens[0].1, "hello");
+        assert_eq!(tokens[1].1, "world");
+        assert_eq!(tokens[2].1, "yes");
+    }
+
+    #[test]
+    fn test_tokenize_with_math_cached_does_not_affect_positions() {
+        // Positions should be 0-based consecutive regardless of caching
+        let tokens = tokenize_with_math("a b c d e");
+        assert_eq!(tokens.len(), 5);
+        for (i, (pos, text)) in tokens.iter().enumerate() {
+            assert_eq!(*pos, i, "position {} should be {}", i, i);
+            assert_eq!(text.as_str(), ["a", "b", "c", "d", "e"][i]);
+        }
+    }
+
+    // ── Regression: align_offsets_to_tantivy with cached tokenizer ──
+
+    #[test]
+    fn test_align_offsets_to_tantivy_trailing_unmatched() {
+        // WordPositions that extend beyond the token stream should be ignored
+        let wp = vec![
+            crate::extractor::WordPosition {
+                page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "hello".to_string(),
+            },
+            crate::extractor::WordPosition {
+                page: 1, x_min: 10.0, y_min: 0.0, x_max: 20.0, y_max: 10.0,
+                text: "world".to_string(),
+            },
+            crate::extractor::WordPosition {
+                page: 2, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "extra".to_string(),
+            },
+        ];
+        let aligned = align_offsets_to_tantivy("hello world", &wp);
+        assert_eq!(aligned.len(), 2, "trailing unmatched WordPositions should be dropped");
     }
 }

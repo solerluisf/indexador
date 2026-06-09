@@ -1,23 +1,21 @@
 <Page x:Class="PdfExplorer.Views.SettingsTab"
       xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-      Title="Settings">
+      Title="Settings"
+      Background="{DynamicResource PageBackground}" Foreground="{DynamicResource PageForeground}">
     <ScrollViewer Margin="10">
         <StackPanel>
 
-            <!-- Search defaults -->
-            <Expander Header="Search Defaults" IsExpanded="True">
+            <!-- Appearance -->
+            <Expander Header="Appearance" IsExpanded="True">
                 <StackPanel Margin="20,10">
-                    <Label Content="Fuzzy Distance" />
-                    <ComboBox x:Name="FuzzyDistance" SelectedIndex="0">
-                        <ComboBoxItem Content="Off" />
-                        <ComboBoxItem Content="Slight (1)" />
-                        <ComboBoxItem Content="Aggressive (2)" />
+                    <Label Content="Theme" />
+                    <ComboBox x:Name="ThemeSelector" SelectedIndex="0" Width="200" HorizontalAlignment="Left"
+                              SelectionChanged="OnThemeChanged">
+                        <ComboBoxItem Content="Light" />
+                        <ComboBoxItem Content="Dark" />
+                        <ComboBoxItem Content="Light Blue" />
                     </ComboBox>
-                    <CheckBox x:Name="StemEnabled" Content="Stemming" Margin="0,5,0,0" />
-                    <Label Content="Recency Weight" Margin="0,5,0,0" />
-                    <Slider x:Name="RecencyWeight" Minimum="0" Maximum="1" TickFrequency="0.1"
-                            Value="0" Width="300" HorizontalAlignment="Left" />
                 </StackPanel>
             </Expander>
 
@@ -46,6 +44,7 @@
                         <ComboBoxItem Content="512 MB" />
                         <ComboBoxItem Content="1 GB" />
                         <ComboBoxItem Content="2 GB" />
+                        <ComboBoxItem Content="3 GB" />
                         <ComboBoxItem Content="4 GB" />
                     </ComboBox>
                     <Label Content="Batch Size" />

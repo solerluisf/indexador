@@ -1,9 +1,23 @@
 use anyhow::{Context, Result};
 use image::GrayImage;
 use imageproc::geometric_transformations;
-use std::io::{BufRead, BufReader, Write};
+use std::ffi::OsStr;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+
+/// Create a Command that suppresses console window creation on Windows.
+/// On non-Windows platforms it behaves identically to `Command::new`.
+fn cmd_no_window<S: AsRef<OsStr>>(program: S) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_DEFAULT_ERROR_MODE
+        cmd.creation_flags(0x08000000 | 0x00000400 | 0x04000000);
+    }
+    cmd
+}
 
 fn find_worker_binary() -> Option<PathBuf> {
     let exe_name = if cfg!(windows) { "tesseract_worker.exe" } else { "tesseract_worker" };
@@ -65,6 +79,7 @@ const END_MARKER: &str = "---END---";
 pub(crate) struct WorkerProcess {
     stdin: ChildStdin,
     reader: BufReader<std::process::ChildStdout>,
+    stderr: Option<ChildStderr>,
     child: Child,
 }
 
@@ -73,14 +88,14 @@ impl WorkerProcess {
         let worker_bin = find_worker_binary()
             .context("Could not locate tesseract_worker.exe — ensure the binary is built")?;
 
-        let mut child = Command::new(&worker_bin)
+        let mut child = cmd_no_window(&worker_bin)
             .arg("--tesseract-path")
             .arg(tesseract_path)
             .arg("--lang")
             .arg(language)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .context(format!(
                 "Failed to spawn tesseract worker '{}'",
@@ -92,8 +107,9 @@ impl WorkerProcess {
         let stdout = child.stdout.take()
             .context("Failed to capture worker stdout")?;
         let reader = BufReader::new(stdout);
+        let stderr = child.stderr.take();
 
-        Ok(WorkerProcess { stdin, reader, child })
+        Ok(WorkerProcess { stdin, reader, stderr, child })
     }
 
     pub(crate) fn process(&mut self, image_path: &Path) -> Result<String> {
@@ -128,6 +144,13 @@ impl Drop for WorkerProcess {
         let _ = writeln!(self.stdin, "EXIT");
         let _ = self.stdin.flush();
         let _ = self.child.wait();
+        // Drain any stderr the worker wrote (e.g. Tesseract warnings/errors).
+        if let Some(ref mut stderr) = self.stderr {
+            let mut buf = String::new();
+            if stderr.read_to_string(&mut buf).is_ok() && !buf.trim().is_empty() {
+                eprintln!("[tesseract-worker stderr] {}", buf.trim());
+            }
+        }
     }
 }
 
@@ -309,7 +332,7 @@ fn otsu_threshold(img: &image::GrayImage) -> u8 {
 }
 
 pub(crate) fn run_tesseract(image_path: &Path, tesseract_path: &Path, language: &str) -> Result<String> {
-    let output = Command::new(tesseract_path)
+    let output = cmd_no_window(tesseract_path)
         .arg(image_path)
         .arg("stdout")
         .arg("-l")
@@ -354,7 +377,7 @@ pub fn find_tesseract() -> Option<PathBuf> {
     // Try `where` on Windows
     #[cfg(windows)]
     {
-        if let Ok(output) = std::process::Command::new("where").arg("tesseract").output() {
+        if let Ok(output) = cmd_no_window("where").arg("tesseract").output() {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).lines().next().map(|s| s.trim().to_string());
                 if let Some(p) = path {

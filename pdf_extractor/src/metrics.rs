@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 pub struct Metrics {
@@ -10,6 +10,7 @@ pub struct Metrics {
     indexer_last_commit_age: AtomicU64,
     search_count: AtomicU64,
     search_time_ns: AtomicU64,
+    indexer_failed: AtomicBool,
     start: Instant,
 }
 
@@ -24,12 +25,13 @@ impl Metrics {
             indexer_last_commit_age: AtomicU64::new(0),
             search_count: AtomicU64::new(0),
             search_time_ns: AtomicU64::new(0),
+            indexer_failed: AtomicBool::new(false),
             start: Instant::now(),
         }
     }
 
-    pub fn increment_processed(&self) {
-        self.docs_processed.fetch_add(1, Ordering::Relaxed);
+    pub fn increment_processed(&self) -> u64 {
+        self.docs_processed.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub fn increment_errored(&self) {
@@ -92,6 +94,13 @@ impl Metrics {
     pub fn log_summary(&self) {
     }
 
+    pub fn set_indexer_failed(&self) {
+        self.indexer_failed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn indexer_failed(&self) -> bool {
+        self.indexer_failed.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]

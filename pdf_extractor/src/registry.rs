@@ -68,24 +68,26 @@ impl CollectionRegistry {
             return Ok(id);
         }
 
-        let next_id: i64 = conn
-            .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM collections", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(1);
+        conn.execute(
+            "INSERT INTO collections (books_folder, label, data_dir) VALUES (?1, ?2, ?3)",
+            rusqlite::params![books_str, books_str, ""],
+        )
+        .context("Failed to insert collection")?;
 
-        let data_dir = self.base_dir.join(next_id.to_string());
+        let coll_id: i64 = conn.last_insert_rowid();
+
+        let data_dir = self.base_dir.join(coll_id.to_string());
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
         let data_str = data_dir.to_string_lossy().to_string();
 
         conn.execute(
-            "INSERT INTO collections (id, books_folder, label, data_dir) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![next_id, books_str, books_str, data_str],
+            "UPDATE collections SET data_dir = ?1 WHERE id = ?2",
+            rusqlite::params![data_str, coll_id],
         )
-        .context("Failed to insert collection")?;
+        .context("Failed to update collection data_dir")?;
 
-        Ok(next_id)
+        Ok(coll_id)
     }
 
     pub fn remove_collection(&self, id: i64) -> Result<()> {

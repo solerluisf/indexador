@@ -1,49 +1,77 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::bounded;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::panic;
-use crate::lang;
 use std::time::{Duration, Instant};
 
-use crate::extractor::extract_pdf;
+/// Create a Command that suppresses console window creation on Windows.
+/// On non-Windows platforms it behaves identically to `Command::new`.
+fn cmd_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_DEFAULT_ERROR_MODE
+        cmd.creation_flags(0x08000000 | 0x00000400 | 0x04000000);
+    }
+    cmd
+}
+
 use crate::indexer::align_offsets_to_tantivy;
 use crate::indexer::Indexer;
 use crate::metrics::Metrics;
-use crate::normalizer::normalize_text;
 use crate::ocr;
 use crate::output::{DocumentRecord, JsonlWriter};
 use crate::scanner::{scan_directory, JobStore};
+use crate::worker_ipc::WorkerFrame;
 
-const DEFAULT_CHANNEL_CAPACITY: usize = 500;
-const BATCH_SIZE: i64 = 100;
-const DEFAULT_INDEXER_BATCH_SIZE: usize = 500;
-const DEFAULT_COMMIT_INTERVAL: u64 = 5000;
+const DEFAULT_CHANNEL_CAPACITY: usize = 2048;
+const BATCH_SIZE: i64 = 20;
+const DEFAULT_INDEXER_BATCH_SIZE: usize = 2000;
+const DEFAULT_COMMIT_INTERVAL: u64 = 20000;
 const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 30;
 
 pub struct PipelineConfig {
     pub num_extract_workers: Option<usize>,
+    pub num_indexer_threads: Option<usize>,
     pub indexer_batch_size: Option<usize>,
     pub commit_interval: Option<u64>,
     pub commit_timeout: Option<u64>,
     pub channel_capacity: Option<usize>,
     pub progress_cb: Option<Box<dyn Fn(u64, u64) + Send>>,
-    pub cancel_flag: Option<&'static AtomicBool>,
+    pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// Path to the pdf_worker binary. When set, extraction runs in a
+    /// separate OS process per batch (PDFium is not thread-safe).
+    /// When None, extraction runs in-thread (the original behaviour).
+    pub worker_path: Option<PathBuf>,
+    /// Optional callback for log messages from the extraction pipeline.
+    /// Called with a UTF-8 byte pointer and length.  The callback must
+    /// copy the data before returning — the pointer is only valid for
+    /// the duration of the call.
+    pub log_cb: Option<extern "C" fn(*const u8, u32)>,
+    /// Optional callback for per‑process metrics (PID, state, memory).
+    /// Same calling convention as log_cb.
+    pub process_cb: Option<extern "C" fn(*const u8, u32)>,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             num_extract_workers: None,
+            num_indexer_threads: None,
             indexer_batch_size: None,
             commit_interval: None,
             commit_timeout: None,
             channel_capacity: None,
             progress_cb: None,
             cancel_flag: None,
+            worker_path: None,
+            log_cb: None,
+            process_cb: None,
         }
     }
 }
@@ -77,6 +105,12 @@ impl PipelineConfig {
         self.channel_capacity
             .map(|v| if v == 0 { 1 } else { v })
             .unwrap_or(DEFAULT_CHANNEL_CAPACITY)
+    }
+
+    pub fn indexer_threads(&self) -> usize {
+        self.num_indexer_threads
+            .map(|v| std::cmp::max(1, v))
+            .unwrap_or_else(|| num_cpus::get())
     }
 }
 
@@ -113,35 +147,43 @@ pub fn run_pipeline(
     indexer: Option<Arc<Indexer>>,
     config: &PipelineConfig,
 ) -> Result<()> {
+    let pipeline_start = Instant::now();
     let _scanned = scan_directory(&jobs, input)?;
-
 
     let pending = jobs.count_pending()?;
     if pending == 0 {
-
         return Ok(());
     }
 
+    // Worker binary is mandatory — in-thread extraction is unsafe (PDFium is not thread-safe).
+    let _worker_path = config
+        .worker_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!(
+            "worker_path is required: pdf_worker.exe must be deployed alongside the library. \
+             Run 'cargo build -p pdf_extractor --bin pdf_worker' to build it."
+        ))?;
 
     let cap = config.channel_cap();
-    let (task_tx, task_rx) = bounded::<ExtractorTask>(cap);
+    let (task_tx, task_rx) = bounded::<Vec<ExtractorTask>>(cap);
     let (result_tx, result_rx) = bounded::<DocumentRecord>(cap);
 
     let num_workers = config.extract_workers();
     let indexer_batch_size = config.indexer_batch();
     let commit_interval = config.commit_int();
     let commit_timeout = config.commit_to();
+    let indexer_threads = config.indexer_threads();
 
 
-    // Producer: claim pending jobs from DB and send to task channel
+    // Producer: claim pending jobs from DB and send batches to task channel.
+    // Batching reduces channel lock contention vs one send() per task.
     let producer_jobs = Arc::clone(&jobs);
     let producer_metrics = Arc::clone(&metrics);
-    let producer_cancel = config.cancel_flag;
+    let producer_cancel = config.cancel_flag.clone();
     let producer_handle = {
         thread::spawn(move || {
             loop {
-                if producer_cancel.map_or(false, |f| f.load(Ordering::Relaxed)) {
-
+                if producer_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
                     break;
                 }
                 match producer_jobs.claim_pending(BATCH_SIZE) {
@@ -149,14 +191,13 @@ pub fn run_pipeline(
                         if batch.is_empty() {
                             break;
                         }
-                        for (id, path, checksum) in batch {
-                            producer_metrics.set_task_queue_depth(task_tx.len() as u64);
-                            if task_tx
-                                .send(ExtractorTask { id, path, checksum })
-                                .is_err()
-                            {
-                                return;
-                            }
+                        let tasks: Vec<ExtractorTask> = batch
+                            .into_iter()
+                            .map(|(id, path, checksum)| ExtractorTask { id, path, checksum })
+                            .collect();
+                        producer_metrics.set_task_queue_depth(task_tx.len() as u64);
+                        if task_tx.send(tasks).is_err() {
+                            return;
                         }
                     }
                     Err(_e) => {
@@ -167,66 +208,27 @@ pub fn run_pipeline(
         })
     };
 
-    // Workers: extract PDFs in parallel
+    let log_cb = config.log_cb;
+    let process_cb = config.process_cb;
+
+    // Workers: extract PDFs via OS process per batch
+    // (full process isolation so PDFium cannot corrupt shared state).
     let mut worker_handles = Vec::new();
     for i in 0..num_workers {
         let task_rx = task_rx.clone();
         let result_tx = result_tx.clone();
         let worker_jobs = Arc::clone(&jobs);
         let worker_metrics = Arc::clone(&metrics);
+        let worker_path = config.worker_path.clone();
+        let wp = worker_path.expect("worker_path validated above");
+        let worker_cancel = config.cancel_flag.clone();
         let handle = thread::Builder::new()
             .name(format!("extract-{}", i))
             .spawn(move || {
-                for task in &task_rx {
-                    let task_path = task.path.clone();
-                    let task_id = task.id;
-                    let task_checksum = task.checksum.clone();
-                    let extraction_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        let path_obj = PathBuf::from(&task_path);
-                        extract_pdf(&path_obj)
-                    }));
-                    match extraction_result {
-                        Ok(Ok(extraction)) => {
-                            let normalized = if !extraction.ocr_flag {
-                                normalize_text(&extraction.text)
-                            } else {
-                                String::new()
-                            };
-                            let math_source =
-                                crate::math_tokenizer::extract_math_source(&extraction.text);
-                            let record = DocumentRecord {
-                                id: task_id,
-                                path: task_path,
-                                checksum: task_checksum,
-                                ocr_flag: extraction.ocr_flag,
-                                language: lang::detect_language(&extraction.text),
-                                math_source,
-                                text: normalized,
-                                word_positions: extraction.word_positions,
-                            };
-                            if result_tx.send(record).is_err() {
-                                return;
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            worker_jobs
-                                .mark_error(task_id, &format!("{}", e))
-                                .ok();
-                            worker_metrics.increment_errored();
-                        }
-                        Err(panic_payload) => {
-                            let msg = panic_payload
-                                .downcast_ref::<&str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "Unknown panic".to_string());
-                            worker_jobs
-                                .mark_error(task_id, &format!("panic: {}", msg))
-                                .ok();
-                            worker_metrics.increment_errored();
-                        }
-                    }
-                }
+                run_extraction_process(
+                    &wp, &task_rx, &result_tx, &worker_jobs, &worker_metrics,
+                    worker_cancel, log_cb, process_cb,
+                );
             })
             .expect("Failed to spawn worker thread");
         worker_handles.push(handle);
@@ -243,10 +245,11 @@ pub fn run_pipeline(
         Some(ref idx) => {
             let idx = Arc::clone(idx);
             let metrics_for_indexer = Arc::clone(&metrics);
+            let jobs_for_indexer = Arc::clone(&jobs);
             let handle = thread::Builder::new()
                 .name("indexer".into())
                 .spawn(move || {
-                    indexer_thread(&*idx, index_rx, &metrics_for_indexer, indexer_batch_size, commit_interval, commit_timeout);
+                    indexer_thread(&*idx, jobs_for_indexer, index_rx, &metrics_for_indexer, indexer_batch_size, commit_interval, commit_timeout, indexer_threads, log_cb);
                 })
                 .expect("Failed to spawn indexer thread");
             Some(handle)
@@ -256,10 +259,13 @@ pub fn run_pipeline(
 
     let total_pending = pending as u64;
     let progress_cb = &config.progress_cb;
-    let cancel_flag = config.cancel_flag;
+    let cancel_flag = config.cancel_flag.clone();
 
     // Writer: consume results and persist
-    let is_cancelled = || cancel_flag.map_or(false, |f| f.load(Ordering::Relaxed));
+    let is_cancelled = move || cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed));
+
+    // Throttle progress callback to at most once per 100 docs to reduce FFI overhead.
+    let progress_throttle = 100u64;
 
     macro_rules! process_record {
         ($record:expr) => {{
@@ -271,15 +277,17 @@ pub fn run_pipeline(
                 metrics.increment_errored();
                 continue;
             }
-            jobs.mark_done(record.id, record.ocr_flag).ok();
-            metrics.increment_processed();
+            let processed = metrics.increment_processed();
 
             if may_index && index_tx.send(record).is_err() {
 
             }
 
             if let Some(ref cb) = progress_cb {
-                cb(metrics.processed(), total_pending);
+                let done = processed + metrics.errored();
+                if done % progress_throttle == 0 || done >= total_pending {
+                    cb(done, total_pending);
+                }
             }
             metrics.log_summary();
         }};
@@ -334,25 +342,48 @@ pub fn run_pipeline(
         h.join().expect("Indexer panicked");
     }
 
+    // Reset any tasks still in 'extracting' back to 'pending'.
+    // These are PDFs the worker did not get to process before crashing.
+    // Must run before the indexer-failed bail so stuck jobs are recoverable.
+    jobs.reprocess_extracting()?;
+
+    let processed = metrics.processed();
+    let errored = metrics.errored();
+    let elapsed = format_uptime(pipeline_start.elapsed());
+    log_msg(log_cb, &format!(
+        "[pipeline] done — {} total ({:?} processed, {:?} errored) in {}",
+        processed + errored, processed, errored, elapsed
+    ));
+
+    if metrics.indexer_failed() {
+        anyhow::bail!("Indexer failed to initialize — Tantivy index writer could not be created. Check disk space, permissions, and index integrity.");
+    }
+
     Ok(())
 }
 
 fn indexer_thread(
     indexer: &Indexer,
+    jobs: Arc<JobStore>,
     rx: crossbeam_channel::Receiver<DocumentRecord>,
     metrics: &Metrics,
     batch_size: usize,
     commit_interval: u64,
     commit_timeout: u64,
+    num_threads: usize,
+    log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) {
-    let index_writer = match indexer.search_index().writer() {
+    let index_writer = match indexer.search_index().writer_with_num_threads(num_threads) {
         Ok(w) => w,
-        Err(_e) => {
+        Err(e) => {
+            log_msg(log_cb, &format!("[indexer_thread] failed to create index writer: {}", e));
+            metrics.set_indexer_failed();
             return;
         }
     };
 
     let mut buf: Vec<DocumentRecord> = Vec::with_capacity(batch_size);
+    let mut done_ids: Vec<(i64, bool)> = Vec::new();
     let mut doc_count: u64 = 0;
     let mut last_commit = Instant::now();
     let writer = std::sync::Mutex::new(index_writer);
@@ -365,7 +396,7 @@ fn indexer_thread(
                 buf.push(record);
                 if buf.len() >= batch_size {
                     let batch: Vec<DocumentRecord> = buf.drain(..).collect();
-                    flush_batch(&writer, indexer, &batch);
+                    flush_batch(&writer, indexer, &mut done_ids, &batch, log_cb);
                     doc_count += batch.len() as u64;
                 }
             }
@@ -373,16 +404,23 @@ fn indexer_thread(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 if !buf.is_empty() {
                     let batch: Vec<DocumentRecord> = buf.drain(..).collect();
-                    flush_batch(&writer, indexer, &batch);
+                    flush_batch(&writer, indexer, &mut done_ids, &batch, log_cb);
                 }
                 break;
             }
         }
 
-        let should_commit = !buf.is_empty()
+        let should_commit = !done_ids.is_empty()
             && (doc_count >= commit_interval
                 || last_commit.elapsed() > Duration::from_secs(commit_timeout));
         if should_commit {
+            // Mark jobs done in SQLite FIRST, then commit Tantivy.
+            // Ordering: if we crash between mark_done and w.commit(), we lose
+            // that batch from search (minor) instead of creating duplicate
+            // Tantivy documents (corruption).
+            let _ = jobs.batch_mark_done(&done_ids);
+            done_ids.clear();
+
             if let Ok(mut w) = writer.lock() {
                 if w.commit().is_ok() {
                     let total = indexer.metrics().docs_indexed();
@@ -391,7 +429,14 @@ fn indexer_thread(
 
                     last_commit = Instant::now();
                     doc_count = 0;
+                } else {
+                    log_msg(log_cb, &format!(
+                        "[indexer_thread] commit failed — Tantivy could not persist {} docs. Check disk space and index integrity.",
+                        done_ids.len()
+                    ));
                 }
+            } else {
+                log_msg(log_cb, "[indexer_thread] commit skipped — writer mutex poisoned");
             }
         }
 
@@ -399,53 +444,61 @@ fn indexer_thread(
         metrics.set_indexer_last_commit_age(last_commit.elapsed().as_secs());
     }
 
-    // Final commit
+    // Mark remaining jobs done first, then final commit.
+    if !done_ids.is_empty() {
+        jobs.batch_mark_done(&done_ids).ok();
+    }
     if let Ok(mut w) = writer.lock() {
-        w.commit().ok();
-        let total = indexer.metrics().docs_indexed();
-        metrics.set_indexer_docs_indexed(total);
-        metrics.set_indexer_last_commit_age(0);
+        if w.commit().is_ok() {
+            done_ids.clear();
+
+            let total = indexer.metrics().docs_indexed();
+            metrics.set_indexer_docs_indexed(total);
+            metrics.set_indexer_last_commit_age(0);
+        } else {
+            log_msg(log_cb, "[indexer_thread] final commit failed — some indexed documents may not be searchable");
+        }
+    } else {
+        log_msg(log_cb, "[indexer_thread] final commit skipped — writer mutex poisoned");
     };
 }
 
 fn flush_batch(
     writer: &std::sync::Mutex<tantivy::IndexWriter>,
     indexer: &Indexer,
+    done_ids: &mut Vec<(i64, bool)>,
     batch: &[DocumentRecord],
+    log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) {
     let mut w = match writer.lock() {
         Ok(w) => w,
-        Err(_) => return,
+        Err(_) => {
+            log_msg(log_cb, "[flush_batch] writer mutex poisoned — skipping batch");
+            return;
+        }
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     for record in batch {
-        let math_source = record.math_source.as_deref().unwrap_or("");
-        if let Err(_e) = indexer.search_index().add_document_with_ts(
+        if let Err(e) = indexer.search_index().add_document(
             &mut w,
             record.id,
             &record.path,
-            &record.checksum,
             &record.text,
-            &record.text,
-            record.language.as_deref().unwrap_or(""),
-            math_source,
-            now,
+            None,
         ) {
-
+            log_msg(log_cb, &format!(
+                "[flush_batch] add_document failed for id={} path='{}': {}",
+                record.id, record.path, e
+            ));
         } else {
             indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+            done_ids.push((record.id, record.ocr_flag));
 
-        // Store word bounding-box positions with Tantivy-aligned offsets
-        if !record.word_positions.is_empty() {
-            let positions_with_offsets: Vec<(usize, crate::extractor::WordPosition)> =
-                align_offsets_to_tantivy(&record.text, &record.word_positions);
-
-            if let Ok(store) = indexer.position_store.lock() {
-                if let Err(_e) = store.store_positions(record.id, &positions_with_offsets) {
+            if !record.word_positions.is_empty() {
+                let aligned = align_offsets_to_tantivy(&record.text, &record.word_positions);
+                if !aligned.is_empty() {
+                    if let Ok(pos_store) = indexer.position_store.lock() {
+                        let _ = pos_store.store_positions(record.id, &aligned);
+                    }
                 }
             }
         }
@@ -463,13 +516,15 @@ fn resolve_ocr_workers(override_val: Option<usize>) -> usize {
 
 pub fn run_ocr_post_processing(
     jobs: Arc<JobStore>,
+    indexer: Option<Arc<Indexer>>,
     ocr_config: &ocr::OcrConfig,
     output_path: Option<PathBuf>,
     num_workers_override: Option<usize>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) -> Result<u64> {
     let num_workers = resolve_ocr_workers(num_workers_override);
     let max_retries = ocr_config.max_retries;
-    let ocr_language = ocr_config.language.clone();
 
     let pending = jobs.count_ocr_pending(max_retries)?;
     if pending == 0 {
@@ -489,14 +544,33 @@ pub fn run_ocr_post_processing(
     let (ocr_tx, ocr_rx) = bounded::<(i64, String, String)>(100);
     let (result_tx, result_rx) = bounded::<(i64, String, String, String)>(100);
 
+    // Clone cancel_flag for the consumer thread; the original is kept
+    // for the worker threads below.
+    let consumer_cancel = cancel_flag.clone();
+
     // Consumer thread: process results immediately so mark_ocr_attempt
     // runs as soon as OCR text arrives, preventing producer re-fetches.
     let consumer_jobs = Arc::clone(&jobs);
     let consumer_writer = jsonl_writer.clone();
+    let consumer_indexer = indexer.clone();
+    let consumer_log_cb = log_cb;
     let consumer_handle = thread::spawn(move || {
         let mut ocr_processed: u64 = 0;
         let mut ocr_errored: u64 = 0;
+
+        // Create Tantivy IndexWriter for OCR re-indexing
+        let mut index_writer = consumer_indexer.as_ref().and_then(|idx| {
+            let result = idx.search_index().writer_with_num_threads(1);
+            if result.is_err() {
+                log_msg(consumer_log_cb, "[ocr-consumer] failed to create Tantivy IndexWriter for OCR re-indexing");
+            }
+            result.ok()
+        });
+
         for (id, path, checksum, ocr_text) in &result_rx {
+            if consumer_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+                break;
+            }
             if ocr_text.is_empty() {
                 consumer_jobs.mark_ocr_attempt(id, false, Some("OCR returned empty text"), max_retries).ok();
                 ocr_errored += 1;
@@ -506,43 +580,67 @@ pub fn run_ocr_post_processing(
             consumer_jobs.mark_ocr_attempt(id, true, None, max_retries).ok();
 
             if let Some(ref writer) = consumer_writer {
-                let math_source =
-                    crate::math_tokenizer::extract_math_source(ocr_text.as_str());
                 let record = DocumentRecord {
                     id,
                     path: path.clone(),
                     checksum: checksum.clone(),
                     ocr_flag: false,
-                    language: Some(ocr_language.clone()),
-                    math_source,
                     text: ocr_text.clone(),
                     word_positions: Vec::new(),
                 };
-                if let Err(_e) = writer.write_record(&record) {
+                if let Err(e) = writer.write_record(&record) {
+                    log_msg(consumer_log_cb, &format!(
+                        "[ocr-consumer] JSONL write failed for id={}: {}", id, e
+                    ));
+                }
+            }
+
+            // Re-index OCR text into Tantivy (delete stale empty-text doc first)
+            if let (Some(idx), Some(w)) = (consumer_indexer.as_ref(), index_writer.as_mut()) {
+                let term = tantivy::Term::from_field_u64(idx.search_index().id_field, id as u64);
+                w.delete_term(term);
+                let math_source = crate::math_tokenizer::extract_math_source(&ocr_text);
+                if let Err(e) = idx.search_index().add_document(
+                    w, id, &path, &ocr_text,
+                    math_source.as_deref(),
+                ) {
+                    log_msg(consumer_log_cb, &format!(
+                        "[ocr-consumer] add_document_with_ts failed for id={} path='{}': {}",
+                        id, path, e
+                    ));
                 }
             }
         }
+
+        if let Some(ref mut w) = index_writer {
+            if let Err(e) = w.commit() {
+                log_msg(consumer_log_cb, &format!(
+                    "[ocr-consumer] final commit failed: {}", e
+                ));
+            }
+        }
+
         (ocr_processed, ocr_errored)
     });
 
-    // Producer: fetch OCR-needed docs and send each unique job ID
-    // exactly once. A local HashSet prevents re-sending even if the
-    // database hasn't been updated yet (consumer thread scheduling lag).
-    // The producer exits after one batch — in-flight jobs are processed
-    // by workers and the consumer; remaining pending jobs wait for the
-    // next CLI invocation.
+    // Producer: fetch OCR-needed docs in batches of 100 and drain the
+    // entire queue. A local HashSet prevents re-sending an ID that was
+    // already dispatched but not yet consumed (consumer thread scheduling
+    // lag means the DB may not reflect the attempt yet).
     let producer_jobs = Arc::clone(&jobs);
     let producer_handle = thread::spawn(move || {
         let mut sent_ids = HashSet::new();
-        match producer_jobs.fetch_ocr_needed(100, max_retries) {
-            Ok(batch) => {
-                for (id, path, checksum) in deduplicate_ocr_batch(batch, &mut sent_ids) {
-                    if ocr_tx.send((id, path, checksum)).is_err() {
-                        return;
+        loop {
+            match producer_jobs.fetch_ocr_needed(100, max_retries) {
+                Ok(batch) if batch.is_empty() => break,
+                Ok(batch) => {
+                    for (id, path, checksum) in deduplicate_ocr_batch(batch, &mut sent_ids) {
+                        if ocr_tx.send((id, path, checksum)).is_err() {
+                            return;
+                        }
                     }
                 }
-            }
-            Err(_e) => {
+                Err(_e) => break,
             }
         }
         drop(ocr_tx);
@@ -572,11 +670,15 @@ pub fn run_ocr_post_processing(
         };
         let mut worker = pool.take_worker()
             .expect("Not enough workers in pool");
+        let worker_cancel = cancel_flag.clone();
 
         let handle = thread::Builder::new()
             .name(format!("ocr-{}", i))
             .spawn(move || {
                 for (id, path_str, checksum) in &rx {
+                    if worker_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+                        break;
+                    }
                     let path_obj = PathBuf::from(&path_str);
                     let ocr_result = run_single_ocr(&path_obj, &cfg, Some(&mut worker));
                     match ocr_result {
@@ -620,13 +722,6 @@ pub fn run_ocr_post_processing(
 /// When `worker` is `Some`, uses a persistent worker process (avoids per-call `tesseract.exe` spawn).
 /// When `None`, falls back to a fresh `Command::new(tesseract_path)` for each call.
 fn run_single_ocr(path: &Path, config: &ocr::OcrConfig, mut worker: Option<&mut ocr::WorkerProcess>) -> Result<String> {
-    // First try to extract text natively (in case PDF has text but was not extracted before)
-    if let Ok(result) = extract_pdf(path) {
-        if !result.text.is_empty() && !result.ocr_flag {
-            return Ok(result.text);
-        }
-    }
-
     // For image-based PDFs, need a PDF renderer.
     let temp_dir = tempfile::tempdir().context("Failed to create temp dir for OCR")?;
     let page_count = get_pdf_page_count(path).unwrap_or(1);
@@ -678,7 +773,7 @@ fn run_single_ocr(path: &Path, config: &ocr::OcrConfig, mut worker: Option<&mut 
 /// Try to determine the number of pages in a PDF using available tools.
 /// Tries `mutool info` and `pdfinfo`, falling back to 1.
 fn get_pdf_page_count(pdf_path: &Path) -> Result<u32> {
-    if let Ok(output) = std::process::Command::new("mutool")
+    if let Ok(output) = cmd_no_window("mutool")
         .args(["info"])
         .arg(pdf_path)
         .output()
@@ -688,7 +783,7 @@ fn get_pdf_page_count(pdf_path: &Path) -> Result<u32> {
         }
     }
 
-    if let Ok(output) = std::process::Command::new("pdfinfo")
+    if let Ok(output) = cmd_no_window("pdfinfo")
         .arg(pdf_path)
         .output()
     {
@@ -715,7 +810,7 @@ fn extract_page_count_from_stdout(stdout: &str) -> Option<u32> {
 fn render_pdf_page(pdf_path: &Path, page_num: u32, output_image: &Path) -> Result<bool> {
     // Try `mutool draw` (MuPDF)
     let page_str = page_num.to_string();
-    if let Ok(output) = std::process::Command::new("mutool")
+    if let Ok(output) = cmd_no_window("mutool")
         .args(["draw", "-o"])
         .arg(output_image)
         .args(["-r", "300"])
@@ -730,7 +825,7 @@ fn render_pdf_page(pdf_path: &Path, page_num: u32, output_image: &Path) -> Resul
 
     // Try `pdftoppm` (poppler)
     let ppm_path = output_image.with_extension("ppm");
-    if let Ok(output) = std::process::Command::new("pdftoppm")
+    if let Ok(output) = cmd_no_window("pdftoppm")
         .args(["-r", "300", "-gray", "-f", &page_str, "-l", &page_str, "-singlefile"])
         .arg(pdf_path)
         .arg(&ppm_path.with_extension(""))
@@ -758,9 +853,595 @@ fn deduplicate_ocr_batch(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Process-based extraction worker (full OS process isolation)
+// ---------------------------------------------------------------------------
+
+/// Collect exactly one batch from the producer channel.
+fn collect_batch(
+    task_rx: &crossbeam_channel::Receiver<Vec<ExtractorTask>>,
+) -> Vec<ExtractorTask> {
+    match task_rx.recv() {
+        Ok(tasks) => tasks,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Read one length-prefixed bincode WorkerFrame from a buffered reader.
+fn read_frame<R: io::Read>(reader: &mut io::BufReader<R>) -> io::Result<WorkerFrame> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut data = vec![0u8; len];
+    reader.read_exact(&mut data)?;
+    bincode::deserialize(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// After a worker crash, drain all complete frames from the stdout pipe buffer.
+/// The worker flushes each frame immediately after writing, so frames for
+/// already-processed documents are always complete in the pipe.
+/// Recovered frames are forwarded to `result_tx` / `jobs.mark_error`.
+/// Returns `(success_count, error_count)` of recovered frames.
+fn drain_crash_frames<R: io::Read>(
+    reader: &mut io::BufReader<R>,
+    path_map: &HashMap<String, (i64, String)>,
+    result_tx: &crossbeam_channel::Sender<DocumentRecord>,
+    jobs: &Arc<JobStore>,
+    metrics: &Arc<Metrics>,
+) -> (usize, usize) {
+    let mut ok = 0usize;
+    let mut err = 0usize;
+    loop {
+        let frame = match read_frame(reader) {
+            Ok(f) => f,
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(_) => break,
+        };
+        match frame {
+            WorkerFrame::Success(wo) => {
+                if let Some(&(id, ref checksum)) = path_map.get(&wo.path) {
+                    let record = DocumentRecord {
+                        id,
+                        path: wo.path,
+                        checksum: checksum.clone(),
+                        ocr_flag: wo.ocr_flag,
+                        text: wo.text,
+                        word_positions: wo.word_positions,
+                    };
+                    let _ = result_tx.send(record);
+                    ok += 1;
+                }
+            }
+            WorkerFrame::Error { path, message } => {
+                if let Some(&(id, _)) = path_map.get(&path) {
+                    jobs.mark_error(id, &message).ok();
+                    metrics.increment_errored();
+                    err += 1;
+                }
+            }
+        }
+    }
+    (ok, err)
+}
+
+/// Long-lived extraction worker per thread.
+///
+/// Spawns ONE pdf_worker.exe and feeds it paths in mini-batches.
+/// Each mini-batch writes ALL paths to stdin in one burst (minimising
+/// context switches), then reads ALL response frames sequentially.
+///
+/// If the worker crashes mid-batch, buffered frames from completed
+/// documents are drained before exit so they aren't silently lost.
+/// Un-accounted tasks stay in 'extracting' status; the pipeline's
+/// final `reprocess_extracting` step resets them to 'pending'.
+fn run_extraction_process(
+    worker_path: &Path,
+    task_rx: &crossbeam_channel::Receiver<Vec<ExtractorTask>>,
+    result_tx: &crossbeam_channel::Sender<DocumentRecord>,
+    jobs: &Arc<JobStore>,
+    metrics: &Arc<Metrics>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    log_cb: Option<extern "C" fn(*const u8, u32)>,
+    process_cb: Option<extern "C" fn(*const u8, u32)>,
+) {
+    let is_cancelled = || cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed));
+    // --- spawn ONE worker for this extractor thread's lifetime ---
+    if !worker_path.exists() {
+        drain_all_for_error(task_rx, |t| {
+            jobs.mark_error(t.id, &format!("worker not found: {}", worker_path.display())).ok();
+            metrics.increment_errored();
+        });
+        return;
+    }
+    let mut child = match cmd_no_window(worker_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            drain_all_for_error(task_rx, |t| {
+                jobs.mark_error(t.id, &format!("worker launch failed [{}]: {}", worker_path.display(), e)).ok();
+                metrics.increment_errored();
+            });
+            return;
+        }
+    };
+
+    let pid = child.id();
+    let thread_name = thread::current().name().unwrap_or("?").to_string();
+    report_process(process_cb, &thread_name, pid, "started", None, "");
+
+    let mut child_stdin = child.stdin.take().expect("stdin piped");
+    let child_stdout = child.stdout.take().expect("stdout piped");
+    let mut stdout_reader = io::BufReader::new(child_stdout);
+    let mut batch_count: u64 = 0;
+    let worker_start = Instant::now();
+    let mut files_ok: u64 = 0;
+    let mut files_err: u64 = 0;
+
+    'outer: loop {
+        batch_count += 1;
+        if batch_count % 5 == 0 {
+            let mem = proc_mon::working_set_mib(pid);
+            report_process(process_cb, &thread_name, pid, "running", mem, "");
+        }
+
+        let batch = collect_batch(task_rx);
+        if batch.is_empty() {
+            break;
+        }
+
+        // Build path → (id, checksum) lookup table ONCE per batch
+        let mut path_map: HashMap<String, (i64, String)> = HashMap::with_capacity(batch.len());
+        for task in &batch {
+            path_map.insert(task.path.clone(), (task.id, task.checksum.clone()));
+        }
+
+        if is_cancelled() {
+            log_msg(log_cb, &format!("[extraction] {} — cancel requested, killing worker", thread_name));
+            let _ = child.kill();
+            break;
+        }
+
+        // --- Phase 1: write ALL paths to stdin in one burst ---
+        for task in &batch {
+            if is_cancelled() {
+                log_msg(log_cb, &format!("[extraction] {} — cancel during stdin write, killing worker", thread_name));
+                let _ = child.kill();
+                break 'outer;
+            }
+            if writeln!(child_stdin, "{}", task.path).is_err() {
+                // Worker died during Phase 1. Frames for paths that were
+                // already written to stdin and processed are in the stdout
+                // pipe buffer — drain them so they aren't silently lost.
+                let (recovered_ok, recovered_err) =
+                    drain_crash_frames(&mut stdout_reader, &path_map, result_tx, jobs, metrics);
+                files_err += recovered_err as u64;
+                let msg = format!(
+                    "[extraction] worker stdin write failed on '{}' — drained {} success + {} error frames from buffer",
+                    task.path, recovered_ok, recovered_err
+                );
+                log_msg(log_cb, &msg);
+                break 'outer;
+            }
+        }
+        let _ = child_stdin.flush();
+
+        // --- Phase 2: read ALL response frames ---
+        for (task_idx, task) in batch.iter().enumerate() {
+            if is_cancelled() {
+                let msg = format!(
+                    "[extraction] {} — cancel during frame read on batch[{}] '{}', killing worker",
+                    thread_name, task_idx, task.path
+                );
+                log_msg(log_cb, &msg);
+                let _ = child.kill();
+                // Drain any frames already buffered before exit
+                let (_recovered_ok, recovered_err) =
+                    drain_crash_frames(&mut stdout_reader, &path_map, result_tx, jobs, metrics);
+                files_err += recovered_err as u64;
+                for remaining in &batch[task_idx..] {
+                    jobs.mark_error(remaining.id, "cancelled").ok();
+                    metrics.increment_errored();
+                }
+                break 'outer;
+            }
+            let frame = match read_frame(&mut stdout_reader) {
+                Ok(f) => f,
+                Err(e) => {
+                    // Worker died mid-Phase 2. Drain any frames the worker
+                    // wrote before crashing (worker processes asynchronously
+                    // and may have completed several docs ahead of our reads).
+                    let (recovered_ok, recovered_err) =
+                        drain_crash_frames(&mut stdout_reader, &path_map, result_tx, jobs, metrics);
+                    files_err += recovered_err as u64;
+                    let uptime = format_uptime(worker_start.elapsed());
+                    let msg = format!(
+                        "[extraction] read_frame failed on batch[{}] '{}': {} — drained {} success + {} error frames (uptime {}, {} ok, {} err)",
+                        task_idx, task.path, e, recovered_ok, recovered_err, uptime, files_ok, files_err
+                    );
+                    log_msg(log_cb, &msg);
+                    // Mark remaining tasks as errored so they aren't stuck.
+                    for remaining in &batch[task_idx..] {
+                        jobs.mark_error(remaining.id, "worker crashed").ok();
+                        metrics.increment_errored();
+                    }
+                    break 'outer;
+                }
+            };
+            match frame {
+                WorkerFrame::Success(wo) => {
+                    let record = DocumentRecord {
+                        id: task.id,
+                        path: wo.path,
+                        checksum: task.checksum.clone(),
+                        ocr_flag: wo.ocr_flag,
+                        text: wo.text,
+                        word_positions: wo.word_positions,
+                    };
+                    if result_tx.send(record).is_err() {
+                        // Cannot send downstream — pipeline shutting down.
+                        // Drain any frames already buffered.
+                let (_recovered_ok, recovered_err) =
+                            drain_crash_frames(&mut stdout_reader, &path_map, result_tx, jobs, metrics);
+                        files_err += recovered_err as u64;
+                        let msg = format!(
+                            "[extraction] pipeline disconnected while reading '{}' — drained {} success + {} error frames",
+                            task.path, _recovered_ok, recovered_err
+                        );
+                        log_msg(log_cb, &msg);
+                        // Mark rest of batch as errored so they aren't stuck.
+                        for remaining in &batch[task_idx..] {
+                            jobs.mark_error(remaining.id, "pipeline disconnected").ok();
+                            metrics.increment_errored();
+                        }
+                        break 'outer;
+                    }
+                    files_ok += 1;
+                }
+                WorkerFrame::Error { path: _, message } => {
+                    jobs.mark_error(task.id, &message).ok();
+                    metrics.increment_errored();
+                    files_err += 1;
+                }
+            }
+        }
+    }
+
+    // --- cleanup ---
+    drop(child_stdin);
+
+    // Collect stderr the worker wrote before exiting (e.g. panic messages,
+    // PDFium errors, abort traces). The pipe buffer is small, so we read it
+    // AFTER dropping stdin to avoid deadlocking.
+    let stderr_dump = child.stderr.take().and_then(|stderr| {
+        let mut buf = String::new();
+        io::BufReader::new(stderr).read_to_string(&mut buf).ok().map(|_| buf)
+    });
+
+    let (exit_code, wait_err) = match child.wait() {
+        Ok(status) if status.success() => {
+            (None, None)
+        }
+        Ok(status) => {
+            (status.code(), None)
+        }
+        Err(e) => {
+            (None, Some(e))
+        }
+    };
+
+    let uptime = format_uptime(worker_start.elapsed());
+    let base_info = format!("{} (uptime {}, {} ok, {} err)", thread_name, uptime, files_ok, files_err);
+
+    let final_state = if let Some(code) = exit_code {
+        let exit_str = format_exit_code(code);
+        let stderr_snippet = stderr_dump
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("\n  stderr: {}", s.trim()))
+            .unwrap_or_default();
+        let msg = format!(
+            "[extraction] worker {} — {}{}",
+            base_info, exit_str, stderr_snippet
+        );
+        log_msg(log_cb, &msg);
+        exit_str
+    } else if let Some(e) = wait_err {
+        let stderr_snippet = stderr_dump
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("\n  stderr: {}", s.trim()))
+            .unwrap_or_default();
+        let msg = format!(
+            "[extraction] failed to wait on {}: {}{}",
+            base_info, e, stderr_snippet
+        );
+        log_msg(log_cb, &msg);
+        "crashed".to_string()
+    } else {
+        "exited(0)".to_string()
+    };
+
+    let mem = proc_mon::working_set_mib(pid);
+    let stderr_snippet = stderr_dump
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            let trimmed = s.trim();
+            if trimmed.len() > 120 { &trimmed[..120] } else { trimmed }
+        })
+        .unwrap_or("");
+    let stderr_part = if stderr_snippet.is_empty() {
+        String::new()
+    } else {
+        format!(" | stderr: {}", stderr_snippet)
+    };
+    let extra = format!("{} ok, {} err, uptime {}{}",
+        files_ok, files_err, uptime, stderr_part);
+    report_process(process_cb, &thread_name, pid, &final_state, mem, &extra);
+}
+
+/// Format a Duration as a human-readable uptime string.
+fn format_uptime(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// Send a log message to the optional C callback, falling back to stderr.
+fn log_msg(log_cb: Option<extern "C" fn(*const u8, u32)>, msg: &str) {
+    match log_cb {
+        Some(cb) => {
+            let bytes = msg.as_bytes();
+            cb(bytes.as_ptr(), bytes.len() as u32);
+        }
+        None => eprintln!("{}", msg),
+    }
+}
+
+/// Map a Windows NTSTATUS exit code to a human-readable description.
+/// On non-Windows, shows the raw code in decimal.
+fn describe_exit_code(code: i32) -> String {
+    #[cfg(windows)]
+    {
+        match code as u32 {
+            0xC0000005 => "0xC0000005 ACCESS_VIOLATION (segfault)".into(),
+            0xC0000017 => "0xC0000017 NO_MEMORY — probable OOM".into(),
+            0xC000009A => "0xC000009A INSUFFICIENT_RESOURCES — probable OOM".into(),
+            0xC00000D5 => "0xC00000D5 COMMITMENT_LIMIT — probable OOM".into(),
+            0xC000013A => "0xC000013A CONTROL_C_EXIT (user interrupted)".into(),
+            0xC0000142 => "0xC0000142 DLL_INIT_FAILED".into(),
+            0xC0000409 => "0xC0000409 STACK_BUFFER_OVERRUN".into(),
+            _ => format!("0x{:08X}", code as u32),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        format!("{}", code)
+    }
+}
+
+/// Prepend `describe_exit_code` info if the code is a known NTSTATUS.
+fn format_exit_code(code: i32) -> String {
+    #[cfg(windows)]
+    {
+        // NTSTATUS codes have the high bit set (>= 0x80000000 as u32)
+        if (code as u32) >= 0x80000000 {
+            format!("exited({})", describe_exit_code(code))
+        } else {
+            format!("exited({})", code)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        format!("exited({})", code)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Process monitoring — query a child process’s working set (Windows only).
+// ---------------------------------------------------------------------------
+#[cfg(windows)]
+mod proc_mon {
+    #![allow(non_snake_case, non_camel_case_types)]
+
+    use std::mem;
+
+    type HANDLE = *mut std::ffi::c_void;
+    type DWORD = u32;
+    type BOOL = i32;
+
+    #[repr(C)]
+    struct PROCESS_MEMORY_COUNTERS {
+        cb: DWORD,
+        PageFaultCount: DWORD,
+        PeakWorkingSetSize: usize,
+        WorkingSetSize: usize,
+        QuotaPeakPagedPoolUsage: usize,
+        QuotaPagedPoolUsage: usize,
+        QuotaPeakNonPagedPoolUsage: usize,
+        QuotaNonPagedPoolUsage: usize,
+        PagefileUsage: usize,
+        PeakPagefileUsage: usize,
+    }
+
+    const PROCESS_QUERY_INFORMATION: DWORD = 0x0400;
+    const PROCESS_VM_READ: DWORD = 0x0010;
+
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) -> HANDLE;
+        fn CloseHandle(hObject: HANDLE) -> BOOL;
+        fn GetProcessMemoryInfo(
+            hProcess: HANDLE,
+            ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS,
+            cb: DWORD,
+        ) -> BOOL;
+    }
+
+    /// Returns the working-set size of the process in MiB, or `None`.
+    pub fn working_set_mib(pid: u32) -> Option<f64> {
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let mut pmc: PROCESS_MEMORY_COUNTERS = mem::zeroed();
+            pmc.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS>() as DWORD;
+            let ok = GetProcessMemoryInfo(handle, &mut pmc, pmc.cb);
+            CloseHandle(handle);
+            if ok == 0 { None } else { Some(pmc.WorkingSetSize as f64 / (1024.0 * 1024.0)) }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod proc_mon {
+    pub fn working_set_mib(_pid: u32) -> Option<f64> { None }
+}
+
+/// Helper: format a process‑metrics string and send it through the callback.
+fn report_process(
+    process_cb: Option<extern "C" fn(*const u8, u32)>,
+    thread_name: &str,
+    pid: u32,
+    state: &str,          // "started", "running", "exited(N)", "crashed"
+    memory_mb: Option<f64>,
+    extra: &str,          // short stderr snippet or empty
+) {
+    let mem = match memory_mb {
+        Some(m) => format!("{:.1}", m),
+        None => "?".to_string(),
+    };
+    let msg = format!("PROC|{}|{}|{}|{}|{}", thread_name, pid, state, mem, extra);
+    match process_cb {
+        Some(cb) => {
+            let bytes = msg.as_bytes();
+            cb(bytes.as_ptr(), bytes.len() as u32);
+        }
+        None => eprintln!("{}", msg),
+    }
+}
+
+/// Drain all remaining batches from the channel and apply an error action.
+fn drain_all_for_error(
+    task_rx: &crossbeam_channel::Receiver<Vec<ExtractorTask>>,
+    on_task: impl Fn(&ExtractorTask),
+) {
+    loop {
+        let batch = collect_batch(task_rx);
+        if batch.is_empty() {
+            break;
+        }
+        for t in &batch {
+            on_task(t);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker_ipc::WorkerOutput;
+
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
+
+    /// Locate `pdf_worker.exe` from the test binary's directory.
+    /// The test binary lives at `target/<profile>/deps/pdf_extractor-<hash>.exe`;
+    /// the worker lives at `target/<profile>/pdf_worker.exe`.
+    fn find_worker_binary() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let profile_dir = exe.parent()?.parent()?; // target/<profile>/
+        let worker = profile_dir.join("pdf_worker.exe");
+        if worker.exists() { Some(worker) } else { None }
+    }
+
+    /// Check whether `pdfium.dll` is available next to the worker binary.
+    /// Extraction tests are skipped when the DLL is absent (CI/dev machines
+    /// without a pdfium deployment).
+    fn is_pdfium_available() -> bool {
+        find_worker_binary()
+            .and_then(|w| w.parent().map(|d| d.join("pdfium.dll")))
+            .map_or(false, |dll| dll.exists())
+    }
+
+    /// Create a minimal valid PDF at `path` containing `text` on a single page.
+    fn make_test_pdf_at(path: &Path, text: &str) {
+        use lopdf::*;
+        let mut doc = Document::new();
+        doc.version = "1.4".to_string();
+
+        let catalog_id = doc.new_object_id();
+        let font_id = doc.new_object_id();
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+        let content_id = doc.new_object_id();
+
+        let escaped: String = text
+            .chars()
+            .map(|c| match c {
+                '(' | ')' | '\\' => format!("\\{}", c),
+                _ => c.to_string(),
+            })
+            .collect();
+        let stream_data = format!("BT /F1 12 Tf 100 700 Td ({}) Tj ET", escaped);
+
+        doc.objects.insert(font_id, Object::Dictionary(Dictionary::from_iter([
+            ("Type", Object::Name("Font".as_bytes().to_vec())),
+            ("Subtype", Object::Name("Type1".as_bytes().to_vec())),
+            ("BaseFont", Object::Name("Helvetica".as_bytes().to_vec())),
+        ])));
+
+        doc.objects.insert(content_id, Object::Stream(Stream::new(
+            Dictionary::from_iter([("Length", Object::Integer(stream_data.len() as i64))]),
+            stream_data.as_bytes().to_vec(),
+        )));
+
+        doc.objects.insert(page_id, Object::Dictionary(Dictionary::from_iter([
+            ("Type", Object::Name("Page".as_bytes().to_vec())),
+            ("Parent", Object::Reference(pages_id)),
+            ("MediaBox", Object::Array(vec![
+                Object::Integer(0), Object::Integer(0),
+                Object::Integer(612), Object::Integer(792),
+            ])),
+            ("Contents", Object::Reference(content_id)),
+            ("Resources", Object::Dictionary(Dictionary::from_iter([(
+                "Font", Object::Dictionary(Dictionary::from_iter([(
+                    "F1", Object::Reference(font_id),
+                )])),
+            )]))),
+        ])));
+
+        doc.objects.insert(pages_id, Object::Dictionary(Dictionary::from_iter([
+            ("Type", Object::Name("Pages".as_bytes().to_vec())),
+            ("Kids", Object::Array(vec![Object::Reference(page_id)])),
+            ("Count", Object::Integer(1)),
+        ])));
+
+        doc.objects.insert(catalog_id, Object::Dictionary(Dictionary::from_iter([
+            ("Type", Object::Name("Catalog".as_bytes().to_vec())),
+            ("Pages", Object::Reference(pages_id)),
+        ])));
+
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc.save(path).unwrap();
+        // Validate by loading back
+        Document::load(path).unwrap();
+    }
+
+    /// Create a minimal PDF and return its path (inside `dir`).
+    fn make_test_pdf(dir: &Path, text: &str) -> PathBuf {
+        let path = dir.join(format!("doc_{}.pdf", text.len()));
+        make_test_pdf_at(&path, text);
+        path
+    }
 
     #[test]
     fn test_dedup_ocr_batch_all_new() {
@@ -1045,5 +1726,520 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.commit_to(), 1, "Zero timeout should clamp to 1");
+    }
+
+    #[test]
+    fn test_pipeline_config_default_indexer_threads() {
+        let cfg = PipelineConfig::default();
+        assert!(cfg.indexer_threads() >= 1, "Default indexer threads should be ≥1, got {}", cfg.indexer_threads());
+    }
+
+    #[test]
+    fn test_pipeline_config_custom_indexer_threads() {
+        let cfg = PipelineConfig {
+            num_indexer_threads: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(cfg.indexer_threads(), 4);
+    }
+
+    #[test]
+    fn test_pipeline_config_indexer_threads_clamps_zero() {
+        let cfg = PipelineConfig {
+            num_indexer_threads: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(cfg.indexer_threads(), 1, "Zero indexer threads should clamp to 1");
+    }
+
+    // ── collect_batch tests ──
+
+    #[allow(dead_code)]
+    fn make_task(id: i64, path: &str) -> ExtractorTask {
+        ExtractorTask { id, path: path.into(), checksum: format!("c{}", id) }
+    }
+
+    fn make_batch(ids: &[i64], prefix: &str) -> Vec<ExtractorTask> {
+        ids.iter().map(|&id| make_task(id, &format!("{}{}.pdf", prefix, id))).collect()
+    }
+
+    #[test]
+    fn test_collect_batch_empty_disconnected() {
+        let (tx, rx) = bounded::<Vec<ExtractorTask>>(10);
+        drop(tx);
+        let batch = collect_batch(&rx);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_collect_batch_single_task() {
+        let (tx, rx) = bounded::<Vec<ExtractorTask>>(10);
+        tx.send(vec![make_task(1, "a.pdf")]).unwrap();
+        drop(tx);
+        let batch = collect_batch(&rx);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, 1);
+        assert_eq!(batch[0].path, "a.pdf");
+    }
+
+    #[test]
+    fn test_collect_batch_multiple_tasks_in_one_batch() {
+        let (tx, rx) = bounded::<Vec<ExtractorTask>>(10);
+        tx.send(make_batch(&[1, 2, 3, 4, 5], "")).unwrap();
+        drop(tx);
+        let batch = collect_batch(&rx);
+        assert_eq!(batch.len(), 5);
+    }
+
+    #[test]
+    fn test_collect_batch_blocks_until_first_arrives() {
+        let (tx, rx) = bounded::<Vec<ExtractorTask>>(10);
+        let tx_clone = tx.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            tx_clone.send(vec![make_task(99, "late.pdf")]).unwrap();
+            drop(tx_clone);
+        });
+        let batch = collect_batch(&rx);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, 99);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_collect_batch_disconnected_returns_partial() {
+        let (tx, rx) = bounded::<Vec<ExtractorTask>>(10);
+        tx.send(make_batch(&[1, 2, 3], "")).unwrap();
+        // drop tx without sending more — should return [1, 2, 3]
+        drop(tx);
+        let batch = collect_batch(&rx);
+        assert_eq!(batch.len(), 3);
+    }
+
+    // ── Producer-side batch sending ──
+
+    #[test]
+    fn test_producer_claims_nothing_when_empty() {
+        let store = super::super::scanner::JobStore::open_in_memory().unwrap();
+        let batch = store.claim_pending(100).unwrap();
+        assert!(batch.is_empty(), "no pending jobs → empty batch");
+    }
+
+    #[test]
+    fn test_producer_claims_and_sends_batch() {
+        let store = super::super::scanner::JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "cs1").unwrap();
+        store.upsert_file("/b.pdf", "cs2").unwrap();
+        store.upsert_file("/c.pdf", "cs3").unwrap();
+
+        let (task_tx, task_rx) = bounded::<Vec<ExtractorTask>>(10);
+        let batch_size: i64 = 2;
+
+        // Simulate the producer: claim pending, batch, send
+        let batch = store.claim_pending(batch_size).unwrap();
+        assert_eq!(batch.len(), 2, "should claim up to batch_size=2");
+        let tasks: Vec<ExtractorTask> = batch
+            .into_iter()
+            .map(|(id, path, checksum)| ExtractorTask { id, path, checksum })
+            .collect();
+        task_tx.send(tasks).unwrap();
+
+        // Verify the batch arrived on the channel
+        let received = collect_batch(&task_rx);
+        assert_eq!(received.len(), 2);
+        assert!(received.iter().any(|t| t.path == "/a.pdf"));
+        assert!(received.iter().any(|t| t.path == "/b.pdf"));
+
+        // Remaining pending tasks should be claimable in a second batch
+        let remaining = store.claim_pending(100).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1, "/c.pdf");
+    }
+
+    // ── run_extraction_process error handling tests ──
+
+    #[test]
+    fn test_process_worker_missing_binary_no_crash() {
+        let (task_tx, task_rx) = bounded::<Vec<ExtractorTask>>(10);
+        let (result_tx, result_rx) = bounded::<DocumentRecord>(10);
+        let jobs = Arc::new(super::super::scanner::JobStore::open_in_memory().unwrap());
+        let metrics = Arc::new(super::super::metrics::Metrics::new());
+
+        task_tx.send(vec![make_task(1, "a.pdf")]).unwrap();
+        drop(task_tx);
+
+        run_extraction_process(
+            Path::new(r"C:\__nonexistent_worker_12345__.exe"),
+            &task_rx, &result_tx, &jobs, &metrics,
+            None, None, None,
+        );
+
+        // Must not crash; no records should arrive at result channel
+        let recv_result = result_rx.try_recv();
+        assert!(recv_result.is_err(), "no record should be sent for failed worker: {:?}", recv_result);
+    }
+
+    fn make_frame_bytes(frame: &WorkerFrame) -> Vec<u8> {
+        let data = bincode::serialize(frame).unwrap();
+        let mut out = Vec::with_capacity(4 + data.len());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn test_read_frame_success() {
+        let frame = WorkerFrame::Success(WorkerOutput {
+            path: "/mocked.pdf".into(),
+            ocr_flag: false,
+            text: "hello from mock".into(),
+            word_positions: vec![],
+        });
+        let bytes = make_frame_bytes(&frame);
+        let mut reader = io::BufReader::new(std::io::Cursor::new(&bytes));
+        let parsed = read_frame(&mut reader).unwrap();
+        match parsed {
+            WorkerFrame::Success(wo) => {
+                assert_eq!(wo.path, "/mocked.pdf");
+                assert_eq!(wo.text, "hello from mock");
+            }
+            _ => panic!("Expected Success frame"),
+        }
+    }
+
+    #[test]
+    fn test_read_frame_error() {
+        let frame = WorkerFrame::Error {
+            path: "/broken.pdf".into(),
+            message: "ERROR:/broken.pdf:parse error".into(),
+        };
+        let bytes = make_frame_bytes(&frame);
+        let mut reader = io::BufReader::new(std::io::Cursor::new(&bytes));
+        let parsed = read_frame(&mut reader).unwrap();
+        match parsed {
+            WorkerFrame::Error { path, message } => {
+                assert_eq!(path, "/broken.pdf");
+                assert!(message.contains("parse error"));
+            }
+            _ => panic!("Expected Error frame"),
+        }
+    }
+
+    #[test]
+    fn test_read_frame_garbage_returns_error() {
+        let garbage = [0u8; 8];
+        let mut reader = io::BufReader::new(std::io::Cursor::new(&garbage));
+        let result = read_frame(&mut reader);
+        assert!(result.is_err(), "garbage frame should produce an error");
+    }
+
+    #[test]
+    fn test_read_frame_truncated_returns_error() {
+        let frame = WorkerFrame::Success(WorkerOutput {
+            path: "/test.pdf".into(),
+            ocr_flag: false,
+            text: "test".into(),
+            word_positions: vec![],
+        });
+        let mut bytes = make_frame_bytes(&frame);
+        bytes.truncate(bytes.len() - 3); // remove last 3 bytes
+        let mut reader = io::BufReader::new(std::io::Cursor::new(&bytes));
+        let result = read_frame(&mut reader);
+        assert!(result.is_err(), "truncated frame should produce an error");
+    }
+
+    // ── Pipeline validation tests ──
+
+    #[test]
+    fn test_run_pipeline_requires_worker_path() {
+        use crate::metrics::Metrics;
+        use crate::output::JsonlWriter;
+        use crate::scanner::scan_directory;
+
+        let tmp = std::env::temp_dir().join("pdf_extractor_test_req_worker");
+        let _ = std::fs::create_dir_all(&tmp);
+        let books = tmp.join("books");
+        std::fs::create_dir_all(&books).unwrap();
+        std::fs::write(books.join("dummy.pdf"), b"dummy").unwrap();
+
+        let jobs = Arc::new(JobStore::open_in_memory().unwrap());
+        let writer = JsonlWriter::new(&tmp.join("out.jsonl")).unwrap();
+        let metrics = Arc::new(Metrics::new());
+
+        scan_directory(&jobs, &books).unwrap();
+
+        let config = PipelineConfig {
+            worker_path: None,
+            ..Default::default()
+        };
+
+        let result = run_pipeline(jobs, &writer, metrics, &books, None, &config);
+        assert!(result.is_err(), "run_pipeline should error when worker_path=None");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.to_lowercase().contains("worker_path"),
+            "error should mention worker_path, got: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Worker binary integration tests ──
+
+    fn parse_worker_frames(data: &[u8]) -> Vec<WorkerFrame> {
+        let mut frames = Vec::new();
+        let mut offset = 0;
+        while offset + 4 <= data.len() {
+            let len = u32::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]) as usize;
+            offset += 4;
+            if offset + len > data.len() {
+                break;
+            }
+            if let Ok(frame) = bincode::deserialize(&data[offset..offset + len]) {
+                frames.push(frame);
+            }
+            offset += len;
+        }
+        frames
+    }
+
+    #[test]
+    fn test_worker_binary_with_valid_pdf() {
+        let worker = match find_worker_binary() {
+            Some(w) => w,
+            None => return,
+        };
+        if !is_pdfium_available() {
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join("pdf_extractor_test_worker_valid");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let pdf = make_test_pdf(&tmp, "This is a longer English sentence that should be reliably detected by the language detector with enough characters");
+
+        let output = std::process::Command::new(&worker)
+            .arg(&pdf)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("failed to spawn pdf_worker");
+
+        assert!(output.status.success(), "worker exited with code {}: {}\nstdout: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout));
+
+        let frames = parse_worker_frames(&output.stdout);
+        assert_eq!(frames.len(), 1, "should produce 1 frame");
+        let wo = match &frames[0] {
+            WorkerFrame::Success(wo) => wo,
+            _ => panic!("expected Success frame"),
+        };
+
+        assert_eq!(wo.path, pdf.to_string_lossy(), "path mismatch");
+        assert!(!wo.ocr_flag, "text PDF should not be OCR-flagged");
+        assert!(wo.text.contains("English sentence"), "extracted text should contain input: {}", wo.text);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_worker_binary_with_missing_file() {
+        let worker = match find_worker_binary() {
+            Some(w) => w,
+            None => return,
+        };
+
+        let missing = Path::new(r"C:\__pdf_worker_test_nonexistent__\missing.pdf");
+
+        let output = std::process::Command::new(&worker)
+            .arg(missing)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("failed to spawn pdf_worker");
+
+        let frames = parse_worker_frames(&output.stdout);
+        assert_eq!(frames.len(), 1, "should produce 1 frame");
+        match &frames[0] {
+            WorkerFrame::Error { path, message: _ } => {
+                assert!(path.contains("missing.pdf"), "error path should mention file, got: {}", path);
+            }
+            _ => panic!("expected Error frame for missing file"),
+        }
+    }
+
+    #[test]
+    fn test_worker_binary_with_multiple_files() {
+        let worker = match find_worker_binary() {
+            Some(w) => w,
+            None => return,
+        };
+        if !is_pdfium_available() {
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join("pdf_extractor_test_worker_batch");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let pdf1 = make_test_pdf(&tmp, "First document text");
+        let pdf2 = make_test_pdf(&tmp, "Second document content");
+        let missing = tmp.join("nonexistent.pdf");
+
+        let output = std::process::Command::new(&worker)
+            .arg(&pdf1)
+            .arg(&pdf2)
+            .arg(&missing)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("failed to spawn pdf_worker");
+
+        assert!(output.status.success(), "worker exited with code {}: {}\nstdout: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout));
+
+        let frames = parse_worker_frames(&output.stdout);
+        assert_eq!(frames.len(), 3, "should produce 3 frames");
+
+        // First frame: success for pdf1
+        match &frames[0] {
+            WorkerFrame::Success(wo) => {
+                assert_eq!(wo.path, pdf1.to_string_lossy());
+                assert!(wo.text.contains("First document"));
+            }
+            _ => panic!("frame 0 should be Success"),
+        }
+
+        // Second frame: success for pdf2
+        match &frames[1] {
+            WorkerFrame::Success(wo) => {
+                assert_eq!(wo.path, pdf2.to_string_lossy());
+                assert!(wo.text.contains("Second document"));
+            }
+            _ => panic!("frame 1 should be Success"),
+        }
+
+        // Third frame: error for missing file
+        match &frames[2] {
+            WorkerFrame::Error { path, message: _ } => {
+                assert!(path.contains("nonexistent.pdf"));
+            }
+            _ => panic!("frame 2 should be Error"),
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_worker_binary_with_no_arguments() {
+        let worker = match find_worker_binary() {
+            Some(w) => w,
+            None => return,
+        };
+
+        let output = std::process::Command::new(&worker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("failed to spawn pdf_worker");
+
+        // In streaming mode with no args and no stdin, the worker processes
+        // zero files and exits successfully.
+        assert!(
+            output.status.success(),
+            "streaming worker should exit successfully with no input, got: {:?}",
+            output.status.code()
+        );
+    }
+
+    #[test]
+    fn test_worker_binary_with_special_characters() {
+        let worker = match find_worker_binary() {
+            Some(w) => w,
+            None => return,
+        };
+        if !is_pdfium_available() {
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join("pdf_extractor_test_worker_special");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        // Use WinAnsi-encodable characters (Helvetica standard encoding
+        // does not support arbitrary Unicode via raw content streams).
+        // PDF extraction will convert these back from the font encoding,
+        // so we test symbols and numbers that round-trip correctly.
+        let text = "Price: 99.95 USD (discount 15%) #sale!";
+        let pdf = make_test_pdf(&tmp, text);
+
+        let output = std::process::Command::new(&worker)
+            .arg(&pdf)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("failed to spawn pdf_worker");
+
+        assert!(output.status.success(), "worker failed for special chars PDF: {}",
+            String::from_utf8_lossy(&output.stderr));
+
+        let frames = parse_worker_frames(&output.stdout);
+        assert_eq!(frames.len(), 1, "should produce 1 frame");
+        let wo = match &frames[0] {
+            WorkerFrame::Success(wo) => wo,
+            _ => panic!("expected Success frame"),
+        };
+
+        assert!(wo.text.contains("99.95"), "should preserve numbers: {}", wo.text);
+        assert!(wo.text.contains("discount"), "should preserve words: {}", wo.text);
+        assert!(wo.text.contains("USD"), "should preserve uppercase: {}", wo.text);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_worker_binary_empty_pdf() {
+        let worker = match find_worker_binary() {
+            Some(w) => w,
+            None => return,
+        };
+        if !is_pdfium_available() {
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join("pdf_extractor_test_worker_empty");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        // Create a PDF with no text content (whitespace only)
+        let pdf = make_test_pdf(&tmp, "   ");
+
+        let output = std::process::Command::new(&worker)
+            .arg(&pdf)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("failed to spawn pdf_worker");
+
+        assert!(output.status.success(), "worker failed for empty-text PDF: {}",
+            String::from_utf8_lossy(&output.stderr));
+
+        let frames = parse_worker_frames(&output.stdout);
+        assert_eq!(frames.len(), 1, "should produce 1 frame");
+        let wo = match &frames[0] {
+            WorkerFrame::Success(wo) => wo,
+            _ => panic!("expected Success frame"),
+        };
+
+        assert_eq!(wo.path, pdf.to_string_lossy());
+        assert!(wo.ocr_flag, "whitespace-only PDF should be flagged for OCR");
+        assert!(wo.text.is_empty(), "text should be empty, got: {}", wo.text);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -1,17 +1,25 @@
+using System.Collections.ObjectModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
 using PdfExplorer.Models;
 using PdfExplorer.Services;
+using PdfExplorer.ViewModels;
 
 namespace PdfExplorer.Views;
 
 public partial class SearchTab : Page
 {
     private readonly PdfEngine _engine;
-    private readonly PdfPageRenderer _renderer = new(1920);
+    private readonly PdfiumPageRenderer _renderer = new(1920);
     private readonly Dictionary<(string, int), PageRenderItem> _globalPageCache = new();
+    private readonly Queue<(string, int)> _globalPageCacheOrder = new();
+    private const int MaxGlobalCacheEntries = 50;
+    private readonly ThumbnailService _thumbService = new();
+    private CancellationTokenSource? _thumbCts;
+    private const int ThumbnailPreloadCount = 30;
     private int _currentPage;
     private long _totalHits;
     private string _lastQuery = string.Empty;
@@ -56,7 +64,6 @@ public partial class SearchTab : Page
             _selectedCollId = (uint)coll.Id;
             SearchBox.IsEnabled = true;
             SearchButton.IsEnabled = true;
-            SearchMode.IsEnabled = true;
             SearchBox.Focus();
         }
         else
@@ -64,7 +71,6 @@ public partial class SearchTab : Page
             _selectedCollId = 0;
             SearchBox.IsEnabled = false;
             SearchButton.IsEnabled = false;
-            SearchMode.IsEnabled = false;
         }
     }
 
@@ -91,7 +97,19 @@ public partial class SearchTab : Page
             _totalHits = results.Total;
             Log($"RunSearch: totalHits={_totalHits}, results count={results.Results.Count}");
 
-            ResultsList.ItemsSource = results.Results;
+            Log("RunSearch: creating ViewModels...");
+            var viewModels = results.Results.Select(r => new SearchResultViewModel(r)).ToList();
+            Log($"RunSearch: created {viewModels.Count} ViewModels");
+
+            ResultsList.ItemsSource = viewModels;
+            Log("RunSearch: ItemsSource assigned");
+
+            // Start thumbnail preloading
+            Log("RunSearch: cancelling previous thumbnail CTS");
+            _thumbCts?.Cancel();
+            _thumbCts = new CancellationTokenSource();
+            Log($"RunSearch: starting PreloadThumbnailsAsync with count={Math.Min(viewModels.Count, ThumbnailPreloadCount)}");
+            _ = PreloadThumbnailsAsync(viewModels, ThumbnailPreloadCount, _thumbCts.Token);
 
             var totalPages = _totalHits > 0 ? (int)System.Math.Ceiling(_totalHits / 1000.0) : 0;
             PageInfo.Content = $"{_currentPage + 1} / {totalPages}";
@@ -106,29 +124,73 @@ public partial class SearchTab : Page
         }
     }
 
-    private void OnSearchModeChanged(object sender, SelectionChangedEventArgs e)
+    private async Task PreloadThumbnailsAsync(List<SearchResultViewModel> items, int count, CancellationToken ct)
     {
-        if (_engine is null) return;
-        switch (SearchMode.SelectedIndex)
+        Log($"PreloadThumbnailsAsync START: items={items.Count}, count={count}");
+        var toLoad = items.Take(count).ToList();
+        Log($"PreloadThumbnailsAsync: will process {toLoad.Count} items");
+
+        foreach (var vm in toLoad)
         {
-            case 0:
-                _engine.FuzzyDistance = 0;
-                _engine.StemEnabled = false;
+            if (ct.IsCancellationRequested)
+            {
+                Log("PreloadThumbnailsAsync: cancellation requested, breaking loop");
                 break;
-            case 1:
-                _engine.FuzzyDistance = 1;
-                _engine.StemEnabled = false;
+            }
+
+            Log($"PreloadThumbnailsAsync: processing item '{vm.FileName}'");
+            try
+            {
+                Log($"PreloadThumbnailsAsync: calling GetThumbnailAsync for '{vm.FileName}'");
+                var raw = await _thumbService.GetThumbnailAsync(vm.Path, ct);
+                Log($"PreloadThumbnailsAsync: GetThumbnailAsync returned {(raw is null ? "NULL" : $"{raw.Width}x{raw.Height}")} for '{vm.FileName}'");
+
+                if (raw is null || ct.IsCancellationRequested)
+                {
+                    Log($"PreloadThumbnailsAsync: no raw data for '{vm.FileName}'");
+                    continue;
+                }
+
+                // Create BitmapSource on UI thread — WPF media objects must be created on STA thread
+                Log($"PreloadThumbnailsAsync: dispatching bitmap creation for '{vm.FileName}'");
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        var bmp = BitmapSource.Create(
+                            raw.Width,
+                            raw.Height,
+                            96,
+                            96,
+                            PixelFormats.Bgra32,
+                            null,
+                            raw.Pixels,
+                            raw.Stride);
+                        bmp.Freeze();
+                        Log($"PreloadThumbnailsAsync: BitmapSource created ({bmp.PixelWidth}x{bmp.PixelHeight})");
+
+                        vm.Thumbnail = bmp;
+                        Log($"PreloadThumbnailsAsync: Thumbnail assigned for '{vm.FileName}'");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"PreloadThumbnailsAsync EXCEPTION creating bitmap for '{vm.FileName}': {ex.GetType().Name}: {ex.Message}");
+                    }
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                Log($"PreloadThumbnailsAsync: OperationCanceledException for '{vm.FileName}', breaking");
                 break;
-            case 2:
-                _engine.FuzzyDistance = 0;
-                _engine.StemEnabled = true;
-                break;
-            case 3:
-                _engine.FuzzyDistance = 0;
-                _engine.StemEnabled = false;
-                break;
+            }
+            catch (Exception ex)
+            {
+                Log($"PreloadThumbnailsAsync EXCEPTION for '{vm.FileName}': {ex.GetType().Name}: {ex.Message}");
+                Log($"PreloadThumbnailsAsync EXCEPTION stack: {ex.StackTrace}");
+            }
         }
-        _engine.SaveSettings();
+
+        Log("PreloadThumbnailsAsync END");
     }
 
     private async void OnNextPage(object sender, RoutedEventArgs e)
@@ -149,7 +211,10 @@ public partial class SearchTab : Page
 
     private async void OnResultSelected(object sender, SelectionChangedEventArgs e)
     {
-        if (ResultsList.SelectedItem is not SearchResult result)
+        try
+        {
+
+        if (ResultsList.SelectedItem is not SearchResultViewModel result)
         {
             Log("OnResultSelected: no selection");
             return;
@@ -162,16 +227,30 @@ public partial class SearchTab : Page
         _currentPdfPath = result.Path;
         StatusLabel.Text = System.IO.Path.GetFileName(result.Path);
 
-        // Fetch term positions for the current search term
+        // Fetch term positions via PDFium text search (case-insensitive)
         try
         {
-            _lastPositions = _engine.GetTermPositions(
-                _selectedCollId,
-                result.Id,
+            _lastPositions = _engine.SearchTextInPdf(
+                result.Path,
                 _lastQuery
             );
             var t1 = DateTime.UtcNow;
-            Log($"GetTermPositions returned {_lastPositions.Count} positions (took {(t1 - t0).TotalMilliseconds:F0}ms)");
+            Log($"SearchTextInPdf returned {_lastPositions.Count} positions (took {(t1 - t0).TotalMilliseconds:F0}ms)");
+
+            // Fallback: try the indexed position store when PDFium finds nothing
+            // (e.g. for PDFs where text extraction stored bounding boxes that
+            // PDFium's own text-search API can't reproduce at query time).
+            if (_lastPositions.Count == 0 && result.CollectionId.HasValue)
+            {
+                Log($"SearchTextInPdf found nothing — trying GetTermPositions from position store");
+                _lastPositions = _engine.GetTermPositions(
+                    (uint)result.CollectionId.Value,
+                    result.Id,
+                    _lastQuery
+                );
+                Log($"GetTermPositions returned {_lastPositions.Count} positions");
+            }
+
             if (_lastPositions.Count > 0)
                 Log($"First position: page={_lastPositions[0].Page}, x_min={_lastPositions[0].XMin}, word_text={_lastPositions[0].WordText}");
 
@@ -205,7 +284,7 @@ public partial class SearchTab : Page
         try
         {
             Log($"Loading PDF: {result.Path}");
-            await _renderer.LoadDocumentAsync(result.Path);
+            _renderer.OpenDocument(result.Path);
             var t2 = DateTime.UtcNow;
             Log($"PDF loaded, page count={_renderer.PageCount} (took {(t2 - tPos).TotalMilliseconds:F0}ms)");
         }
@@ -269,6 +348,12 @@ public partial class SearchTab : Page
 
         var tEnd = DateTime.UtcNow;
         Log($"OnResultSelected complete (total {(tEnd - t0).TotalMilliseconds:F0}ms)");
+        }
+        catch (Exception ex)
+        {
+            Log($"OnResultSelected UNHANDLED ERROR: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+            StatusLabel.Text = $"Error: {ex.Message}";
+        }
     }
 
     // ── Lazy rendering ───────────────────────────────────────────────
@@ -291,15 +376,16 @@ public partial class SearchTab : Page
         var pagePositions = _positionsByPage.GetValueOrDefault(pageIdx, new List<WordPosition>());
         try
         {
-            var item = await _renderer.RenderPageAsync(pageIdx, pagePositions);
+            var raw = _renderer.RenderPageRaw(pageIdx, pagePositions);
+            var item = await Dispatcher.InvokeAsync(() => PdfiumPageRenderer.CreatePageItem(raw, pagePositions));
             Log($"  rendered: image={(item.PageImage is not null ? $"{item.ImagePixelWidth}x{item.ImagePixelHeight}" : "null")}");
             _pageCache[pageIdx] = item;
-            _globalPageCache[cacheKey] = item;
+            AddToGlobalCache(cacheKey, item);
             return item;
         }
         catch (Exception ex)
         {
-            Log($"RenderPageAsync error: {ex.GetType().Name}: {ex.Message}");
+            Log($"RenderPage error: {ex.GetType().Name}: {ex.Message}");
             var fallback = new PageRenderItem
             {
                 PageNumber = pageIdx + 1,
@@ -308,7 +394,7 @@ public partial class SearchTab : Page
                 Positions = pagePositions,
             };
             _pageCache[pageIdx] = fallback;
-            _globalPageCache[cacheKey] = fallback;
+            AddToGlobalCache(cacheKey, fallback);
             return fallback;
         }
     }
@@ -457,6 +543,11 @@ public partial class SearchTab : Page
     {
         Log($"ScrollToMatch({index})");
         if (index < 0 || index >= _matchingPages.Count) return;
+        if (index >= _pageElements.Count)
+        {
+            Log($"ScrollToMatch: index={index} >= _pageElements.Count={_pageElements.Count}");
+            return;
+        }
         _currentMatchIndex = index;
 
         var element = _pageElements[index];
@@ -525,11 +616,21 @@ public partial class SearchTab : Page
 
     private async Task NavigateToPosition(int posIdx)
     {
+        if (posIdx < 0 || posIdx >= _lastPositions.Count)
+        {
+            Log($"NavigateToPosition: invalid posIdx={posIdx} (count={_lastPositions.Count})");
+            return;
+        }
+
         var pos = _lastPositions[posIdx];
         var pageIdx = pos.Page - 1;
 
         var matchIdx = _matchingPages.IndexOf(pageIdx);
-        if (matchIdx < 0) return;
+        if (matchIdx < 0 || matchIdx >= _pageElements.Count)
+        {
+            Log($"NavigateToPosition: matchIdx={matchIdx} out of range (pages={_pageElements.Count})");
+            return;
+        }
 
         // Ensure the page is loaded
         if (_pageElements[matchIdx] is null)
@@ -539,10 +640,15 @@ public partial class SearchTab : Page
         }
 
         // Find which position occurrence within the page
-        var pagePositions = _positionsByPage[pageIdx];
+        if (!_positionsByPage.TryGetValue(pageIdx, out var pagePositions))
+        {
+            Log($"NavigateToPosition: pageIdx={pageIdx} not found in _positionsByPage");
+            return;
+        }
+
         var posInPage = pagePositions.IndexOf(pos);
 
-        if (_matchHighlightRects.TryGetValue(matchIdx, out var rects) && posInPage < rects.Count)
+        if (_matchHighlightRects.TryGetValue(matchIdx, out var rects) && posInPage >= 0 && posInPage < rects.Count)
         {
             _currentMatchIndex = matchIdx;
             rects[posInPage].BringIntoView();
@@ -553,6 +659,23 @@ public partial class SearchTab : Page
     }
 
     // ── Helpers ─────────────────────────────────────────────────────
+
+    private void AddToGlobalCache((string, int) key, PageRenderItem item)
+    {
+        lock (_globalPageCache)
+        {
+            if (!_globalPageCache.ContainsKey(key))
+            {
+                _globalPageCacheOrder.Enqueue(key);
+                while (_globalPageCacheOrder.Count > MaxGlobalCacheEntries)
+                {
+                    var oldest = _globalPageCacheOrder.Dequeue();
+                    _globalPageCache.Remove(oldest);
+                }
+            }
+            _globalPageCache[key] = item;
+        }
+    }
 
     private void ClearViewer()
     {
@@ -576,5 +699,16 @@ public partial class SearchTab : Page
         PrevPosition.IsEnabled = false;
         NextPosition.IsEnabled = false;
         WordsField.Text = "";
+
+        // Close the native PDF handle to avoid use-after-free when switching documents
+        try
+        {
+            _renderer.CloseDocument();
+            Log("ClearViewer: renderer document closed");
+        }
+        catch (Exception ex)
+        {
+            Log($"ClearViewer: error closing renderer document: {ex.Message}");
+        }
     }
 }

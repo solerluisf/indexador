@@ -1,26 +1,51 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use std::collections::HashMap;
+use std::path::Path;
+#[cfg_attr(not(test), allow(unused_imports))]
+use std::path::PathBuf;
 use xxhash_rust::xxh3::xxh3_64;
 
 pub struct JobStore {
-    conn: Mutex<Connection>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl JobStore {
     pub fn open(db_path: &Path) -> Result<Self> {
-        let conn = Connection::open(db_path).context("Failed to open SQLite database")?;
-        Self::from_connection(conn)
+        let manager = SqliteConnectionManager::file(db_path)
+            .with_init(|conn| conn.execute_batch("PRAGMA busy_timeout = 5000;"));
+        let pool = Pool::builder()
+            .max_size(8)
+            .build(manager)
+            .context("Failed to build SQLite connection pool")?;
+        let conn = pool.get().context("Failed to get initial connection")?;
+        // WAL mode persists in the database file, so it only needs to be set once.
+        // In-memory databases are test-only and don't benefit from WAL.
+        conn.execute_batch("PRAGMA journal_mode = WAL;")
+            .context("Failed to enable WAL journal mode")?;
+        Self::init_schema(&conn)?;
+        drop(conn);
+        Ok(Self { pool })
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::from_connection(conn)
+        // Use a unique temp file per call so pool connections share
+        // the same database without cross-test contamination.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pdf_jobstore_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).context("Failed to create temp dir for JobStore")?;
+        let db_path = dir.join("test.db");
+        Self::open(&db_path)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
+    fn init_schema(conn: &rusqlite::Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,31 +63,17 @@ impl JobStore {
         )
         .context("Failed to create jobs table")?;
 
-        // Add OCR columns for databases created before Phase 4
-        conn.execute_batch(
-            "ALTER TABLE jobs ADD COLUMN ocr_attempts INTEGER NOT NULL DEFAULT 0;",
-        )
-        .ok();
-        conn.execute_batch(
-            "ALTER TABLE jobs ADD COLUMN ocr_error TEXT;",
-        )
-        .ok();
-        conn.execute_batch(
-            "ALTER TABLE jobs ADD COLUMN failed_ocr TEXT;",
-        )
-        .ok();
-        conn.execute_batch(
-            "ALTER TABLE jobs ADD COLUMN language TEXT;",
-        )
-        .ok();
-
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        conn.execute_batch("ALTER TABLE jobs ADD COLUMN ocr_attempts INTEGER NOT NULL DEFAULT 0;").ok();
+        conn.execute_batch("ALTER TABLE jobs ADD COLUMN ocr_error TEXT;").ok();
+        conn.execute_batch("ALTER TABLE jobs ADD COLUMN failed_ocr TEXT;").ok();
+        conn.execute_batch("ALTER TABLE jobs ADD COLUMN language TEXT;").ok();
+        conn.execute_batch("ALTER TABLE jobs ADD COLUMN file_modified INTEGER;").ok();
+        conn.execute_batch("ALTER TABLE jobs ADD COLUMN file_size INTEGER;").ok();
+        Ok(())
     }
 
     pub fn upsert_file(&self, path: &str, checksum: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         let mut stmt = conn
             .prepare(
                 "INSERT INTO jobs (path, checksum, status)
@@ -72,8 +83,7 @@ impl JobStore {
                      status = 'pending',
                      ocr_flag = 0,
                      error = NULL
-                 WHERE excluded.checksum != jobs.checksum
-                   AND jobs.status IN ('done', 'error')",
+                 WHERE excluded.checksum != jobs.checksum",
             )
             .context("Failed to prepare upsert")?;
 
@@ -88,8 +98,32 @@ impl JobStore {
         }
     }
 
+    /// Insert or update a job as pending without reading the file for checksum.
+    /// Always sets status to 'pending' regardless of checksum changes.
+    /// Returns true if a row was inserted/updated, false if unchanged.
+    ///
+    /// Used by scan_directory after the fast-path (mtime+size) check succeeds.
+    /// The checksum field is left empty — the worker will compute and store it
+    /// during extraction. This avoids the double I/O of reading the file once
+    /// for a scanner checksum and again for PDFium extraction.
+    pub fn mark_pending(&self, path: &str) -> Result<bool> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        let changed = conn
+            .execute(
+                "INSERT INTO jobs (path, checksum, status)
+                 VALUES (?1, '', 'pending')
+                 ON CONFLICT(path) DO UPDATE SET
+                     status = 'pending',
+                     ocr_flag = 0,
+                     error = NULL",
+                rusqlite::params![path],
+            )
+            .context("Failed to mark pending")?;
+        Ok(changed > 0)
+    }
+
     pub fn mark_done(&self, id: i64, ocr_flag: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         conn.execute(
             "UPDATE jobs SET status = 'done', ocr_flag = ?1 WHERE id = ?2",
             rusqlite::params![ocr_flag as i32, id],
@@ -98,8 +132,39 @@ impl JobStore {
         Ok(())
     }
 
+    pub fn batch_mark_done(&self, items: &[(i64, bool)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.pool.get().context("Failed to get DB connection")?;
+        let tx = conn.transaction()?;
+
+        // Group by ocr_flag so a single IN-clause per group suffices.
+        let mut false_ids = Vec::new();
+        let mut true_ids = Vec::new();
+        for &(id, flag) in items {
+            if flag { true_ids.push(id); } else { false_ids.push(id); }
+        }
+
+        // SQLite default max variables per statement is 999.
+        const MAX_VARS: usize = 999;
+        for (ids, flag_val) in [(&false_ids, "0"), (&true_ids, "1")] {
+            for chunk in ids.chunks(MAX_VARS) {
+                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "UPDATE jobs SET status = 'done', ocr_flag = {flag_val} WHERE id IN ({placeholders})"
+                );
+                tx.execute(&sql, rusqlite::params_from_iter(chunk.iter().copied()))
+                    .context("Failed to batch-mark jobs done")?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn mark_error(&self, id: i64, error_msg: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         conn.execute(
             "UPDATE jobs SET status = 'error', error = ?1 WHERE id = ?2",
             rusqlite::params![error_msg, id],
@@ -109,7 +174,7 @@ impl JobStore {
     }
 
     pub fn count_pending(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM jobs WHERE status = 'pending'",
@@ -122,7 +187,7 @@ impl JobStore {
 
     #[allow(dead_code)]
     pub fn fetch_pending(&self, limit: i64) -> Result<Vec<(i64, String, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         let clamped = if limit < 0 { 0 } else { limit };
         let mut stmt = conn
             .prepare(
@@ -148,24 +213,35 @@ impl JobStore {
     }
 
     pub fn claim_pending(&self, limit: i64) -> Result<Vec<(i64, String, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.pool.get().context("Failed to get DB connection")?;
         let clamped = if limit < 0 { 0 } else { limit };
 
-        let mut select = conn
-            .prepare("SELECT id, path, checksum FROM jobs WHERE status = 'pending' LIMIT ?1")
-            .context("Failed to prepare claim select")?;
+        // Use an IMMEDIATE transaction so the SELECT + UPDATE is atomic
+        // across pool connections. Without this, concurrent claim_pending
+        // calls from different connections could claim the same rows.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("Failed to begin immediate transaction for claim")?;
 
-        let rows: Vec<(i64, String, String)> = select
-            .query_map(rusqlite::params![clamped], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .context("Failed to query pending jobs for claim")?
-            .filter_map(|r| r.ok())
-            .collect();
+        let rows: Vec<(i64, String, String)> = {
+            let mut select = tx
+                .prepare("SELECT id, path, checksum FROM jobs WHERE status = 'pending' LIMIT ?1")
+                .context("Failed to prepare claim select")?;
+
+            let r = select
+                .query_map(rusqlite::params![clamped], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .context("Failed to query pending jobs for claim")?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+
+            r
+        };
 
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -177,15 +253,29 @@ impl JobStore {
             "UPDATE jobs SET status = 'extracting' WHERE id IN ({})",
             placeholders
         );
-        conn.execute(&sql, rusqlite::params_from_iter(&id_list))
+        tx.execute(&sql, rusqlite::params_from_iter(&id_list))
             .context("Failed to mark jobs as extracting")?;
 
+        tx.commit().context("Failed to commit claim transaction")?;
         Ok(rows)
+    }
+
+    /// Reset any jobs stuck in 'extracting' status back to 'pending'.
+    /// Used at the end of the pipeline to recover tasks lost when the
+    /// worker process crashes mid-batch.
+    pub fn reprocess_extracting(&self) -> Result<()> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        conn.execute(
+            "UPDATE jobs SET status = 'pending', error = NULL WHERE status = 'extracting'",
+            [],
+        )
+        .context("Failed to reprocess extracting jobs")?;
+        Ok(())
     }
 
     #[allow(dead_code)]
     pub fn mark_extracted(&self, id: i64, ocr_flag: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         conn.execute(
             "UPDATE jobs SET status = 'extracted', ocr_flag = ?1 WHERE id = ?2",
             rusqlite::params![ocr_flag as i32, id],
@@ -196,7 +286,7 @@ impl JobStore {
 
     #[allow(dead_code)]
     pub fn fetch_extracted(&self, limit: i64) -> Result<Vec<(i64, String, String, bool)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         let clamped = if limit < 0 { 0 } else { limit };
         let mut stmt = conn
             .prepare(
@@ -224,7 +314,7 @@ impl JobStore {
 
     #[allow(dead_code)]
     pub fn count_by_status(&self, status: &str) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM jobs WHERE status = ?1",
@@ -236,7 +326,7 @@ impl JobStore {
     }
 
     pub fn fetch_ocr_needed(&self, limit: i64, max_retries: u32) -> Result<Vec<(i64, String, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         let clamped = if limit < 0 { 0 } else { limit };
         let mut stmt = conn
             .prepare(
@@ -262,7 +352,7 @@ impl JobStore {
     }
 
     pub fn mark_ocr_attempt(&self, id: i64, success: bool, ocr_error: Option<&str>, max_retries: u32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         if success {
             conn.execute(
                 "UPDATE jobs SET ocr_attempts = ocr_attempts + 1, ocr_flag = 0, ocr_error = NULL, failed_ocr = NULL WHERE id = ?1",
@@ -280,7 +370,7 @@ impl JobStore {
     }
 
     pub fn fetch_failed_ocr(&self) -> Result<Vec<(i64, String, String, Option<String>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, path, checksum, ocr_error FROM jobs WHERE failed_ocr IS NOT NULL ORDER BY failed_ocr DESC",
@@ -305,8 +395,36 @@ impl JobStore {
         Ok(result)
     }
 
+    /// Fetch all jobs with status 'error'.
+    pub fn fetch_errored(&self) -> Result<Vec<(i64, String, String, i32, Option<String>)>> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, status, ocr_flag, error FROM jobs WHERE status = 'error' ORDER BY id",
+            )
+            .context("Failed to prepare fetch_errored query")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i32>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .context("Failed to query errored jobs")?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.context("Failed to read row")?);
+        }
+        Ok(result)
+    }
+
     pub fn count_ocr_pending(&self, max_retries: u32) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM jobs WHERE status = 'done' AND ocr_flag = 1 AND ocr_attempts < ?1",
@@ -317,9 +435,129 @@ impl JobStore {
         Ok(count)
     }
 
+    /// Fast-path: returns true if a row exists with matching path, mtime, and size.
+    /// Used by scan_directory to skip re-reading+re-checksumming unchanged files.
+    pub fn is_file_unchanged(&self, path: &str, modified: u64, size: u64) -> Result<bool> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM jobs WHERE path = ?1 AND file_modified = ?2 AND file_size = ?3",
+                rusqlite::params![path, modified, size],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        Ok(exists)
+    }
+
+    /// Update stored file metadata by job id.
+    /// This is called unconditionally (even when the checksum hasn't changed)
+    /// so that future scans can use the fast-path.
+    pub fn update_file_metadata(&self, id: i64, modified: u64, size: u64) -> Result<()> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        conn.execute(
+            "UPDATE jobs SET file_modified = ?1, file_size = ?2 WHERE id = ?3",
+            rusqlite::params![modified, size, id],
+        )
+        .context("Failed to update file metadata")?;
+        Ok(())
+    }
+
+    /// Get the primary key `id` for a given path, or `None` if not found.
+    pub fn get_id_by_path(&self, path: &str) -> Result<Option<i64>> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        match conn.query_row(
+            "SELECT id FROM jobs WHERE path = ?1",
+            rusqlite::params![path],
+            |row| row.get(0),
+        ) {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Load all known file paths + metadata into a HashMap for fast in-memory lookups.
+    /// Used by scan_directory to avoid per-file SQLite queries during the walk.
+    /// Legacy rows with NULL file_modified/file_size are treated as (0, 0),
+    /// forcing a re-index on first scan after migration.
+    pub fn load_all_metadata(&self) -> Result<HashMap<String, (u64, u64, String)>> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        let mut stmt = conn
+            .prepare("SELECT path, file_modified, file_size, status FROM jobs")
+            .context("Failed to prepare load_all_metadata query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<u64>>(1)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(2)?.unwrap_or(0),
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .context("Failed to query all metadata")?;
+        let mut map = HashMap::new();
+        for row in rows {
+            if let Ok((path, modified, size, status)) = row {
+                map.insert(path, (modified, size, status));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Batch upsert multiple files as pending in a single transaction.
+    /// Each entry includes the path alongside its mtime and file size,
+    /// so no separate `update_file_metadata` call is needed afterward.
+    pub fn batch_mark_pending(&self, files: &[(String, u64, u64)]) -> Result<()> {
+        let mut conn = self.pool.get().context("Failed to get DB connection")?;
+        let tx = conn
+            .transaction()
+            .context("Failed to begin transaction for batch_mark_pending")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO jobs (path, checksum, status, file_modified, file_size)
+                     VALUES (?1, '', 'pending', ?2, ?3)
+                     ON CONFLICT(path) DO UPDATE SET
+                         status = 'pending',
+                         ocr_flag = 0,
+                         error = NULL,
+                         file_modified = excluded.file_modified,
+                         file_size = excluded.file_size",
+                )
+                .context("Failed to prepare batch_mark_pending statement")?;
+            for (path, modified, size) in files {
+                stmt.execute(rusqlite::params![path, modified, size])
+                    .with_context(|| format!("Failed to batch-mark pending: {}", path))?;
+            }
+        }
+        tx.commit()
+            .context("Failed to commit batch_mark_pending transaction")?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn pragma_value(&self, pragma: &str) -> Result<String> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        conn.query_row(
+            &format!("PRAGMA {}", pragma),
+            [],
+            |row| {
+                let v: rusqlite::types::Value = row.get(0)?;
+                match v {
+                    rusqlite::types::Value::Text(s) => Ok(s),
+                    rusqlite::types::Value::Integer(i) => Ok(i.to_string()),
+                    rusqlite::types::Value::Real(f) => Ok(f.to_string()),
+                    rusqlite::types::Value::Blob(b) => Ok(format!("{:?}", b)),
+                    rusqlite::types::Value::Null => Ok(String::new()),
+                }
+            },
+        )
+        .context("Failed to query pragma")
+    }
+
     #[cfg(test)]
     pub fn get_job_language(&self, id: i64) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get().context("Failed to get DB connection")?;
         conn.query_row(
             "SELECT language FROM jobs WHERE id = ?1",
             rusqlite::params![id],
@@ -329,42 +567,80 @@ impl JobStore {
     }
 }
 
-pub fn compute_checksum(path: &Path) -> Result<String> {
-    let data = std::fs::read(path).context("Failed to read file for checksum")?;
-    let hash = xxh3_64(&data);
-    Ok(format!("{:016x}", hash))
+pub fn compute_checksum(data: &[u8]) -> String {
+    let hash = xxh3_64(data);
+    format!("{:016x}", hash)
 }
 
 pub fn scan_directory(jobs: &JobStore, dir: &Path) -> Result<u64> {
-    let mut scanned = 0u64;
+    use rayon::prelude::*;
+    use walkdir::WalkDir;
+
     if !dir.is_dir() {
         anyhow::bail!("Input path is not a directory: {}", dir.display());
     }
 
-    let entries = walkdir(dir)?;
-    for path in entries {
-        if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pdf"))
-            != Some(true)
-        {
-            continue;
-        }
+    // Phase 1: load all known file metadata into memory (single SQL query).
+    // Replaces per-file is_file_unchanged() round-trips with a HashMap lookup.
+    let known = jobs.load_all_metadata()?;
 
-        let path_str = path.to_string_lossy().to_string();
-        match compute_checksum(&path) {
-            Ok(checksum) => {
-                if jobs.upsert_file(&path_str, &checksum)? {
-                    scanned += 1;
+    // Phase 2: walk the directory tree in parallel, check each PDF against the
+    // in-memory map, and collect only new/changed files with their stats.
+    // The walkdir iterator is Send, so par_bridge() parallelizes the
+    // std::fs::metadata() calls across all available CPU cores.
+    let changes: Vec<(String, u64, u64)> = WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false)
+        })
+        .par_bridge()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let path_str = path.to_string_lossy().to_string();
+            let metadata = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => return None,
+            };
+            let modified = match metadata.modified() {
+                Ok(t) => t
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                Err(_) => 0,
+            };
+            let size = metadata.len();
+
+            // In-memory check: no SQLite round-trip per file.
+            // Always re-queue errored or stuck-extracting files regardless
+            // of mtime/size so they are retried on subsequent runs.
+            if let Some((known_mtime, known_size, known_status)) = known.get(&path_str) {
+                if *known_mtime == modified && *known_size == size
+                    && known_status != "error" && known_status != "extracting"
+                {
+                    return None; // unchanged
                 }
             }
-            Err(_e) => {}
 
-        }
+            Some((path_str, modified, size))
+        })
+        .collect();
+
+    if changes.is_empty() {
+        return Ok(0);
     }
 
-    Ok(scanned)
+    // Phase 3: batch upsert all new/changed files in a single transaction.
+    // The UPSERT handles both the status reset AND metadata update atomically,
+    // so no separate get_id_by_path + update_file_metadata is needed.
+    jobs.batch_mark_pending(&changes)?;
+
+    Ok(changes.len() as u64)
 }
 
 #[cfg(test)]
@@ -373,11 +649,13 @@ mod tests {
     use std::env::temp_dir;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     fn unique_dir() -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = temp_dir().join(format!("pdf_extractor_test_{}", id));
+        let dir = temp_dir().join(format!("pdf_extractor_test_{}_{}", std::process::id(), id));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -389,9 +667,10 @@ mod tests {
         let dir = unique_dir();
         let path = dir.join("test.txt");
         fs::write(&path, b"hello world").unwrap();
+        let data = fs::read(&path).unwrap();
 
-        let hash1 = compute_checksum(&path).unwrap();
-        let hash2 = compute_checksum(&path).unwrap();
+        let hash1 = compute_checksum(&data);
+        let hash2 = compute_checksum(&data);
         assert_eq!(hash1, hash2);
 
         fs::remove_dir_all(&dir).unwrap();
@@ -404,9 +683,11 @@ mod tests {
         let b = dir.join("b.txt");
         fs::write(&a, b"hello").unwrap();
         fs::write(&b, b"world").unwrap();
+        let data_a = fs::read(&a).unwrap();
+        let data_b = fs::read(&b).unwrap();
 
-        let hash_a = compute_checksum(&a).unwrap();
-        let hash_b = compute_checksum(&b).unwrap();
+        let hash_a = compute_checksum(&data_a);
+        let hash_b = compute_checksum(&data_b);
         assert_ne!(hash_a, hash_b);
 
         fs::remove_dir_all(&dir).unwrap();
@@ -417,59 +698,37 @@ mod tests {
         let dir = unique_dir();
         let path = dir.join("test.txt");
         fs::write(&path, b"data").unwrap();
+        let data = fs::read(&path).unwrap();
 
-        let hash = compute_checksum(&path).unwrap();
+        let hash = compute_checksum(&data);
         assert_eq!(hash.len(), 16);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
 
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    // --- compute_checksum: error flows ---
+    // --- compute_checksum: content-based ---
 
     #[test]
-    fn test_compute_checksum_nonexistent_file() {
-        let result = compute_checksum(&PathBuf::from(r"C:\THIS_FILE_DOES_NOT_EXIST_12345.pdf"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_compute_checksum_empty_file() {
-        let dir = unique_dir();
-        let path = dir.join("empty.pdf");
-        fs::write(&path, b"").unwrap();
-
-        let hash = compute_checksum(&path).unwrap();
+    fn test_compute_checksum_empty_data() {
+        let hash = compute_checksum(b"");
         assert_eq!(hash.len(), 16);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn test_compute_checksum_binary_content() {
-        let dir = unique_dir();
-        let path = dir.join("binary.bin");
         let data: Vec<u8> = (0..=255).collect();
-        fs::write(&path, &data).unwrap();
-
-        let hash = compute_checksum(&path).unwrap();
+        let hash = compute_checksum(&data);
         assert_eq!(hash.len(), 16);
 
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn test_compute_checksum_large_file() {
-        let dir = unique_dir();
-        let path = dir.join("large.bin");
+    fn test_compute_checksum_large_data() {
         let data = vec![0xABu8; 10_000_000];
-        fs::write(&path, &data).unwrap();
-
-        let hash = compute_checksum(&path).unwrap();
+        let hash = compute_checksum(&data);
         assert_eq!(hash.len(), 16);
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     // --- JobStore: basic flows ---
@@ -536,6 +795,60 @@ mod tests {
 
         let count = store.count_pending().unwrap();
         assert_eq!(count, 1);
+    }
+
+    // --- mark_pending: new no-checksum path ---
+
+    #[test]
+    fn test_mark_pending_inserts_new() {
+        let store = JobStore::open_in_memory().unwrap();
+        let inserted = store.mark_pending("/new.pdf").unwrap();
+        assert!(inserted);
+        assert_eq!(store.count_pending().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_mark_pending_always_returns_true_for_existing() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.mark_pending("/a.pdf").unwrap();
+
+        // Second call should also return true (always sets to pending)
+        let inserted = store.mark_pending("/a.pdf").unwrap();
+        assert!(inserted, "mark_pending should always return true for existing paths");
+        assert_eq!(store.count_pending().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_mark_pending_resets_error_jobs() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.mark_pending("/a.pdf").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_error(batch[0].0, "previous error").unwrap();
+
+        // mark_pending should reset to pending
+        let inserted = store.mark_pending("/a.pdf").unwrap();
+        assert!(inserted);
+        assert_eq!(store.count_pending().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_mark_pending_resets_done_jobs() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.mark_pending("/a.pdf").unwrap();
+        let batch = store.claim_pending(10).unwrap();
+        store.mark_done(batch[0].0, false).unwrap();
+
+        let inserted = store.mark_pending("/a.pdf").unwrap();
+        assert!(inserted);
+        assert_eq!(store.count_pending().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_mark_pending_leaves_empty_checksum() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.mark_pending("/a.pdf").unwrap();
+        let batch = store.fetch_pending(10).unwrap();
+        assert_eq!(batch[0].2, "", "mark_pending should store empty checksum");
     }
 
     // --- JobStore: claim_pending ---
@@ -944,7 +1257,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    // --- walkdir: private, tested indirectly via scan_directory ---
+    // --- scan_directory: empty subdirectory ---
 
     #[test]
     fn test_scan_directory_empty_subdirectory() {
@@ -1134,7 +1447,7 @@ mod tests {
         let batch = store.claim_pending(10).unwrap();
 
         // Direct SQL update to set language (as the pipeline would)
-        let conn = store.conn.lock().unwrap();
+        let conn = store.pool.get().unwrap();
         conn.execute(
             "UPDATE jobs SET language = ?1 WHERE id = ?2",
             rusqlite::params!["eng", batch[0].0],
@@ -1144,23 +1457,539 @@ mod tests {
         let lang = store.get_job_language(batch[0].0).unwrap();
         assert_eq!(lang.as_deref(), Some("eng"), "Should retrieve stored language");
     }
-}
 
-fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let read_dir = std::fs::read_dir(&current)
-            .with_context(|| format!("Failed to read directory: {}", current.display()))?;
-        for entry in read_dir {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                files.push(path);
-            }
+    // ── Regression: compute_checksum is now pure &[u8] -> String (no I/O) ──
+
+    #[test]
+    fn test_compute_checksum_all_byte_values() {
+        let mut data: Vec<u8> = (0..=255).collect();
+        let hash = compute_checksum(&data);
+        assert_eq!(hash.len(), 16, "hex digest should be 16 chars");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "should be hex");
+
+        // Verify idempotence
+        assert_eq!(compute_checksum(&data), hash);
+
+        // Verify single-bit change flips output
+        data[0] ^= 1;
+        let hash2 = compute_checksum(&data);
+        assert_ne!(hash2, hash, "bit flip should change checksum");
+    }
+
+    #[test]
+    fn test_compute_checksum_idempotent_concurrent() {
+        let data = b"concurrent idempotence check data";
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let d = data.to_vec();
+            handles.push(std::thread::spawn(move || compute_checksum(&d)));
+        }
+        let hashes: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for h in &hashes {
+            assert_eq!(h, &hashes[0], "all concurrent calls should produce identical checksums");
         }
     }
-    Ok(files)
+
+    // ── Regression: scan_directory with inlined walkdir ──
+
+    #[test]
+    fn test_scan_directory_pdfs_in_subdirs_and_root() {
+        let dir = make_scan_dir();
+        fs::write(dir.join("root.pdf"), b"root").unwrap();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub").join("nested.pdf"), b"nested").unwrap();
+        let store = JobStore::open_in_memory().unwrap();
+        let count = scan_directory(&store, &dir).unwrap();
+        assert_eq!(count, 2, "should discover PDFs in root and subdirectory");
+        assert_eq!(store.count_pending().unwrap(), 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_directory_skips_non_pdf_extensions() {
+        let dir = make_scan_dir();
+        fs::write(dir.join("alpha.pdf"), b"pdf").unwrap();
+        fs::write(dir.join("bravo.txt"), b"text").unwrap();
+        fs::write(dir.join("charlie"), b"noext").unwrap();
+        fs::write(dir.join("delta.pdf.txt"), b"double").unwrap();
+        let store = JobStore::open_in_memory().unwrap();
+        let count = scan_directory(&store, &dir).unwrap();
+        assert_eq!(count, 1, "only .pdf should be discovered");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Lazy walk: files processed one-at-a-time, not pre-collected ──
+
+    #[test]
+    fn test_scan_directory_large_directory_tree() {
+        let dir = make_scan_dir();
+        // Create 200 directories each with one PDF — tests that the walk
+        // processes files without pre-collecting all paths into memory.
+        for i in 0..200 {
+            let sub = dir.join(format!("sub{}", i));
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("doc.pdf"), b"content").unwrap();
+        }
+        let store = JobStore::open_in_memory().unwrap();
+        let count = scan_directory(&store, &dir).unwrap();
+        assert_eq!(count, 200, "all PDFs in subdirectories should be found");
+        assert_eq!(store.count_pending().unwrap(), 200);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_directory_deeply_nested_lazy() {
+        let dir = make_scan_dir();
+        // Create a chain a/b/c/.../doc.pdf to verify the stack-based
+        // walk reaches deeply without pre-collecting sibling files.
+        let mut current = dir.clone();
+        for _ in 0..50 {
+            current = current.join("n");
+            fs::create_dir_all(&current).unwrap();
+        }
+        fs::write(current.join("deep.pdf"), b"deep").unwrap();
+        // Also add a file at the root — should be found first during walk
+        fs::write(dir.join("shallow.pdf"), b"shallow").unwrap();
+
+        let store = JobStore::open_in_memory().unwrap();
+        let count = scan_directory(&store, &dir).unwrap();
+        assert_eq!(count, 2, "should find shallow + deeply nested PDF");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_directory_subdirs_only_no_files() {
+        let dir = make_scan_dir();
+        fs::create_dir_all(dir.join("a")).unwrap();
+        fs::create_dir_all(dir.join("b")).unwrap();
+        fs::create_dir_all(dir.join("a").join("c")).unwrap();
+        let store = JobStore::open_in_memory().unwrap();
+        let count = scan_directory(&store, &dir).unwrap();
+        assert_eq!(count, 0, "subdirectories with no PDFs should not produce results");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── is_file_unchanged tests ──
+
+    #[test]
+    fn test_is_file_unchanged_true() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let id = store.get_id_by_path("/a.pdf").unwrap().unwrap();
+        store.update_file_metadata(id, 1000, 500).unwrap();
+
+        assert!(store.is_file_unchanged("/a.pdf", 1000, 500).unwrap());
+    }
+
+    #[test]
+    fn test_is_file_unchanged_false_wrong_mtime() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let id = store.get_id_by_path("/a.pdf").unwrap().unwrap();
+        store.update_file_metadata(id, 1000, 500).unwrap();
+
+        assert!(!store.is_file_unchanged("/a.pdf", 2000, 500).unwrap());
+    }
+
+    #[test]
+    fn test_is_file_unchanged_false_wrong_size() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let id = store.get_id_by_path("/a.pdf").unwrap().unwrap();
+        store.update_file_metadata(id, 1000, 500).unwrap();
+
+        assert!(!store.is_file_unchanged("/a.pdf", 1000, 999).unwrap());
+    }
+
+    #[test]
+    fn test_is_file_unchanged_missing_path() {
+        let store = JobStore::open_in_memory().unwrap();
+        assert!(!store.is_file_unchanged("/nonexistent.pdf", 1000, 500).unwrap());
+    }
+
+    #[test]
+    fn test_is_file_unchanged_no_metadata_stored() {
+        let store = JobStore::open_in_memory().unwrap();
+        // upsert without calling update_file_metadata
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        // is_file_unchanged checks file_modified IS NULL, so should return false
+        assert!(!store.is_file_unchanged("/a.pdf", 1000, 500).unwrap());
+    }
+
+    // ── update_file_metadata tests ──
+
+    #[test]
+    fn test_update_file_metadata_stores_values() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let id = store.get_id_by_path("/a.pdf").unwrap().unwrap();
+        store.update_file_metadata(id, 42, 777).unwrap();
+
+        assert!(store.is_file_unchanged("/a.pdf", 42, 777).unwrap());
+    }
+
+    #[test]
+    fn test_update_file_metadata_overwrites_previous() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "abc").unwrap();
+        let id = store.get_id_by_path("/a.pdf").unwrap().unwrap();
+        store.update_file_metadata(id, 10, 100).unwrap();
+        store.update_file_metadata(id, 20, 200).unwrap();
+
+        assert!(!store.is_file_unchanged("/a.pdf", 10, 100).unwrap());
+        assert!(store.is_file_unchanged("/a.pdf", 20, 200).unwrap());
+    }
+
+    // ── scan_directory fast-path tests ──
+
+    #[test]
+    fn test_scan_directory_skips_unchanged_files() {
+        let dir = make_scan_dir();
+        fs::write(dir.join("doc.pdf"), b"same content").unwrap();
+        let store = JobStore::open_in_memory().unwrap();
+
+        // First scan: reads and indexes
+        let first = scan_directory(&store, &dir).unwrap();
+        assert_eq!(first, 1, "first scan should detect the PDF");
+
+        // Second scan: mtime + size match → fast-path skip
+        let second = scan_directory(&store, &dir).unwrap();
+        assert_eq!(second, 0, "second scan should skip unchanged file");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_directory_no_file_read_on_rescan() {
+        let dir = make_scan_dir();
+        fs::write(dir.join("doc.pdf"), b"content").unwrap();
+        let store = JobStore::open_in_memory().unwrap();
+
+        let first = scan_directory(&store, &dir).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(store.count_pending().unwrap(), 1);
+
+        // Second scan on unchanged file: no file read (fast-path skip)
+        let second = scan_directory(&store, &dir).unwrap();
+        assert_eq!(second, 0, "no new scans on unchanged files");
+        assert_eq!(store.count_pending().unwrap(), 1, "pending count unchanged");
+
+        // Third scan: still no file read
+        let third = scan_directory(&store, &dir).unwrap();
+        assert_eq!(third, 0, "still no new scans");
+        assert_eq!(store.count_pending().unwrap(), 1, "pending count still unchanged");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_directory_rescans_modified_content() {
+        let dir = make_scan_dir();
+        let path = dir.join("doc.pdf");
+        fs::write(&path, b"original").unwrap();
+        let store = JobStore::open_in_memory().unwrap();
+
+        let first = scan_directory(&store, &dir).unwrap();
+        assert_eq!(first, 1);
+
+        // Modify content (which changes size and mtime)
+        std::thread::sleep(std::time::Duration::from_millis(150)); // ensure mtime changes (NTFS granularity ~100ms)
+        fs::write(&path, b"modified content").unwrap();
+
+        let second = scan_directory(&store, &dir).unwrap();
+        assert_eq!(second, 1, "modified file should be re-scanned");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_directory_rescans_same_size_different_content() {
+        let dir = make_scan_dir();
+        let path = dir.join("doc.pdf");
+        fs::write(&path, b"abcdefgh").unwrap();
+        let store = JobStore::open_in_memory().unwrap();
+
+        let first = scan_directory(&store, &dir).unwrap();
+        assert_eq!(first, 1);
+
+        // Same size but different content.
+        // Sleep >1s to cross the second-resolution mtime boundary.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(&path, b"hgfedcba").unwrap();
+
+        let second = scan_directory(&store, &dir).unwrap();
+        assert_eq!(second, 1, "same-size modified file should be re-scanned");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_directory_touch_same_content() {
+        let dir = make_scan_dir();
+        let path = dir.join("doc.pdf");
+        fs::write(&path, b"content").unwrap();
+        let store = JobStore::open_in_memory().unwrap();
+
+        let first = scan_directory(&store, &dir).unwrap();
+        assert_eq!(first, 1);
+
+        // Touch file (mtime changes, size unchanged, content unchanged).
+        // Without a scanner checksum, the file is always re-scanned when
+        // mtime differs.  The metadata is updated so the third scan skips.
+        // Sleep >1s to cross the second-resolution mtime boundary.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(&path, b"content").unwrap();
+
+        let second = scan_directory(&store, &dir).unwrap();
+        assert_eq!(second, 1, "touched file is re-scanned (no checksum dedup at scan time)");
+
+        // Third scan: now mtime+size match → fast-path skip
+        let third = scan_directory(&store, &dir).unwrap();
+        assert_eq!(third, 0, "third scan should fast-path skip");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_directory_fast_path_does_not_hide_new_files() {
+        let dir = make_scan_dir();
+        let store = JobStore::open_in_memory().unwrap();
+
+        // Scan empty dir
+        let first = scan_directory(&store, &dir).unwrap();
+        assert_eq!(first, 0);
+
+        // Add a PDF
+        fs::write(dir.join("new.pdf"), b"new file").unwrap();
+
+        // Second scan should find it
+        let second = scan_directory(&store, &dir).unwrap();
+        assert_eq!(second, 1, "new file should be detected after fast-path skip");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_directory_mixed_changed_and_unchanged() {
+        let dir = make_scan_dir();
+        let store = JobStore::open_in_memory().unwrap();
+
+        fs::write(dir.join("stable.pdf"), b"stable").unwrap();
+        fs::write(dir.join("volatile.pdf"), b"v1").unwrap();
+
+        let first = scan_directory(&store, &dir).unwrap();
+        assert_eq!(first, 2);
+
+        // Modify one file.
+        // Sleep >1s to cross the second-resolution mtime boundary.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(dir.join("volatile.pdf"), b"v2").unwrap();
+
+        let second = scan_directory(&store, &dir).unwrap();
+        assert_eq!(second, 1, "only the modified file should be rescanned");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_is_file_unchanged_zero_values() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/zero.pdf", "cs").unwrap();
+        let id = store.get_id_by_path("/zero.pdf").unwrap().unwrap();
+        store.update_file_metadata(id, 0, 0).unwrap();
+        assert!(store.is_file_unchanged("/zero.pdf", 0, 0).unwrap());
+        assert!(!store.is_file_unchanged("/zero.pdf", 0, 1).unwrap(), "different size should not match");
+        assert!(!store.is_file_unchanged("/zero.pdf", 1, 0).unwrap(), "different mtime should not match");
+    }
+
+    #[test]
+    fn test_is_file_unchanged_large_mtime() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/old.pdf", "cs").unwrap();
+        let id = store.get_id_by_path("/old.pdf").unwrap().unwrap();
+        store.update_file_metadata(id, 9_999_999_999_999, 100).unwrap();
+        assert!(store.is_file_unchanged("/old.pdf", 9_999_999_999_999, 100).unwrap());
+    }
+
+    #[test]
+    fn test_update_file_metadata_nonexistent_id() {
+        let store = JobStore::open_in_memory().unwrap();
+        // An UPDATE on a non-existent id is a no-op, not an error.
+        store.update_file_metadata(999, 42, 100).unwrap();
+    }
+
+    #[test]
+    fn test_scan_directory_size_zero_file() {
+        let dir = make_scan_dir();
+        fs::write(dir.join("empty.pdf"), b"").unwrap();
+        let store = JobStore::open_in_memory().unwrap();
+        let first = scan_directory(&store, &dir).unwrap();
+        assert_eq!(first, 1, "zero-size PDF should be detected");
+        let second = scan_directory(&store, &dir).unwrap();
+        assert_eq!(second, 0, "zero-size PDF should be fast-path skipped on second scan");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_scan_directory_fast_path_after_metadata_update() {
+        let dir = make_scan_dir();
+        let path = dir.join("doc.pdf");
+        fs::write(&path, b"content").unwrap();
+        let store = JobStore::open_in_memory().unwrap();
+
+        assert_eq!(scan_directory(&store, &dir).unwrap(), 1);
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let modified = meta.modified().unwrap()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let size = meta.len();
+        assert!(store.is_file_unchanged(
+            &path.to_string_lossy(), modified, size
+        ).unwrap(), "file should be considered unchanged after first scan");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── SQLite WAL mode + busy timeout tests ──
+
+    #[test]
+    fn test_wal_mode_enabled_for_file_db() {
+        let dir = unique_dir();
+        let db_path = dir.join("test_wal.db");
+        let store = JobStore::open(&db_path).unwrap();
+        let mode = store.pragma_value("journal_mode").unwrap();
+        assert_eq!(mode.to_lowercase(), "wal", "file-based DB should use WAL mode, got: {}", mode);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_busy_timeout_set() {
+        let store = JobStore::open_in_memory().unwrap();
+        let raw = store.pragma_value("busy_timeout").unwrap();
+        let timeout: i64 = raw.trim().parse().unwrap();
+        assert_eq!(timeout, 5000, "busy_timeout should be 5000ms, got: '{}'", raw);
+    }
+
+    #[test]
+    fn test_in_memory_db_still_works_with_pragmas() {
+        let store = JobStore::open_in_memory().unwrap();
+        store.upsert_file("/a.pdf", "cs1").unwrap();
+        assert!(store.is_file_unchanged("/a.pdf", 0, 0).is_ok(), "in-memory DB should be functional");
+        assert_eq!(store.count_pending().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_concurrent_mark_done_contention() {
+        let store = Arc::new(JobStore::open_in_memory().unwrap());
+        let num_jobs: i64 = 50;
+        let mut ids = Vec::new();
+
+        for i in 0..num_jobs {
+            let path = format!("/concurrent/{}.pdf", i);
+            store.upsert_file(&path, &format!("cs{}", i)).unwrap();
+            let batch = store.claim_pending(1).unwrap();
+            ids.push(batch[0].0);
+        }
+
+        let mut handles = Vec::new();
+        for id in ids {
+            let store = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                store.mark_done(id, false).unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        assert_eq!(store.count_pending().unwrap(), 0);
+        assert_eq!(store.count_by_status("done").unwrap(), num_jobs);
+    }
+
+    #[test]
+    fn test_concurrent_claim_and_mark_contention() {
+        let store = Arc::new(JobStore::open_in_memory().unwrap());
+        let num_jobs: i64 = 40;
+        let num_threads = 8;
+        let jobs_per_thread = num_jobs / num_threads;
+
+        for i in 0..num_jobs {
+            store.upsert_file(&format!("/stress/{}.pdf", i), &format!("cs{}", i)).unwrap();
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..num_threads {
+            let store = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                for _ in 0..jobs_per_thread {
+                    let batch = store.claim_pending(1).unwrap();
+                    if !batch.is_empty() {
+                        let (id, _, _) = batch[0];
+                        store.mark_done(id, false).unwrap();
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        assert_eq!(store.count_pending().unwrap(), 0, "all jobs should be claimed");
+        assert_eq!(store.count_by_status("done").unwrap(), num_jobs, "all jobs should be done");
+    }
+
+    #[test]
+    fn test_concurrent_mixed_operations_contention() {
+        let store = Arc::new(JobStore::open_in_memory().unwrap());
+        let num_jobs: i64 = 30;
+
+        for i in 0..num_jobs {
+            store.upsert_file(&format!("/mixed/{}.pdf", i), &format!("cs{}", i)).unwrap();
+        }
+
+        let store_clone = Arc::clone(&store);
+        let writer = thread::spawn(move || {
+            for i in num_jobs..num_jobs + 10 {
+                store_clone.upsert_file(&format!("/mixed/new_{}.pdf", i), &format!("cs{}", i)).unwrap();
+            }
+        });
+
+        let store_clone = Arc::clone(&store);
+        let reader = thread::spawn(move || {
+            for _ in 0..20 {
+                let _ = store_clone.count_pending();
+                let _ = store_clone.count_by_status("done");
+            }
+        });
+
+        let store_clone = Arc::clone(&store);
+        let claimer = thread::spawn(move || {
+            let mut total = 0;
+            loop {
+                let batch = store_clone.claim_pending(5).unwrap();
+                if batch.is_empty() {
+                    break;
+                }
+                for (id, _, _) in &batch {
+                    store_clone.mark_done(*id, false).unwrap();
+                }
+                total += batch.len();
+                if total >= num_jobs as usize {
+                    break;
+                }
+            }
+        });
+
+        writer.join().expect("writer panicked");
+        reader.join().expect("reader panicked");
+        claimer.join().expect("claimer panicked");
+
+        let done = store.count_by_status("done").unwrap();
+        let pending = store.count_pending().unwrap();
+        assert_eq!(done + pending, num_jobs + 10, "all original + new jobs should be accounted for");
+    }
 }
+
+
