@@ -8,6 +8,17 @@ namespace PdfExplorer.Services;
 public sealed class PdfEngine : IDisposable
 {
     private const string Dll = "pdf_extractor_capi.dll";
+
+    // Error codes matching pdf_extractor_capi/src/lib.rs
+    public const int ErrGeneral = -1;
+    public const int ErrNotFound = -2;
+    public const int ErrInvalidParam = -3;
+    public const int ErrBufferRetry = -4;
+    public const int ErrPoisoned = -100;
+    public const int ErrNotInit = -101;
+    public const int ErrRegNotInit = -102;
+    public const int ErrInvalidUtf8 = -103;
+    public const int ErrNullPtr = -105;
     private readonly string _settingsPath;
     private uint? _indexingCollId;
 
@@ -118,6 +129,9 @@ public sealed class PdfEngine : IDisposable
     private static extern int pdf_search_text_in_pdf(byte[] path, byte[] term, byte[] outJson, ref uint outLen);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_search_text_in_mem(byte[] data, int len, byte[] term, byte[] outJson, ref uint outLen);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern void pdf_free_string(IntPtr ptr);
 
     public SearchResponse Search(string query, int limit = 1000, int offset = 0, uint? collId = null)
@@ -175,6 +189,15 @@ public sealed class PdfEngine : IDisposable
     {
         Log($"SearchTextInPdf(path='{path}', term='{term}')");
         var json = CallBuf((buf, ref len) => pdf_search_text_in_pdf(Utf8(path), Utf8(term), buf, ref len));
+        var result = JsonSerializer.Deserialize<List<WordPosition>>(json) ?? new List<WordPosition>();
+        Log($"SearchTextInPdf returned: {result.Count} positions");
+        return result;
+    }
+
+    public List<WordPosition> SearchTextInPdf(byte[] pdfData, string term)
+    {
+        Log($"SearchTextInPdf({pdfData.Length} bytes, term='{term}')");
+        var json = CallBuf((buf, ref len) => pdf_search_text_in_mem(pdfData, pdfData.Length, Utf8(term), buf, ref len));
         var result = JsonSerializer.Deserialize<List<WordPosition>>(json) ?? new List<WordPosition>();
         Log($"SearchTextInPdf returned: {result.Count} positions");
         return result;
@@ -543,7 +566,7 @@ public sealed class PdfEngine : IDisposable
         int retries = 0;
         const int maxRetries = 10;
         const uint maxBufSize = 50 * 1024 * 1024; // 50 MB
-        while (rc == -4 && retries < maxRetries)
+        while (rc == ErrBufferRetry && retries < maxRetries)
         {
             retries++;
             if (len > maxBufSize)
@@ -551,7 +574,7 @@ public sealed class PdfEngine : IDisposable
             buf = new byte[len];
             rc = nativeCall(buf, ref len);
         }
-        if (rc == -4)
+        if (rc == ErrBufferRetry)
             throw new InvalidOperationException($"CallBuf buffer still insufficient after {maxRetries} retries (last len={len})");
         if (rc != 0)
             ThrowOnError(rc, this);

@@ -99,9 +99,54 @@ public sealed class PdfiumPageRenderer : IDisposable
         }
     }
 
-    public int PageCount
+    public int GetPageCount()
     {
-        get { lock (_lock) { return _pageCount; } }
+        lock (_lock) { return _pageCount; }
+    }
+
+    [Obsolete("Use GetPageCount() instead")]
+    public int PageCount => GetPageCount();
+
+    /// <summary>
+    /// Opens a PDF document from a byte array (already read from disk).
+    /// Use this overload to avoid reading the file twice when the caller
+    /// already has the bytes in memory (e.g. from SearchTextInPdf).
+    /// </summary>
+    public void OpenDocument(byte[] pdfData, string? debugPath = null)
+    {
+        lock (_lock)
+        {
+            if (_docHandle >= 0)
+            {
+                Log($"OpenDocument: closing previous handle={_docHandle}");
+                lock (GlobalPdfiumLock)
+                {
+                    pdf_close_document(_docHandle);
+                }
+                _docHandle = -1;
+                _pageCount = 0;
+            }
+
+            Log($"OpenDocument: '{debugPath ?? "(bytes)"}' ({pdfData.Length} bytes)");
+            int rc;
+            lock (GlobalPdfiumLock)
+            {
+                rc = pdf_open_document_mem(pdfData, pdfData.Length);
+            }
+            Log($"  pdf_open_document_mem returned {rc}");
+
+            if (rc < 0)
+                throw new InvalidOperationException($"Failed to open PDF (error {rc})");
+
+            _docHandle = rc;
+            int count;
+            lock (GlobalPdfiumLock)
+            {
+                count = pdf_document_page_count(_docHandle);
+            }
+            _pageCount = count;
+            Log($"  Document opened, handle={_docHandle}, pages={_pageCount}");
+        }
     }
 
     // ── Raw page rendering (thread-safe, no WPF objects) ─────────

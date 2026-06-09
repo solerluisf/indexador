@@ -54,7 +54,7 @@
                                         <TextBlock Text="{Binding FolderPath}" FontSize="10" Foreground="Gray" TextWrapping="NoWrap"/>
                                         <TextBlock Text="{Binding Snippet}" FontSize="10" Foreground="DimGray"
                                                    TextWrapping="Wrap" MaxHeight="40"/>
-                                        <TextBlock Text="{Binding Score, StringFormat='Score: {0:F2}'}" FontSize="9" Foreground="DarkBlue"/>
+                                        <TextBlock Text="{Binding Score, Mode=OneWay, StringFormat='Score: {0:F2}'}" FontSize="9" Foreground="DarkBlue"/>
                                     </StackPanel>
                                 </Grid>
                             </Border>

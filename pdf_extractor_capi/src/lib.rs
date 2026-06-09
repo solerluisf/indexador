@@ -56,6 +56,10 @@ static PROCESS_CALLBACK: OnceLock<Mutex<Option<extern "C" fn(*const u8, u32)>>> 
 // ---------------------------------------------------------------------------
 // Error codes
 // ---------------------------------------------------------------------------
+const ERR_GENERAL: i32 = -1;
+const ERR_NOT_FOUND: i32 = -2;
+const ERR_INVALID_PARAM: i32 = -3;
+const ERR_BUFFER_RETRY: i32 = -4;
 const ERR_POISONED: i32 = -100;
 const ERR_NOT_INIT: i32 = -101;
 const ERR_REG_NOT_INIT: i32 = -102;
@@ -228,7 +232,7 @@ unsafe fn write_to_buffer(data: &[u8], out: *mut c_char, out_len: *mut u32) -> i
     let needed = data.len();
     if capacity < needed {
         *out_len = needed as u32;
-        return ERR_BUFFER_TOO_SMALL;
+        return ERR_BUFFER_RETRY;
     }
     std::ptr::copy_nonoverlapping(data.as_ptr(), out as *mut u8, needed);
     *out_len = needed as u32;
@@ -718,13 +722,223 @@ pub unsafe extern "C" fn pdf_get_term_positions(
 }
 
 // ---------------------------------------------------------------------------
-// pdf_search_text_in_pdf
-// Searches for `term` inside the PDF at `path` using PDFium's text search API
-// (FPDFText_FindStart / FPDFText_FindNext), then returns per-character
-// bounding boxes merged by line — one highlight rectangle per text line per
-// match.  This completely replaces the old PositionStore‑based approach and
-// correctly handles multi‑word phrases that span across lines.
+// pdf_search_text_in_mem / pdf_search_text_in_pdf
+// Searches for `term` inside the PDF using PDFium's text search API
 // ---------------------------------------------------------------------------
+
+/// Internal implementation shared by both `pdf_search_text_in_mem` and
+/// `pdf_search_text_in_pdf`.  Takes raw PDF bytes, loads them via PDFium,
+/// and returns JSON-encoded positions.
+unsafe fn search_text_in_pdf_impl(
+    pdf_data: &[u8],
+    term_str: &str,
+    out_json: *mut c_char,
+    out_len: *mut u32,
+) -> i32 {
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(pdf) => pdf,
+        None => {
+            set_error("pdfium.dll not available".into());
+            return ERR_GENERAL;
+        }
+    };
+
+    let doc = unsafe { (pdfium.FPDF_LoadMemDocument)(pdf_data.as_ptr(), pdf_data.len() as i32, std::ptr::null()) };
+    if doc.is_null() {
+        let err = unsafe { (pdfium.FPDF_GetLastError)() };
+        set_error(format!("PDFium error {}: {}", err, pdf_extractor::pdfium::error_str(err)));
+        return ERR_GENERAL;
+    }
+
+    let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+    let normalized_term: String = term_str.nfkc().collect();
+
+    // Collect all per‑character positions, grouped by page later
+    let mut all_positions: Vec<pdf_extractor::positions::StoredPosition> = Vec::new();
+
+    for page_idx in 0..page_count {
+        let pdf_page = unsafe { (pdfium.FPDF_LoadPage)(doc, page_idx) };
+        if pdf_page.is_null() {
+            continue;
+        }
+
+        let text_page = unsafe { (pdfium.FPDFText_LoadPage)(pdf_page) };
+        if text_page.is_null() {
+            unsafe { (pdfium.FPDF_ClosePage)(pdf_page) };
+            continue;
+        }
+
+        let char_count = unsafe { (pdfium.FPDFText_CountChars)(text_page) };
+
+        // Collect all chars with their unicode values and bounding boxes
+        struct CharInfo {
+            left: f64,
+            right: f64,
+            bottom: f64,
+            top: f64,
+        }
+        let mut page_chars: Vec<CharInfo> = Vec::with_capacity(char_count as usize);
+        let mut raw_text = String::with_capacity(char_count as usize);
+
+        for i in 0..char_count {
+            let ch = unsafe { (pdfium.FPDFText_GetUnicode)(text_page, i) };
+            if ch == 0 {
+                raw_text.push('\u{FFFD}');
+                page_chars.push(CharInfo {
+                    left: 0.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    top: 0.0,
+                });
+                continue;
+            }
+            match char::from_u32(ch) {
+                Some(c) => raw_text.push(c),
+                None => raw_text.push('\u{FFFD}'),
+            }
+            let mut left = 0.0f64;
+            let mut right = 0.0f64;
+            let mut bottom = 0.0f64;
+            let mut top = 0.0f64;
+            unsafe {
+                (pdfium.FPDFText_GetCharBox)(text_page, i, &mut left, &mut right, &mut bottom, &mut top);
+            }
+            page_chars.push(CharInfo { left, right, bottom, top });
+        }
+
+        // Normalize the raw page text and build the char mapping
+        let (norm_text, norm_to_raw) = normalize_with_mapping(&raw_text);
+
+        // Find all occurrences of normalized_term in norm_text
+        if normalized_term.is_empty() {
+            unsafe {
+                (pdfium.FPDFText_ClosePage)(text_page);
+                (pdfium.FPDF_ClosePage)(pdf_page);
+            }
+            continue;
+        }
+
+        // Case‑insensitive search: lower‑case both the normalized page text
+        // and the user query so that "Machine" matches "machine", etc.
+        let term_lower: Vec<char> = normalized_term.chars().flat_map(|c| c.to_lowercase()).collect();
+        let norm_chars: Vec<char> = norm_text.chars().collect();
+        let norm_lower: Vec<char> = norm_chars.iter().flat_map(|c| c.to_lowercase()).collect();
+        let term_len = term_lower.len();
+        if term_len > 0 {
+            let mut search_char: usize = 0;
+            while search_char + term_len <= norm_lower.len() {
+                if norm_lower[search_char..search_char + term_len] == term_lower[..] {
+                    let norm_end_char = search_char + normalized_term.chars().count();
+                    if norm_end_char > norm_to_raw.len() {
+                        break;
+                    }
+                    let raw_start = norm_to_raw[search_char].0;
+                    let raw_end = norm_to_raw[norm_end_char.saturating_sub(1)].1;
+
+                    for raw_i in raw_start..=raw_end {
+                        if raw_i >= page_chars.len() {
+                            break;
+                        }
+                        let info = &page_chars[raw_i];
+                        all_positions.push(pdf_extractor::positions::StoredPosition {
+                            word_offset: raw_i,
+                            page: page_idx as u32 + 1,
+                            x_min: info.left as f32,
+                            y_min: info.bottom as f32,
+                            x_max: info.right as f32,
+                            y_max: info.top as f32,
+                            word_text: term_str.to_string(),
+                        });
+                    }
+
+                    search_char += 1;
+                } else {
+                    search_char += 1;
+                }
+            }
+        }
+
+        unsafe {
+            (pdfium.FPDFText_ClosePage)(text_page);
+            (pdfium.FPDF_ClosePage)(pdf_page);
+        }
+    }
+
+    unsafe { (pdfium.FPDF_CloseDocument)(doc) };
+
+    // Group per‑character boxes by page and line, merge into one per line
+    all_positions.sort_by_key(|p| (p.page, p.word_offset));
+    let merged = merge_by_line_from_chars(&all_positions);
+
+    let json_str = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
+    unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_search_text_in_mem(
+    data: *const u8,
+    data_len: i32,
+    term: *const c_char,
+    out_json: *mut c_char,
+    out_len: *mut u32,
+) -> i32 {
+    let rc = (|| -> i32 {
+        let term_str = match unsafe { cstr_to_str(term) } {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+
+        if out_len.is_null() {
+            return ERR_NULL_PTR;
+        }
+        if data.is_null() || data_len <= 0 {
+            set_error("Invalid PDF data".into());
+            return ERR_GENERAL;
+        }
+
+        let pdf_data = std::slice::from_raw_parts(data, data_len as usize);
+        unsafe { search_text_in_pdf_impl(pdf_data, term_str, out_json, out_len) }
+    })();
+    rc
+}
+
+// pdf_search_text_in_pdf (legacy — reads from disk)
+// Now delegates to the shared `search_text_in_pdf_impl` to avoid duplication.
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_search_text_in_pdf(
+    path: *const c_char,
+    term: *const c_char,
+    out_json: *mut c_char,
+    out_len: *mut u32,
+) -> i32 {
+    let rc = (|| -> i32 {
+        let path_str = match unsafe { cstr_to_str(path) } {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let term_str = match unsafe { cstr_to_str(term) } {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+
+        if out_len.is_null() {
+            return ERR_NULL_PTR;
+        }
+
+        let pdf_data = match std::fs::read(path_str) {
+            Ok(d) => d,
+            Err(e) => {
+                set_error(format!("Failed to read PDF: {}", e));
+                return ERR_GENERAL;
+            }
+        };
+
+        unsafe { search_text_in_pdf_impl(&pdf_data, term_str, out_json, out_len) }
+    })();
+    rc
+}
 
 /// Normalize text with NFKC, returning a mapping from each normalized char
 /// back to (first_raw_idx, last_raw_idx) in the original raw string.
@@ -778,175 +992,6 @@ fn normalize_with_mapping(raw: &str) -> (String, Vec<(usize, usize)>) {
         }
     }
     (result, mapping)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pdf_search_text_in_pdf(
-    path: *const c_char,
-    term: *const c_char,
-    out_json: *mut c_char,
-    out_len: *mut u32,
-) -> i32 {
-    let rc = (|| -> i32 {
-        let path_str = match unsafe { cstr_to_str(path) } {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
-        let term_str = match unsafe { cstr_to_str(term) } {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
-
-        if out_len.is_null() {
-            return -3;
-        }
-
-        let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
-            Some(pdf) => pdf,
-            None => {
-                set_error("pdfium.dll not available".into());
-                return -1;
-            }
-        };
-
-        let pdf_data = match std::fs::read(path_str) {
-            Ok(d) => d,
-            Err(e) => {
-                set_error(format!("Failed to read PDF: {}", e));
-                return -1;
-            }
-        };
-        let doc = unsafe { (pdfium.FPDF_LoadMemDocument)(pdf_data.as_ptr(), pdf_data.len() as i32, std::ptr::null()) };
-        if doc.is_null() {
-            let err = unsafe { (pdfium.FPDF_GetLastError)() };
-            set_error(format!("PDFium error {}: {}", err, pdf_extractor::pdfium::error_str(err)));
-            return -1;
-        }
-
-        let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
-        let normalized_term: String = term_str.nfkc().collect();
-
-        // Collect all per‑character positions, grouped by page later
-        let mut all_positions: Vec<pdf_extractor::positions::StoredPosition> = Vec::new();
-
-        for page_idx in 0..page_count {
-            let pdf_page = unsafe { (pdfium.FPDF_LoadPage)(doc, page_idx) };
-            if pdf_page.is_null() {
-                continue;
-            }
-
-            let text_page = unsafe { (pdfium.FPDFText_LoadPage)(pdf_page) };
-            if text_page.is_null() {
-                unsafe { (pdfium.FPDF_ClosePage)(pdf_page) };
-                continue;
-            }
-
-            let char_count = unsafe { (pdfium.FPDFText_CountChars)(text_page) };
-
-            // Collect all chars with their unicode values and bounding boxes
-            struct CharInfo {
-                left: f64,
-                right: f64,
-                bottom: f64,
-                top: f64,
-            }
-            let mut page_chars: Vec<CharInfo> = Vec::with_capacity(char_count as usize);
-            let mut raw_text = String::with_capacity(char_count as usize);
-
-            for i in 0..char_count {
-                let ch = unsafe { (pdfium.FPDFText_GetUnicode)(text_page, i) };
-                if ch == 0 {
-                    raw_text.push('\u{FFFD}');
-                    page_chars.push(CharInfo {
-                        left: 0.0,
-                        right: 0.0,
-                        bottom: 0.0,
-                        top: 0.0,
-                    });
-                    continue;
-                }
-                match char::from_u32(ch) {
-                    Some(c) => raw_text.push(c),
-                    None => raw_text.push('\u{FFFD}'),
-                }
-                let mut left = 0.0f64;
-                let mut right = 0.0f64;
-                let mut bottom = 0.0f64;
-                let mut top = 0.0f64;
-                unsafe {
-                    (pdfium.FPDFText_GetCharBox)(text_page, i, &mut left, &mut right, &mut bottom, &mut top);
-                }
-                page_chars.push(CharInfo { left, right, bottom, top });
-            }
-
-            // Normalize the raw page text and build the char mapping
-            let (norm_text, norm_to_raw) = normalize_with_mapping(&raw_text);
-
-            // Find all occurrences of normalized_term in norm_text
-            if normalized_term.is_empty() {
-                unsafe {
-                    (pdfium.FPDFText_ClosePage)(text_page);
-                    (pdfium.FPDF_ClosePage)(pdf_page);
-                }
-                continue;
-            }
-
-            // Case‑insensitive search: lower‑case both the normalized page text
-            // and the user query so that "Machine" matches "machine", etc.
-            let term_lower: Vec<char> = normalized_term.chars().flat_map(|c| c.to_lowercase()).collect();
-            let norm_chars: Vec<char> = norm_text.chars().collect();
-            let norm_lower: Vec<char> = norm_chars.iter().flat_map(|c| c.to_lowercase()).collect();
-            let term_len = term_lower.len();
-            if term_len > 0 {
-                let mut search_char: usize = 0;
-                while search_char + term_len <= norm_lower.len() {
-                    if norm_lower[search_char..search_char + term_len] == term_lower[..] {
-                        let norm_end_char = search_char + normalized_term.chars().count();
-                        if norm_end_char > norm_to_raw.len() {
-                            break;
-                        }
-                        let raw_start = norm_to_raw[search_char].0;
-                        let raw_end = norm_to_raw[norm_end_char.saturating_sub(1)].1;
-
-                        for raw_i in raw_start..=raw_end {
-                            if raw_i >= page_chars.len() {
-                                break;
-                            }
-                            let info = &page_chars[raw_i];
-                            all_positions.push(pdf_extractor::positions::StoredPosition {
-                                word_offset: raw_i,
-                                page: page_idx as u32 + 1,
-                                x_min: info.left as f32,
-                                y_min: info.bottom as f32,
-                                x_max: info.right as f32,
-                                y_max: info.top as f32,
-                                word_text: term_str.to_string(),
-                            });
-                        }
-
-                        search_char += 1;
-                    } else {
-                        search_char += 1;
-                    }
-                }
-            }
-
-            unsafe {
-                (pdfium.FPDFText_ClosePage)(text_page);
-                (pdfium.FPDF_ClosePage)(pdf_page);
-            }
-        }
-
-        unsafe { (pdfium.FPDF_CloseDocument)(doc) };
-
-        // Group per‑character boxes by page and line, merge into one per line
-        all_positions.sort_by_key(|p| (p.page, p.word_offset));
-        let merged = merge_by_line_from_chars(&all_positions);
-
-        let json_str = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
-        unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
-    })();
-    rc
 }
 
 // Helper: merge per‑character positions into one bounding box per text line.
@@ -1529,7 +1574,7 @@ pub unsafe extern "C" fn pdf_render_page_bgra(
     handle: i32,
     page_index: i32,
     dpi: f64,
-    _highlight_json: *const u8,
+    highlight_json: *const u8,
     out_width: *mut i32,
     out_height: *mut i32,
     out_stride: *mut i32,
@@ -1608,6 +1653,57 @@ pub unsafe extern "C" fn pdf_render_page_bgra(
 
     let buf_ptr = unsafe { (pdfium.FPDFBitmap_GetBuffer)(bitmap) };
     let stride = unsafe { (pdfium.FPDFBitmap_GetStride)(bitmap) };
+
+    // ── Native highlight rendering ─────────────────────────────────
+    if !highlight_json.is_null() && !buf_ptr.is_null() && stride > 0 {
+        let cstr = unsafe { CStr::from_ptr(highlight_json as *const c_char) };
+        if let Ok(json_str) = cstr.to_str() {
+            if !json_str.is_empty() {
+                if let Ok(highlights) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+                    let page_num = page_index as u32 + 1;
+                    let buf = std::slice::from_raw_parts_mut(
+                        buf_ptr as *mut u8,
+                        (dest_height as usize) * (stride as usize),
+                    );
+                    for h in &highlights {
+                        let _ = match h.get("page").and_then(|v| v.as_u64()) {
+                            Some(p) if p == page_num as u64 => (),
+                            _ => continue,
+                        };
+                        let x_min = h.get("x_min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let y_min = h.get("y_min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let x_max = h.get("x_max").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let y_max = h.get("y_max").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                        let px1 = (x_min * scale).round() as i32;
+                        let py1 = ((h_pts as f64 - y_max) * scale).round() as i32;
+                        let px2 = (x_max * scale).round() as i32;
+                        let py2 = ((h_pts as f64 - y_min) * scale).round() as i32;
+
+                        let px1 = px1.clamp(0, dest_width);
+                        let py1 = py1.clamp(0, dest_height);
+                        let px2 = px2.clamp(0, dest_width);
+                        let py2 = py2.clamp(0, dest_height);
+
+                        let src_a = 204u32;
+                        let dst_a = 255u32 - src_a;
+                        for y in py1..py2 {
+                            let row_off = (y as usize) * (stride as usize);
+                            for x in px1..px2 {
+                                let i = row_off + (x as usize) * 4;
+                                let b = buf[i] as u32;
+                                let g = buf[i + 1] as u32;
+                                let r = buf[i + 2] as u32;
+                                buf[i]     = ((0u32   * src_a + b * dst_a) / 255) as u8;
+                                buf[i + 1] = ((230u32 * src_a + g * dst_a) / 255) as u8;
+                                buf[i + 2] = ((255u32 * src_a + r * dst_a) / 255) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     unsafe { (pdfium.FPDF_ClosePage)(page); }
 
