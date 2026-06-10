@@ -20,5 +20,4 @@ internal sealed class PdfViewState
 
     // Virtualized page view models
     public ObservableCollection<PdfPageViewModel>? PageViewModels { get; set; }
-    public double[] PageOffsets { get; set; } = Array.Empty<double>();
 }

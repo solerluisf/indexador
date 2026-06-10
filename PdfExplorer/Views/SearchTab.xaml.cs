@@ -640,46 +640,21 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private void BuildPageViewModels()
     {
-        double scale = _renderer.TargetDpi / 72.0;
-        double viewportWidth = Math.Max(200, PageScroller.ViewportWidth - 20);
         var list = new List<PdfPageViewModel>(_state.MatchingPages.Count);
-        var offsets = new double[_state.MatchingPages.Count];
-        double acc = 0;
 
         for (int i = 0; i < _state.MatchingPages.Count; i++)
         {
             int pageIdx = _state.MatchingPages[i];
-            offsets[i] = acc;
-
-            double totalH = 1100; // fallback
-
-            try
-            {
-                var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
-                double renderedW = wPts * scale;
-                double renderedH = hPts * scale;
-                double imageH = renderedW > 0 ? renderedH * (viewportWidth / renderedW) : 0;
-                totalH = 10 + 24 + 4 + imageH + 10 + 10; // padding + header + img + margin
-            }
-            catch (Exception ex)
-            {
-                Log($"BuildPageViewModels: failed to get dimensions for page {pageIdx}: {ex.Message}");
-            }
-
             _state.PositionsByPage.TryGetValue(pageIdx, out var pos);
             list.Add(new PdfPageViewModel
             {
                 PageIndex = pageIdx,
                 MatchIndex = i,
-                DisplayHeight = totalH,
                 Positions = pos ?? new List<WordPosition>(),
             });
-
-            acc += totalH;
         }
 
         _state.PageViewModels = new ObservableCollection<PdfPageViewModel>(list);
-        _state.PageOffsets = offsets;
         PageList.ItemsSource = _state.PageViewModels;
     }
 

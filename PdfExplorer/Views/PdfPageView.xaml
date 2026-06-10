@@ -4,8 +4,7 @@
              Loaded="OnLoaded" Unloaded="OnUnloaded">
     <Grid>
         <Border BorderBrush="Silver" BorderThickness="1"
-                Padding="5" Margin="0,0,0,10"
-                Height="{Binding DisplayHeight}">
+                Padding="5" Margin="0,0,0,10">
             <StackPanel>
                 <TextBlock Text="{Binding PageHeader}"
                            FontWeight="SemiBold" Margin="0,0,0,4"/>
