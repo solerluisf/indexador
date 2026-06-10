@@ -9,6 +9,7 @@ namespace PdfExplorer.Views;
 public partial class PdfPageView : UserControl
 {
     private bool _rendered;
+    private CancellationTokenSource? _loadCts;
 
     public PdfPageView()
     {
@@ -17,7 +18,12 @@ public partial class PdfPageView : UserControl
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
-        if (_rendered || DataContext is not PdfPageViewModel vm)
+        _loadCts?.Cancel();
+        _loadCts = new CancellationTokenSource();
+        var ct = _loadCts.Token;
+
+        var vm = DataContext as PdfPageViewModel;
+        if (_rendered || vm is null)
             return;
 
         vm.IsLoading = true;
@@ -31,8 +37,12 @@ public partial class PdfPageView : UserControl
 
             var item = await service.GetOrRenderPageAsync(vm.PageIndex, vm.Positions);
 
+            if (ct.IsCancellationRequested)
+                return;
+
             await Dispatcher.InvokeAsync(() =>
             {
+                if (ct.IsCancellationRequested) return;
                 if (DataContext is PdfPageViewModel currentVm && currentVm.PageIndex == vm.PageIndex)
                 {
                     currentVm.PageImage = item.PageImage;
@@ -40,25 +50,34 @@ public partial class PdfPageView : UserControl
                 }
             });
         }
+        catch (OperationCanceledException)
+        {
+            // normal — document changed or control recycled
+        }
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"[PdfPageView] Render error: {ex.Message}");
         }
         finally
         {
-            await Dispatcher.InvokeAsync(() =>
+            if (!ct.IsCancellationRequested)
             {
-                if (DataContext is PdfPageViewModel currentVm && currentVm.PageIndex == vm.PageIndex)
-                    currentVm.IsLoading = false;
-            });
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    if (ct.IsCancellationRequested) return;
+                    vm.IsLoading = false;
+                });
+            }
         }
     }
 
     private void OnUnloaded(object sender, RoutedEventArgs e)
     {
-        if (DataContext is PdfPageViewModel vm)
-            vm.PageImage = null;
+        _loadCts?.Cancel();
+        _loadCts = null;
         _rendered = false;
+        // Do NOT null vm.PageImage here — that would poison the cache.
+        // The LRU cache in SearchTab manages bitmap lifetime.
     }
 
     private static T? FindVisualParent<T>(DependencyObject child) where T : DependencyObject

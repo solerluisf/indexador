@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Windows;
 using System.Windows.Controls;
@@ -16,10 +17,12 @@ public partial class SearchTab : Page, IPdfRenderingService
     private readonly Dictionary<(string, int), PageRenderItem> _globalPageCache = new();
     private readonly Queue<(string, int)> _globalPageCacheOrder = new();
     private readonly object _globalCacheLock = new();
-    private const int MaxGlobalCacheEntries = 50;
+    private const int MaxGlobalCacheEntries = 200;
     private readonly object _renderCacheLock = new();
+    private readonly ConcurrentDictionary<int, Task<PageRenderItem>> _pendingRenders = new();
     private readonly ThumbnailService _thumbService = new();
     private CancellationTokenSource? _thumbCts;
+    private CancellationTokenSource? _selectionCts;
     private const int ThumbnailPreloadCount = 30;
     private int _currentPage;
     private long _totalHits;
@@ -163,6 +166,10 @@ public partial class SearchTab : Page, IPdfRenderingService
                         vm.Thumbnail = bmp;
                         Log($"PreloadThumbnailsAsync: Thumbnail assigned for '{vm.FileName}'");
                     }
+                    catch (OperationCanceledException)
+                    {
+                        Log("PreloadThumbnailsAsync: cancelled");
+                    }
                     catch (Exception ex)
                     {
                         Log($"PreloadThumbnailsAsync EXCEPTION creating bitmap for '{vm.FileName}': {ex.GetType().Name}: {ex.Message}");
@@ -218,17 +225,24 @@ public partial class SearchTab : Page, IPdfRenderingService
     {
         try
         {
-
             if (ResultsList.SelectedItem is not SearchResultViewModel result)
             {
                 Log("OnResultSelected: no selection");
                 return;
             }
 
+            // Cancel any previous selection rendering and clear state first.
+            // ClearViewer must run BEFORE creating the new _selectionCts,
+            // otherwise ClearViewer would cancel the token we just created.
+            _selectionCts?.Cancel();
+            ClearViewer();
+
+            _selectionCts = new CancellationTokenSource();
+            var ct = _selectionCts.Token;
+
             var t0 = DateTime.UtcNow;
             Log($"OnResultSelected: id={result.Id}, path={result.Path}, collId={result.CollectionId}, query='{_lastQuery}'");
 
-            ClearViewer();
             _state.PdfPath = result.Path;
             StatusLabel.Text = System.IO.Path.GetFileName(result.Path);
 
@@ -352,10 +366,13 @@ public partial class SearchTab : Page, IPdfRenderingService
             _state.CurrentMatchIndex = 0;
             _state.CurrentPositionIndex = -1;
 
-            BuildPageViewModels();
-            UpdateMatchNav();
-            UpdatePositionNav();
-            ScrollToMatch(0);
+            if (ct.IsCancellationRequested)
+            {
+                Log("OnResultSelected: cancelled before build");
+                return;
+            }
+
+            BuildOrDeferViewModels(ct);
 
             var tEnd = DateTime.UtcNow;
             Log($"OnResultSelected complete (total {(tEnd - t0).TotalMilliseconds:F0}ms)");
@@ -370,6 +387,21 @@ public partial class SearchTab : Page, IPdfRenderingService
     // ── Lazy rendering (IPdfRenderingService) ───────────────────────
 
     async Task<PageRenderItem> IPdfRenderingService.GetOrRenderPageAsync(int pageIdx, List<WordPosition> pagePositions)
+    {
+        // Coalesce concurrent render requests for the same page.
+        // Multiple PdfPageView controls can request the same pageIdx
+        // simultaneously during VirtualizingStackPanel recycling.
+        try
+        {
+            return await _pendingRenders.GetOrAdd(pageIdx, idx => RenderPageInternalAsync(idx, pagePositions));
+        }
+        finally
+        {
+            _pendingRenders.TryRemove(pageIdx, out _);
+        }
+    }
+
+    private async Task<PageRenderItem> RenderPageInternalAsync(int pageIdx, List<WordPosition> pagePositions)
     {
         var cacheKey = (_state.PdfPath, pageIdx);
 
@@ -386,13 +418,23 @@ public partial class SearchTab : Page, IPdfRenderingService
                 return cachedLocal;
         }
 
+        var ct = _selectionCts?.Token ?? CancellationToken.None;
+        ct.ThrowIfCancellationRequested();
+
         Log($"Rendering page {pageIdx + 1} (0-based={pageIdx})");
         StatusLabel.Text = $"Rendering page {pageIdx + 1}...";
 
         try
         {
             var raw = _renderer.RenderPageRaw(pageIdx, pagePositions);
-            var item = await Dispatcher.InvokeAsync(() => PdfiumPageRenderer.CreatePageItem(raw, pagePositions));
+            ct.ThrowIfCancellationRequested();
+
+            var item = await Dispatcher.InvokeAsync(() =>
+            {
+                ct.ThrowIfCancellationRequested();
+                return PdfiumPageRenderer.CreatePageItem(raw, pagePositions);
+            });
+
             Log($"  rendered: image={(item.PageImage is not null ? $"{item.ImagePixelWidth}x{item.ImagePixelHeight}" : "null")}");
 
             lock (_renderCacheLock)
@@ -401,6 +443,10 @@ public partial class SearchTab : Page, IPdfRenderingService
             }
             AddToGlobalCache(cacheKey, item);
             return item;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -543,6 +589,40 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     // ── Build virtualized page models ─────────────────────────────
 
+    private void BuildOrDeferViewModels(CancellationToken ct)
+    {
+        if (PageScroller.ViewportWidth > 0)
+        {
+            BuildPageViewModels();
+            UpdateMatchNav();
+            UpdatePositionNav();
+            ScrollToMatch(0);
+            return;
+        }
+
+        Log("BuildOrDeferViewModels: viewport not yet laid out — deferring");
+        EventHandler? handler = null;
+        handler = (_, _) =>
+        {
+            if (ct.IsCancellationRequested)
+            {
+                PageScroller.LayoutUpdated -= handler;
+                return;
+            }
+
+            if (PageScroller.ViewportWidth > 35)
+            {
+                PageScroller.LayoutUpdated -= handler;
+                Log("BuildOrDeferViewModels: deferred build now");
+                BuildPageViewModels();
+                UpdateMatchNav();
+                UpdatePositionNav();
+                ScrollToMatch(0);
+            }
+        };
+        PageScroller.LayoutUpdated += handler;
+    }
+
     private void BuildPageViewModels()
     {
         double scale = _renderer.TargetDpi / 72.0;
@@ -609,6 +689,11 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private void ClearViewer()
     {
+        // Cancel any in-flight renders for the previous document
+        _selectionCts?.Cancel();
+        _selectionCts = null;
+
+        _pendingRenders.Clear();
         PageList.ItemsSource = null;
         _state = new PdfViewState();
         _state.CurrentPositionIndex = -1;
