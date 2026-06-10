@@ -58,6 +58,19 @@ public sealed class PdfiumPageRenderer : IDisposable
         int handle, int pageIndex,
         out double outWidthPts, out double outHeightPts);
 
+    [DllImport("pdf_extractor_capi.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_render_page_to_buffer(
+        int handle,
+        int pageIndex,
+        double dpi,
+        byte[]? highlightJson,
+        IntPtr buffer,
+        int width,
+        int height,
+        int stride,
+        out double outWidthPts,
+        out double outHeightPts);
+
     // ── Constructor ───────────────────────────────────────────────
 
     public PdfiumPageRenderer(double targetDpi = 150)
@@ -273,6 +286,48 @@ public sealed class PdfiumPageRenderer : IDisposable
             PageIndex = pageIndex, Width = w, Height = h, Stride = stride,
             WidthPts = wPts, HeightPts = hPts, Pixels = buffer, Success = true,
         };
+    }
+
+    // ── Direct-to-buffer rendering (zero-copy) ────────────────────
+
+    /// <summary>
+    /// Renders a page directly into a caller-allocated buffer (pinned byte[] or
+    /// WriteableBitmap.BackBuffer). Zero-copy — Rust writes directly into the
+    /// buffer, no Marshal.Copy, no internal bitmap allocation.
+    /// Must be called from a background thread (not the UI thread).
+    /// </summary>
+    public void RenderToBuffer(int pageIndex, List<WordPosition> pagePositions,
+        IntPtr buffer, int width, int height, int stride,
+        out double wPts, out double hPts)
+    {
+        var t0 = DateTime.UtcNow;
+        Log($"RenderToBuffer: page={pageIndex + 1}, {width}x{height} stride={stride}");
+
+        // Cache the serialized highlight JSON per page
+        var highlightJson = pagePositions.Count > 0
+            ? _highlightJsonCache.GetOrAdd(pageIndex, _ => Utf8Bytes(JsonSerializer.Serialize(pagePositions)))
+            : null;
+
+        int rc;
+        lock (_lock)
+        {
+            if (_docHandle < 0)
+                throw new InvalidOperationException("No document open. Call OpenDocument first.");
+
+            lock (GlobalPdfiumLock)
+            {
+                rc = pdf_render_page_to_buffer(
+                    _docHandle, pageIndex, _targetDpi, highlightJson,
+                    buffer, width, height, stride,
+                    out wPts, out hPts);
+            }
+        }
+
+        var t1 = DateTime.UtcNow;
+        Log($"  pdf_render_page_to_buffer rc={rc}, wPts={wPts:F1}, hPts={hPts:F1} (took {(t1 - t0).TotalMilliseconds:F1}ms)");
+
+        if (rc < 0)
+            throw new InvalidOperationException($"RenderToBuffer failed (rc={rc})");
     }
 
     // ── Bitmap creation (must be called on UI thread) ─────────────

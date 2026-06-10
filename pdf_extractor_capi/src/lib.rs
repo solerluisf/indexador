@@ -1770,6 +1770,145 @@ pub unsafe extern "C" fn pdf_render_page_bgra(
     0
 }
 
+// ---------------------------------------------------------------------------
+// pdf_render_page_to_buffer — renders directly into a caller-allocated buffer
+// (zero-copy: WPF BackBuffer or pinned byte[]). No internal allocation.
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_render_page_to_buffer(
+    handle: i32,
+    page_index: i32,
+    dpi: f64,
+    highlight_json: *const u8,
+    buffer: *mut u8,
+    width: i32,
+    height: i32,
+    stride: i32,
+    out_width_pts: *mut f64,
+    out_height_pts: *mut f64,
+) -> i32 {
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(p) => p,
+        None => {
+            set_error("pdfium.dll not available".into());
+            return -1;
+        }
+    };
+
+    if out_width_pts.is_null() || out_height_pts.is_null() {
+        set_error("Null output pointer".into());
+        return -3;
+    }
+    if buffer.is_null() || width <= 0 || height <= 0 || stride <= 0 {
+        set_error("Invalid buffer parameters".into());
+        return -3;
+    }
+
+    let map = OPEN_DOCS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let (doc_ptr, _) = match map.get(&handle) {
+        Some(entry) => *entry,
+        None => {
+            set_error("Invalid document handle".into());
+            return -1;
+        }
+    };
+    let doc = doc_ptr as *mut std::ffi::c_void;
+
+    let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+    if page_index < 0 || page_index >= page_count {
+        set_error(format!("Page {} out of range ({} pages)", page_index, page_count));
+        return -1;
+    }
+
+    let page = unsafe { (pdfium.FPDF_LoadPage)(doc, page_index) };
+    if page.is_null() {
+        set_error("Failed to load page".into());
+        return -1;
+    }
+
+    let w_pts = unsafe { (pdfium.FPDF_GetPageWidthF)(page) as f64 };
+    let h_pts = unsafe { (pdfium.FPDF_GetPageHeightF)(page) as f64 };
+
+    // Wrap the external buffer as a PDFium bitmap — no allocation
+    let bitmap = unsafe {
+        (pdfium.FPDFBitmap_CreateEx)(
+            width, height,
+            pdf_extractor::pdfium::FPDFBITMAP_BGRA,
+            buffer as *mut std::ffi::c_void,
+            stride,
+        )
+    };
+    if bitmap.is_null() {
+        unsafe { (pdfium.FPDF_ClosePage)(page); }
+        set_error("Failed to create PDFium bitmap with external buffer".into());
+        return -1;
+    }
+
+    unsafe {
+        (pdfium.FPDFBitmap_FillRect)(bitmap, 0, 0, width, height, 0xFFFFFFFF);
+        (pdfium.FPDF_RenderPageBitmap)(bitmap, page, 0, 0, width, height, 0, pdf_extractor::pdfium::FPDF_NONE);
+    }
+
+    // ── Native highlight rendering ─────────────────────────────────
+    if !highlight_json.is_null() {
+        let cstr = unsafe { CStr::from_ptr(highlight_json as *const c_char) };
+        if let Ok(json_str) = cstr.to_str() {
+            if !json_str.is_empty() {
+                if let Ok(highlights) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+                    let page_num = page_index as u32 + 1;
+                    let total_bytes = (height as usize) * (stride as usize);
+                    let buf = std::slice::from_raw_parts_mut(buffer as *mut u8, total_bytes);
+                    let scale = dpi / 72.0;
+                    for h in &highlights {
+                        let _ = match h.get("page").and_then(|v| v.as_u64()) {
+                            Some(p) if p == page_num as u64 => (),
+                            _ => continue,
+                        };
+                        let x_min = h.get("x_min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let y_min = h.get("y_min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let x_max = h.get("x_max").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let y_max = h.get("y_max").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                        let px1 = (x_min * scale).round() as i32;
+                        let py1 = ((h_pts - y_max) * scale).round() as i32;
+                        let px2 = (x_max * scale).round() as i32;
+                        let py2 = ((h_pts - y_min) * scale).round() as i32;
+
+                        let px1 = px1.clamp(0, width);
+                        let py1 = py1.clamp(0, height);
+                        let px2 = px2.clamp(0, width);
+                        let py2 = py2.clamp(0, height);
+
+                        let src_a = 204u32;
+                        let dst_a = 255u32 - src_a;
+                        for y in py1..py2 {
+                            let row_off = (y as usize) * (stride as usize);
+                            for x in px1..px2 {
+                                let i = row_off + (x as usize) * 4;
+                                let b = buf[i] as u32;
+                                let g = buf[i + 1] as u32;
+                                let r = buf[i + 2] as u32;
+                                buf[i]     = ((0u32   * src_a + b * dst_a) / 255) as u8;
+                                buf[i + 1] = ((230u32 * src_a + g * dst_a) / 255) as u8;
+                                buf[i + 2] = ((255u32 * src_a + r * dst_a) / 255) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe {
+        (pdfium.FPDF_ClosePage)(page);
+        (pdfium.FPDFBitmap_Destroy)(bitmap); // destroys bitmap wrapper, NOT the external buffer
+        *out_width_pts = w_pts;
+        *out_height_pts = h_pts;
+    }
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pdf_free_bitmap(pixels: *mut u8) {
     if pixels.is_null() {

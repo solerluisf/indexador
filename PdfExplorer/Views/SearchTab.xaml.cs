@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -409,8 +410,6 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private async Task<PageRenderItem> RenderPageInternalAsync(int pageIdx, List<WordPosition> pagePositions, CancellationToken ct)
     {
-        // Capture state identity at the start — ClearViewer may replace _state
-        // while this render is in flight, and we must not write into the new state.
         var capturedState = _state;
         var cacheKey = (capturedState.PdfPath, pageIdx);
 
@@ -435,27 +434,66 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         try
         {
-            // Run the native PDFium render on a background thread.
-            // RenderPageRaw is thread-safe (takes _lock + GlobalPdfiumLock,
-            // no WPF objects created). This keeps the UI thread responsive.
-            var raw = await Task.Run(() => _renderer.RenderPageRaw(pageIdx, pagePositions));
-            ct.ThrowIfCancellationRequested();
+            // Get page dimensions first (needed to allocate the buffer)
+            var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
+            int pixW = (int)(wPts * _renderer.TargetDpi / 72.0);
+            int pixH = (int)(hPts * _renderer.TargetDpi / 72.0);
+            int stride = pixW * 4;
 
-            var item = await Dispatcher.InvokeAsync(() =>
+            // Allocate and pin the buffer — Rust will render directly into it
+            var buffer = new byte[stride * pixH];
+            var pin = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+            try
             {
+                IntPtr ptr = pin.AddrOfPinnedObject();
+
+                // Native render on background thread (zero-copy: writes into buffer)
+                await Task.Run(() =>
+                {
+                    _renderer.RenderToBuffer(pageIdx, pagePositions,
+                        ptr, pixW, pixH, stride,
+                        out var _, out var _);
+                }, ct);
+
                 ct.ThrowIfCancellationRequested();
-                return PdfiumPageRenderer.CreatePageItem(raw, pagePositions);
-            });
 
-            Log($"  rendered: image={(item.PageImage is not null ? $"{item.ImagePixelWidth}x{item.ImagePixelHeight}" : "null")}");
+                // Create the frozen WPF bitmap on the UI thread
+                var item = await Dispatcher.InvokeAsync(() =>
+                {
+                    ct.ThrowIfCancellationRequested();
 
-            lock (_renderCacheLock)
-            {
-                if (ReferenceEquals(_state, capturedState))
-                    _state.PageCache[pageIdx] = item;
+                    var bitmap = BitmapSource.Create(
+                        pixW, pixH, 96, 96,
+                        PixelFormats.Bgra32, null,
+                        buffer, stride);
+                    bitmap.Freeze();
+
+                    return new PageRenderItem
+                    {
+                        PageNumber = pageIdx + 1,
+                        PageImage = bitmap,
+                        ImagePixelWidth = pixW,
+                        ImagePixelHeight = pixH,
+                        PdfPageWidth = wPts,
+                        PdfPageHeight = hPts,
+                        Positions = pagePositions,
+                    };
+                });
+
+                Log($"  rendered: {pixW}x{pixH}");
+
+                lock (_renderCacheLock)
+                {
+                    if (ReferenceEquals(_state, capturedState))
+                        _state.PageCache[pageIdx] = item;
+                }
+                AddToGlobalCache(cacheKey, item);
+                return item;
             }
-            AddToGlobalCache(cacheKey, item);
-            return item;
+            finally
+            {
+                pin.Free();
+            }
         }
         catch (OperationCanceledException)
         {
