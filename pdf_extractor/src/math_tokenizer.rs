@@ -237,9 +237,11 @@ pub fn extract_math_source(text: &str) -> Option<String> {
     }
 
     // Try display math first: $$...$$, \[...\]
-    let re_display = Regex::new(r"\$\$(.+?)\$\$|\\\[(.+?)\\\]").ok()?;
+    static RE_DISPLAY: OnceLock<Regex> = OnceLock::new();
+    let re_display = RE_DISPLAY.get_or_init(|| Regex::new(r"\$\$(.+?)\$\$|\\\[(.+?)\\\]").unwrap());
     // Then inline: $...$, \(...\)
-    let re_inline = Regex::new(r"\$(.+?)\$|\\\((.+?)\\\)").ok()?;
+    static RE_INLINE: OnceLock<Regex> = OnceLock::new();
+    let re_inline = RE_INLINE.get_or_init(|| Regex::new(r"\$(.+?)\$|\\\((.+?)\\\)").unwrap());
     let mut parts: Vec<String> = Vec::new();
 
     for cap in re_display.captures_iter(text) {

@@ -41,13 +41,13 @@ mod tests {
 
     #[test]
     fn test_worker_output_missing_path_field() {
-        let result: Result<WorkerOutput, _> = serde_json::from_str(r#"{"checksum":"x","ocr_flag":false,"text":""}"#);
+        let result: Result<WorkerOutput, _> = serde_json::from_str(r#"{"checksum":"x","ocr_flag":false,"text":"","word_positions":[]}"#);
         assert!(result.is_err(), "missing path should fail");
     }
 
     #[test]
     fn test_worker_output_ocr_flag_true() {
-        let json = r#"{"path":"/scan.pdf","checksum":"x","ocr_flag":true,"text":""}"#;
+        let json = r#"{"path":"/scan.pdf","checksum":"x","ocr_flag":true,"text":"","word_positions":[]}"#;
         let wo: WorkerOutput = serde_json::from_str(json).unwrap();
         assert!(wo.ocr_flag);
         assert!(wo.text.is_empty());

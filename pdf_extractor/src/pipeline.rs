@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,10 +29,15 @@ use crate::output::{DocumentRecord, JsonlWriter};
 use crate::scanner::{scan_directory, JobStore};
 use crate::worker_ipc::WorkerFrame;
 
-const DEFAULT_CHANNEL_CAPACITY: usize = 2048;
-const BATCH_SIZE: i64 = 20;
-const DEFAULT_INDEXER_BATCH_SIZE: usize = 2000;
-const DEFAULT_COMMIT_INTERVAL: u64 = 20000;
+// Channel capacity for DocumentRecord queues.  Each record carries the full
+// extracted text (up to several MB for large PDFs), so a small default bounds
+// peak memory even when the indexer is the bottleneck.
+//   peak memory ≈ (CHANNEL_CAP + INDEXER_BATCH) × avg_text_size
+//   = (256 + 500) × text_size
+const DEFAULT_CHANNEL_CAPACITY: usize = 256;
+const BATCH_SIZE: i64 = 100;
+const DEFAULT_INDEXER_BATCH_SIZE: usize = 500;
+const DEFAULT_COMMIT_INTERVAL: u64 = 50000;
 const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 30;
 
 pub struct PipelineConfig {
@@ -80,7 +85,12 @@ impl PipelineConfig {
     pub fn extract_workers(&self) -> usize {
         self.num_extract_workers
             .map(|v| std::cmp::max(1, v))
-            .unwrap_or_else(|| std::cmp::max(1, num_cpus::get() - 2))
+            .unwrap_or_else(|| {
+                let cores = num_cpus::get();
+                // Each worker is a full subprocess loading pdfium.dll (~40 MB+).
+                // Cap the auto-detected default so we don't OOM on high-core machines.
+                std::cmp::min(std::cmp::max(1, cores.saturating_sub(2)), 4)
+            })
     }
 
     pub fn indexer_batch(&self) -> usize {
@@ -264,8 +274,8 @@ pub fn run_pipeline(
     // Writer: consume results and persist
     let is_cancelled = move || cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed));
 
-    // Throttle progress callback to at most once per 100 docs to reduce FFI overhead.
-    let progress_throttle = 100u64;
+    // Throttle progress callback to at most once per 500 docs to reduce FFI overhead.
+    let progress_throttle = 500u64;
 
     macro_rules! process_record {
         ($record:expr) => {{
@@ -279,8 +289,15 @@ pub fn run_pipeline(
             }
             let processed = metrics.increment_processed();
 
-            if may_index && index_tx.send(record).is_err() {
-
+            if may_index {
+                let id = record.id;
+                let path = record.path.clone();
+                if index_tx.send(record).is_err() {
+                    log_msg(log_cb, &format!(
+                        "[pipeline] indexer channel disconnected for id={} path='{}' — indexer unavailable, will retry on next run",
+                        id, path
+                    ));
+                }
             }
 
             if let Some(ref cb) = progress_cb {
@@ -383,7 +400,7 @@ fn indexer_thread(
     };
 
     let mut buf: Vec<DocumentRecord> = Vec::with_capacity(batch_size);
-    let mut done_ids: Vec<(i64, bool)> = Vec::new();
+    let mut done_ids: Vec<(i64, bool, String)> = Vec::new();
     let mut doc_count: u64 = 0;
     let mut last_commit = Instant::now();
     let writer = std::sync::Mutex::new(index_writer);
@@ -414,29 +431,32 @@ fn indexer_thread(
             && (doc_count >= commit_interval
                 || last_commit.elapsed() > Duration::from_secs(commit_timeout));
         if should_commit {
-            // Mark jobs done in SQLite FIRST, then commit Tantivy.
-            // Ordering: if we crash between mark_done and w.commit(), we lose
-            // that batch from search (minor) instead of creating duplicate
-            // Tantivy documents (corruption).
-            let _ = jobs.batch_mark_done(&done_ids);
-            done_ids.clear();
-
-            if let Ok(mut w) = writer.lock() {
-                if w.commit().is_ok() {
-                    let total = indexer.metrics().docs_indexed();
-                    metrics.set_indexer_docs_indexed(total);
-                    metrics.set_indexer_last_commit_age(0);
-
-                    last_commit = Instant::now();
-                    doc_count = 0;
-                } else {
-                    log_msg(log_cb, &format!(
-                        "[indexer_thread] commit failed — Tantivy could not persist {} docs. Check disk space and index integrity.",
-                        done_ids.len()
-                    ));
-                }
+            // Commit Tantivy FIRST, then mark done in SQLite.
+            // `add_document` now deletes any pre-existing document for the
+            // same id, so re-processing after a crash is idempotent.
+            // This way a crash between w.commit() and batch_mark_done() only
+            // causes harmless re-indexing — never permanent search loss.
+            let commit_ok = if let Ok(mut w) = writer.lock() {
+                w.commit().is_ok()
             } else {
-                log_msg(log_cb, "[indexer_thread] commit skipped — writer mutex poisoned");
+                false
+            };
+
+            if commit_ok {
+                let _ = jobs.batch_mark_done(&done_ids);
+                done_ids.clear();
+
+                let total = indexer.metrics().docs_indexed();
+                metrics.set_indexer_docs_indexed(total);
+                metrics.set_indexer_last_commit_age(0);
+
+                last_commit = Instant::now();
+                doc_count = 0;
+            } else {
+                log_msg(log_cb, &format!(
+                    "[indexer_thread] commit failed — Tantivy could not persist {} docs. Check disk space and index integrity.",
+                    done_ids.len()
+                ));
             }
         }
 
@@ -444,14 +464,13 @@ fn indexer_thread(
         metrics.set_indexer_last_commit_age(last_commit.elapsed().as_secs());
     }
 
-    // Mark remaining jobs done first, then final commit.
-    if !done_ids.is_empty() {
-        jobs.batch_mark_done(&done_ids).ok();
-    }
+    // Final commit: Tantivy first, then mark done in SQLite.
     if let Ok(mut w) = writer.lock() {
         if w.commit().is_ok() {
-            done_ids.clear();
-
+            if !done_ids.is_empty() {
+                jobs.batch_mark_done(&done_ids).ok();
+                done_ids.clear();
+            }
             let total = indexer.metrics().docs_indexed();
             metrics.set_indexer_docs_indexed(total);
             metrics.set_indexer_last_commit_age(0);
@@ -466,40 +485,52 @@ fn indexer_thread(
 fn flush_batch(
     writer: &std::sync::Mutex<tantivy::IndexWriter>,
     indexer: &Indexer,
-    done_ids: &mut Vec<(i64, bool)>,
+    done_ids: &mut Vec<(i64, bool, String)>,
     batch: &[DocumentRecord],
     log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) {
-    let mut w = match writer.lock() {
-        Ok(w) => w,
-        Err(_) => {
-            log_msg(log_cb, "[flush_batch] writer mutex poisoned — skipping batch");
-            return;
-        }
-    };
-    for record in batch {
-        if let Err(e) = indexer.search_index().add_document(
-            &mut w,
-            record.id,
-            &record.path,
-            &record.text,
-            None,
-        ) {
-            log_msg(log_cb, &format!(
-                "[flush_batch] add_document failed for id={} path='{}': {}",
-                record.id, record.path, e
-            ));
-        } else {
-            indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            done_ids.push((record.id, record.ocr_flag));
+    // Phase 1: add documents to Tantivy under the writer lock (fast, in-memory).
+    // Collect records that need position storage for phase 2 outside the lock.
+    let mut positions_to_store: Vec<(i64, Vec<(usize, crate::extractor::WordPosition)>)> = Vec::new();
+    {
+        let mut w = match writer.lock() {
+            Ok(w) => w,
+            Err(_) => {
+                log_msg(log_cb, "[flush_batch] writer mutex poisoned — skipping batch");
+                return;
+            }
+        };
+        for record in batch {
+            if let Err(e) = indexer.search_index().add_document(
+                &mut w,
+                record.id,
+                &record.path,
+                &record.text,
+                None,
+            ) {
+                log_msg(log_cb, &format!(
+                    "[flush_batch] add_document failed for id={} path='{}': {}",
+                    record.id, record.path, e
+                ));
+            } else {
+                indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                done_ids.push((record.id, record.ocr_flag, record.checksum.clone()));
 
-            if !record.word_positions.is_empty() {
-                let aligned = align_offsets_to_tantivy(&record.text, &record.word_positions);
-                if !aligned.is_empty() {
-                    if let Ok(pos_store) = indexer.position_store.lock() {
-                        let _ = pos_store.store_positions(record.id, &aligned);
+                if !record.word_positions.is_empty() {
+                    let aligned = align_offsets_to_tantivy(&record.text, &record.word_positions);
+                    if !aligned.is_empty() {
+                        positions_to_store.push((record.id, aligned));
                     }
                 }
+            }
+        }
+    } // writer lock released here
+
+    // Phase 2: store word positions outside the writer lock (SQLite I/O).
+    if !positions_to_store.is_empty() {
+        if let Ok(pos_store) = indexer.position_store.lock() {
+            for (id, aligned) in &positions_to_store {
+                let _ = pos_store.store_positions(*id, aligned);
             }
         }
     }
@@ -507,11 +538,16 @@ fn flush_batch(
 
 /// Resolve the effective number of OCR worker threads.
 /// If an override is given, clamps to at least 1.
-/// Otherwise auto-detects as `max(1, cores/2 - 1)`.
+/// Otherwise auto-detects as `min(max(1, cores/2 - 1), 2)`.
 fn resolve_ocr_workers(override_val: Option<usize>) -> usize {
     override_val
         .map(|v| std::cmp::max(1, v))
-        .unwrap_or_else(|| std::cmp::max(1, num_cpus::get() / 2 - 1))
+        .unwrap_or_else(|| {
+            let cores = num_cpus::get();
+            // OCR workers are memory-heavy (tesseract + temp images per worker).
+            // Cap the auto-detected default conservatively.
+            std::cmp::min(std::cmp::max(1, cores / 2 - 1), 2)
+        })
 }
 
 pub fn run_ocr_post_processing(
@@ -770,25 +806,54 @@ fn run_single_ocr(path: &Path, config: &ocr::OcrConfig, mut worker: Option<&mut 
     Ok(full_text)
 }
 
+/// Probe whether a tool binary is available on PATH, caching the result.
+fn tool_is_available(name: &str) -> bool {
+    // Use the name as the key; we keep one probe per name.
+    // The map is append-only so it's safe behind OnceLock.
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        OnceLock::new();
+    let mut map = CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *map.entry(name.to_string()).or_insert_with(|| {
+        cmd_no_window(name)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|mut child| {
+                let _ = child.kill();
+                let _ = child.wait();
+                true
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Try to determine the number of pages in a PDF using available tools.
+/// Checks tool availability once (cached) to avoid spawning missing binaries.
 /// Tries `mutool info` and `pdfinfo`, falling back to 1.
 fn get_pdf_page_count(pdf_path: &Path) -> Result<u32> {
-    if let Ok(output) = cmd_no_window("mutool")
-        .args(["info"])
-        .arg(pdf_path)
-        .output()
-    {
-        if let Some(n) = extract_page_count_from_stdout(&String::from_utf8_lossy(&output.stdout)) {
-            return Ok(n);
+    if tool_is_available("mutool") {
+        if let Ok(output) = cmd_no_window("mutool")
+            .args(["info"])
+            .arg(pdf_path)
+            .output()
+        {
+            if let Some(n) = extract_page_count_from_stdout(&String::from_utf8_lossy(&output.stdout)) {
+                return Ok(n);
+            }
         }
     }
 
-    if let Ok(output) = cmd_no_window("pdfinfo")
-        .arg(pdf_path)
-        .output()
-    {
-        if let Some(n) = extract_page_count_from_stdout(&String::from_utf8_lossy(&output.stdout)) {
-            return Ok(n);
+    if tool_is_available("pdfinfo") {
+        if let Ok(output) = cmd_no_window("pdfinfo")
+            .arg(pdf_path)
+            .output()
+        {
+            if let Some(n) = extract_page_count_from_stdout(&String::from_utf8_lossy(&output.stdout)) {
+                return Ok(n);
+            }
         }
     }
 
@@ -798,7 +863,8 @@ fn get_pdf_page_count(pdf_path: &Path) -> Result<u32> {
 /// Extract the page count from the stdout of `mutool info` or `pdfinfo`.
 /// Returns `None` if the output does not contain a valid `Pages: N` line.
 fn extract_page_count_from_stdout(stdout: &str) -> Option<u32> {
-    let re = regex::Regex::new(r"(?m)^Pages:\s+(\d+)\s*$").unwrap();
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"(?m)^Pages:\s+(\d+)\s*$").unwrap());
     re.captures(stdout)
         .and_then(|caps| caps[1].parse::<u32>().ok())
         .filter(|&n| n > 0)
@@ -808,32 +874,37 @@ fn extract_page_count_from_stdout(stdout: &str) -> Option<u32> {
 /// `page_num` is 1-indexed.
 /// Returns Ok(true) if rendering succeeded, Ok(false) if no renderer available.
 fn render_pdf_page(pdf_path: &Path, page_num: u32, output_image: &Path) -> Result<bool> {
-    // Try `mutool draw` (MuPDF)
     let page_str = page_num.to_string();
-    if let Ok(output) = cmd_no_window("mutool")
-        .args(["draw", "-o"])
-        .arg(output_image)
-        .args(["-r", "300"])
-        .arg(pdf_path)
-        .arg(&page_str)
-        .output()
-    {
-        if output.status.success() && output_image.exists() {
-            return Ok(true);
+
+    // Try `mutool draw` (MuPDF)
+    if tool_is_available("mutool") {
+        if let Ok(output) = cmd_no_window("mutool")
+            .args(["draw", "-o"])
+            .arg(output_image)
+            .args(["-r", "300"])
+            .arg(pdf_path)
+            .arg(&page_str)
+            .output()
+        {
+            if output.status.success() && output_image.exists() {
+                return Ok(true);
+            }
         }
     }
 
     // Try `pdftoppm` (poppler)
-    let ppm_path = output_image.with_extension("ppm");
-    if let Ok(output) = cmd_no_window("pdftoppm")
-        .args(["-r", "300", "-gray", "-f", &page_str, "-l", &page_str, "-singlefile"])
-        .arg(pdf_path)
-        .arg(&ppm_path.with_extension(""))
-        .output()
-    {
-        if output.status.success() && ppm_path.exists() {
-            std::fs::rename(&ppm_path, output_image)?;
-            return Ok(true);
+    if tool_is_available("pdftoppm") {
+        let ppm_path = output_image.with_extension("ppm");
+        if let Ok(output) = cmd_no_window("pdftoppm")
+            .args(["-r", "300", "-gray", "-f", &page_str, "-l", &page_str, "-singlefile"])
+            .arg(pdf_path)
+            .arg(&ppm_path.with_extension(""))
+            .output()
+        {
+            if output.status.success() && ppm_path.exists() {
+                std::fs::rename(&ppm_path, output_image)?;
+                return Ok(true);
+            }
         }
     }
 
@@ -899,11 +970,11 @@ fn drain_crash_frames<R: io::Read>(
         };
         match frame {
             WorkerFrame::Success(wo) => {
-                if let Some(&(id, ref checksum)) = path_map.get(&wo.path) {
+                if let Some(&(id, _)) = path_map.get(&wo.path) {
                     let record = DocumentRecord {
                         id,
                         path: wo.path,
-                        checksum: checksum.clone(),
+                        checksum: wo.checksum,
                         ocr_flag: wo.ocr_flag,
                         text: wo.text,
                         word_positions: wo.word_positions,
@@ -1076,7 +1147,7 @@ fn run_extraction_process(
                     let record = DocumentRecord {
                         id: task.id,
                         path: wo.path,
-                        checksum: task.checksum.clone(),
+                        checksum: wo.checksum,
                         ocr_flag: wo.ocr_flag,
                         text: wo.text,
                         word_positions: wo.word_positions,
@@ -1891,6 +1962,7 @@ mod tests {
     fn test_read_frame_success() {
         let frame = WorkerFrame::Success(WorkerOutput {
             path: "/mocked.pdf".into(),
+            checksum: "dummy".into(),
             ocr_flag: false,
             text: "hello from mock".into(),
             word_positions: vec![],
@@ -1937,6 +2009,7 @@ mod tests {
     fn test_read_frame_truncated_returns_error() {
         let frame = WorkerFrame::Success(WorkerOutput {
             path: "/test.pdf".into(),
+            checksum: "dummy".into(),
             ocr_flag: false,
             text: "test".into(),
             word_positions: vec![],

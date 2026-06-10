@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tantivy::query::Occur;
 use tantivy::schema::Value;
@@ -38,11 +38,8 @@ struct AppContext {
     commit_timeout: Option<u32>,
     extract_workers: Option<u32>,
     num_indexer_threads: Option<u32>,
-    fuzzy_distance: u32,
-    stem_enabled: u32,
     search_field: Option<String>,
     path_filter: Option<String>,
-    recency_weight: f32,
     field_weights: Option<Vec<(String, f32)>>,
     collection_boosts: HashMap<i64, f32>,
     boolean_query: Option<Vec<(String, String)>>,
@@ -107,11 +104,8 @@ fn with_app_mut<R>(f: impl FnOnce(&mut AppContext) -> R) -> Result<R, i32> {
         commit_timeout: None,
         extract_workers: None,
         num_indexer_threads: None,
-        fuzzy_distance: 0,
-        stem_enabled: 0,
         search_field: None,
         path_filter: None,
-        recency_weight: 0.0,
         field_weights: None,
         collection_boosts: HashMap::new(),
         boolean_query: None,
@@ -129,27 +123,39 @@ fn set_error(msg: String) {
 
 /// Per-collection cancellation tokens so concurrent indexing operations
 /// don't interfere with each other.
+// Atomically-accessed scalar settings — no RwLock contention with readers.
+static FUZZY_DISTANCE: AtomicU32 = AtomicU32::new(0);
+static STEM_ENABLED: AtomicU32 = AtomicU32::new(0);
+static RECENCY_WEIGHT_BITS: AtomicU32 = AtomicU32::new(f32::to_bits(0.0));
+
 static CANCEL_TOKENS: OnceLock<Mutex<HashMap<u32, Arc<AtomicBool>>>> = OnceLock::new();
 fn cancel_tokens() -> &'static Mutex<HashMap<u32, Arc<AtomicBool>>> {
     CANCEL_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(test)]
-fn reset_state() {
-    if let Ok(mut guard) = cancel_tokens().lock() {
-        guard.clear();
+/// Reset all global state — clears AppContext, collection registry, error,
+/// callbacks, cancellation tokens, and atomic settings.  Used by `pdf_reset_all`
+/// and by `#[cfg(test)]` helpers.
+fn reset_all_globals() {
+    // AppContext
+    if let Some(rw) = APP.get() {
+        if let Ok(mut guard) = rw.write() {
+            *guard = None;
+        }
     }
-    if let Ok(mut guard) = APP.get_or_init(|| RwLock::new(None)).write() {
-        *guard = None;
+    // Collection registry
+    if let Some(lock) = COLLECTION_REGISTRY.get() {
+        if let Ok(mut guard) = lock.lock() {
+            *guard = None;
+        }
     }
-    if let Ok(mut guard) = COLLECTION_REGISTRY.get_or_init(|| Mutex::new(None)).lock() {
-        *guard = None;
-    }
+    // Error
     if let Some(lock) = LAST_ERROR.get() {
         if let Ok(mut guard) = lock.lock() {
             *guard = None;
         }
     }
+    // Callbacks
     if let Some(lock) = LOG_CALLBACK.get() {
         if let Ok(mut guard) = lock.lock() {
             *guard = None;
@@ -160,6 +166,21 @@ fn reset_state() {
             *guard = None;
         }
     }
+    // Cancellation tokens
+    if let Some(lock) = CANCEL_TOKENS.get() {
+        if let Ok(mut guard) = lock.lock() {
+            guard.clear();
+        }
+    }
+    // Atomic scalar settings
+    FUZZY_DISTANCE.store(0, Ordering::Relaxed);
+    STEM_ENABLED.store(0, Ordering::Relaxed);
+    RECENCY_WEIGHT_BITS.store(f32::to_bits(0.0), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn reset_state() {
+    reset_all_globals();
 }
 
 /// Locate `pdf_worker.exe` relative to the current executable.
@@ -257,6 +278,15 @@ unsafe fn cstr_to_str(ptr: *const c_char) -> Result<&'static str, i32> {
 pub unsafe extern "C" fn pdf_api_version() -> u32 {
     let ver = PDF_EXTRACTOR_API_VERSION;
     ver
+}
+
+/// Reset the cached PDFium DLL state so the next PDFium operation will
+/// attempt to reload `pdfium.dll` from scratch.  This allows recovery
+/// when the DLL becomes available after an initial failure (e.g. the DLL
+/// was copied into the expected directory at runtime).
+#[no_mangle]
+pub unsafe extern "C" fn pdf_reload_pdfium() {
+    pdf_extractor::pdfium::Pdfium::reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,15 +1194,18 @@ pub unsafe extern "C" fn pdf_page_dimensions(
     out_buf: *mut u8,
     out_len: *mut u32,
 ) -> i32 {
+    if out_buf.is_null() || out_len.is_null() {
+        return ERR_NULL_PTR;
+    }
+    if *out_len < 16 {
+        *out_len = 16;
+        return ERR_BUFFER_RETRY;
+    }
+
     let p = match unsafe { cstr_to_str(path) } {
         Ok(s) => s,
         Err(e) => return e,
     };
-
-    if out_len.is_null() || *out_len < 16 {
-        if !out_len.is_null() { *out_len = 16; }
-        return -4;
-    }
     *out_len = 16;
 
     let pdf_data = match std::fs::read(p) {
@@ -1564,6 +1597,9 @@ pub unsafe extern "C" fn pdf_get_page_dimensions(
     out_width_pts: *mut f64,
     out_height_pts: *mut f64,
 ) -> i32 {
+    if out_width_pts.is_null() || out_height_pts.is_null() {
+        return ERR_NULL_PTR;
+    }
     let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
         Some(p) => p,
         None => {
@@ -2203,20 +2239,6 @@ macro_rules! define_u32_setter {
     };
 }
 
-macro_rules! define_u32_direct_setter {
-    ($name:ident, $field:ident) => {
-        #[no_mangle]
-        pub unsafe extern "C" fn $name(value: u32) -> i32 {
-            (|| -> i32 {
-            match with_app_mut(|app| { app.$field = value; Ok::<_, i32>(()) }) {
-                Ok(_) => 0,
-                Err(e) => e,
-            }
-            })()
-        }
-    };
-}
-
 macro_rules! define_string_setter {
     ($name:ident, $field:ident) => {
         #[no_mangle]
@@ -2249,8 +2271,17 @@ define_u32_setter!(pdf_set_commit_interval, commit_interval);
 define_u32_setter!(pdf_set_commit_timeout, commit_timeout);
 define_u32_setter!(pdf_set_extract_workers, extract_workers);
 define_u32_setter!(pdf_set_indexer_threads, num_indexer_threads);
-define_u32_direct_setter!(pdf_set_fuzzy_distance, fuzzy_distance);
-define_u32_direct_setter!(pdf_set_stem, stem_enabled);
+#[no_mangle]
+pub unsafe extern "C" fn pdf_set_fuzzy_distance(value: u32) -> i32 {
+    FUZZY_DISTANCE.store(value, Ordering::Relaxed);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pdf_set_stem(value: u32) -> i32 {
+    STEM_ENABLED.store(value, Ordering::Relaxed);
+    0
+}
 define_string_setter!(pdf_set_tesseract_path, tesseract_path);
 define_string_setter!(pdf_set_ocr_language, ocr_language);
 define_string_setter!(pdf_set_search_field, search_field);
@@ -2292,12 +2323,8 @@ pub unsafe extern "C" fn pdf_set_ram_buffer(value: u64) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pdf_set_recency_weight(value: f32) -> i32 {
-    (|| -> i32 {
-    match with_app_mut(|app| { app.recency_weight = value; Ok::<_, i32>(()) }) {
-        Ok(_) => 0,
-        Err(e) => e,
-    }
-    })()
+    RECENCY_WEIGHT_BITS.store(value.to_bits(), Ordering::Relaxed);
+    0
 }
 
 /// Set per-field weight boosts for ranked search.
@@ -2728,12 +2755,17 @@ pub unsafe extern "C" fn pdf_close_collection(_coll_id: u32) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn pdf_close_all() -> i32 {
     // Clear global app state
-    if let Some(rw) = APP.get() {
-        if let Ok(mut guard) = rw.write() {
-            *guard = None;
-        }
-    }
+    reset_all_globals();
     0
+}
+
+/// Reset **all** global state — AppContext, collection registry, error,
+/// callbacks, cancellation tokens, and atomic scalar settings.  After
+/// calling this, the library returns to its initial (uninitialised) state.
+/// Any open document handles or bitmaps become invalid and must not be used.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_reset_all() {
+    reset_all_globals();
 }
 
 /// Settings read from AppContext once, to avoid mutex contention in parallel search.
@@ -2749,16 +2781,19 @@ struct SearchSettings {
 }
 
 fn load_search_settings() -> SearchSettings {
+    let fuzzy = FUZZY_DISTANCE.load(Ordering::Relaxed);
+    let stem = STEM_ENABLED.load(Ordering::Relaxed) != 0;
+    let recency_weight = f32::from_bits(RECENCY_WEIGHT_BITS.load(Ordering::Relaxed));
     with_app_read(|app| SearchSettings {
-        fuzzy: app.fuzzy_distance,
-        stem: app.stem_enabled != 0,
+        fuzzy,
+        stem,
+        recency_weight,
         field: app.search_field.clone(),
         path_filter: app.path_filter.clone(),
-        recency_weight: app.recency_weight,
         field_weights: app.field_weights.clone(),
         boolean_query: app.boolean_query.clone(),
     })
-    .unwrap_or_default()
+    .unwrap_or(SearchSettings { fuzzy, stem, recency_weight, ..Default::default() })
 }
 
 fn do_search_with_index(
@@ -4382,12 +4417,12 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         // Index a doc in each collection with the same searchable content
         let si1 = SearchIndex::new(&idx1).unwrap();
         let mut w1 = si1.writer().unwrap();
-        si1.add_document(&mut w1, 1, "/doc1.pdf", "chk1", "math algebra", "math algebra", "en", "").unwrap();
+        si1.add_document(&mut w1, 1, "/doc1.pdf", "math algebra", Some("math algebra")).unwrap();
         w1.commit().unwrap();
 
         let si2 = SearchIndex::new(&idx2).unwrap();
         let mut w2 = si2.writer().unwrap();
-        si2.add_document(&mut w2, 1, "/doc2.pdf", "chk2", "math algebra", "math algebra", "en", "").unwrap();
+        si2.add_document(&mut w2, 1, "/doc2.pdf", "math algebra", Some("math algebra")).unwrap();
         w2.commit().unwrap();
 
         // --- Basic flow: boost coll2 ---

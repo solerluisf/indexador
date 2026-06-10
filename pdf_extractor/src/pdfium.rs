@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use libloading::Library;
 use std::ffi::c_void;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 macro_rules! load_fn {
     ($lib:expr, $name:ident, $ty:ty) => {
@@ -70,35 +70,46 @@ pub struct Pdfium {
     pub FPDF_GetLastError: unsafe extern "C" fn() -> u32,
 }
 
-static PDFIUM: OnceLock<Result<Pdfium, String>> = OnceLock::new();
+static PDFIUM: Mutex<Option<&'static Pdfium>> = Mutex::new(None);
 
 impl Pdfium {
     /// Get the global PDFium instance, loading pdfium.dll on first call.
     /// Returns `None` if the DLL cannot be loaded.
+    /// Errors are **not** cached — if the DLL is missing on first call,
+    /// subsequent calls will retry loading.
     pub fn global() -> Option<&'static Self> {
-        match Self::init() {
-            Ok(pdfium) => Some(pdfium),
-            Err(_) => None,
-        }
+        Self::init().ok()
     }
 
     /// Force initialization — returns an error if pdfium.dll cannot be loaded.
+    /// Errors are **not** cached — if the DLL is missing on first call,
+    /// subsequent calls will retry loading.
     pub fn init() -> Result<&'static Self> {
-        let result = PDFIUM.get_or_init(|| unsafe {
-            Self::load_inner().map_err(|e| e.to_string())
-        });
-        match result {
-            Ok(ref pdfium) => Ok(pdfium),
-            Err(ref e) => Err(anyhow::anyhow!("{}", e)),
+        let mut guard = PDFIUM.lock().unwrap();
+        if let Some(pdfium) = guard.as_ref() {
+            return Ok(pdfium);
+        }
+        match unsafe { Self::load_inner() } {
+            Ok(pdfium) => {
+                let leaked: &'static Self = Box::leak(Box::new(pdfium));
+                *guard = Some(leaked);
+                Ok(leaked)
+            }
+            Err(e) => Err(e),
         }
     }
 
     /// Returns true if pdfium.dll was loaded successfully.
     pub fn is_available() -> bool {
-        match PDFIUM.get() {
-            Some(Ok(_)) => true,
-            _ => false,
-        }
+        PDFIUM.lock().unwrap().is_some()
+    }
+
+    /// Reset the cached PDFium instance so the next call to `global()` or
+    /// `init()` will reload the DLL.  The old instance remains usable until
+    /// all references to it are dropped, but new callers will attempt a fresh
+    /// load.
+    pub fn reset() {
+        *PDFIUM.lock().unwrap() = None;
     }
 
     unsafe fn load_inner() -> Result<Self> {

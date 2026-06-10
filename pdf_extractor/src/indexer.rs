@@ -5,9 +5,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::query::{BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery};
-#[cfg(test)]
-use tantivy::query::TermQuery;
+use tantivy::query::{BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery, TermQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDocument, Term};
@@ -131,6 +129,10 @@ impl SearchIndex {
         text: &str,
         math_source: Option<&str>,
     ) -> Result<()> {
+        // Delete any existing document with the same id before adding,
+        // so re-processing a file after a crash does not create duplicates.
+        writer
+            .delete_term(Term::from_field_u64(self.id_field, id as u64));
         let mut doc = TantivyDocument::from(doc!(
             self.id_field => id as u64,
             self.path_field => path,
@@ -235,9 +237,9 @@ impl SearchIndex {
     /// Returns the word offsets where `term` appears in document `doc_id`.
     /// Each offset is the 0-indexed word position within the content_norm field.
     ///
-    /// Works by scanning all segments' postings for the term, checking each
-    /// matching document's stored id field. This is reliable but slower than
-    /// a direct segment-local lookup.
+    /// Uses a `TermQuery` on the id field to locate the exact `DocAddress`,
+    /// then reads postings only from the containing segment — O(1) segment
+    /// scan instead of O(segments × postings).
     ///
     /// Returns an empty Vec if the term has no positions for this doc.
     pub fn search_term_positions(&self, doc_id: u64, term: &str) -> Result<Vec<usize>> {
@@ -247,51 +249,44 @@ impl SearchIndex {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
         let searcher = reader.searcher();
-        let content_term = tantivy::Term::from_field_text(self.content_field, term);
-        let segment_readers = searcher.segment_readers();
-        let mut all_offsets = Vec::new();
 
-        for seg in segment_readers.iter() {
-            let inv_index = match seg.inverted_index(self.content_field) {
-                Ok(idx) => idx,
-                Err(_) => continue,
-            };
+        // Locate the document via its id field — this gives us the segment
+        // ordinal and segment-local doc id in one cheap term lookup.
+        let id_term = Term::from_field_u64(self.id_field, doc_id);
+        let id_query = TermQuery::new(id_term, IndexRecordOption::Basic);
+        let top_docs = searcher.search(&id_query, &TopDocs::with_limit(1))?;
+        let (_score, doc_address) = match top_docs.first() {
+            Some(addr) => *addr,
+            None => return Ok(Vec::new()),
+        };
 
-            let Ok(Some(mut postings)) = inv_index.read_postings(
-                &content_term,
-                IndexRecordOption::WithFreqsAndPositions,
-            ) else { continue };
+        let seg = &searcher.segment_readers()[doc_address.segment_ord as usize];
+        let inv_index = match seg.inverted_index(self.content_field) {
+            Ok(idx) => idx,
+            Err(_) => return Ok(Vec::new()),
+        };
 
-            let store_reader = match seg.get_store_reader(0) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+        let content_term = Term::from_field_text(self.content_field, term);
+        let Ok(Some(mut postings)) = inv_index.read_postings(
+            &content_term,
+            IndexRecordOption::WithFreqsAndPositions,
+        ) else { return Ok(Vec::new()) };
 
-            // Postings are already positioned at the first document
-            loop {
-                let seg_doc_id = postings.doc();
-                if seg_doc_id == TERMINATED {
-                    break;
-                }
-                if let Ok(stored_doc) = store_reader.get::<TantivyDocument>(seg_doc_id) {
-                    if let Some(id_val) = stored_doc.get_first(self.id_field) {
-                        if let Some(stored_id) = id_val.as_u64() {
-                            if stored_id == doc_id {
-                                let mut positions = Vec::new();
-                                postings.positions_with_offset(0, &mut positions);
-                                for pos in positions {
-                                    all_offsets.push(pos as usize);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                postings.advance();
+        // Seek directly to our segment-local doc
+        let target = doc_address.doc_id;
+        if postings.doc() == TERMINATED || postings.doc() > target {
+            return Ok(Vec::new());
+        }
+        while postings.doc() < target {
+            postings.advance();
+            if postings.doc() == TERMINATED {
+                return Ok(Vec::new());
             }
         }
 
-        Ok(all_offsets)
+        let mut positions = Vec::new();
+        postings.positions_with_offset(0, &mut positions);
+        Ok(positions.into_iter().map(|p| p as usize).collect())
     }
 
     /// Returns the total number of matching documents (ignoring limit/offset).
