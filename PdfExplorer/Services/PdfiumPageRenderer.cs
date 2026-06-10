@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
@@ -18,6 +19,7 @@ public sealed class PdfiumPageRenderer : IDisposable
     private int _pageCount;
     private readonly double _targetDpi;
     private GCHandle? _pinnedPdfData;
+    private readonly ConcurrentDictionary<int, byte[]> _highlightJsonCache = new();
 
     public double TargetDpi => _targetDpi;
 
@@ -81,6 +83,7 @@ public sealed class PdfiumPageRenderer : IDisposable
                 }
                 _docHandle = -1;
                 _pageCount = 0;
+                _highlightJsonCache.Clear();
             }
 
             // Read file inside the lock to avoid TOCTOU race and redundant reads.
@@ -160,6 +163,7 @@ public sealed class PdfiumPageRenderer : IDisposable
                 }
                 _docHandle = -1;
                 _pageCount = 0;
+                _highlightJsonCache.Clear();
             }
 
             // Pin the byte array — FPDF_LoadMemDocument stores a pointer internally
@@ -204,8 +208,11 @@ public sealed class PdfiumPageRenderer : IDisposable
         var t0 = DateTime.UtcNow;
         Log($"RenderPageRaw: page={pageIndex + 1}, dpi={_targetDpi}");
 
+        // Cache the serialized highlight JSON per page — positions don't change
+        // during the document session, and serialization allocates a temporary
+        // string + byte array for every render.
         var highlightJson = pagePositions.Count > 0
-            ? Utf8Bytes(JsonSerializer.Serialize(pagePositions))
+            ? _highlightJsonCache.GetOrAdd(pageIndex, _ => Utf8Bytes(JsonSerializer.Serialize(pagePositions)))
             : null;
 
         int handle, w, h, stride;
@@ -290,17 +297,15 @@ public sealed class PdfiumPageRenderer : IDisposable
             };
         }
 
-        var bitmap = new WriteableBitmap(raw.Width, raw.Height, 96, 96, PixelFormats.Bgra32, null);
-        try
-        {
-            bitmap.Lock();
-            Marshal.Copy(raw.Pixels, 0, bitmap.BackBuffer, raw.Pixels.Length);
-            bitmap.AddDirtyRect(new Int32Rect(0, 0, raw.Width, raw.Height));
-        }
-        finally
-        {
-            bitmap.Unlock();
-        }
+        // BitmapSource.Create + Freeze is faster than WriteableBitmap for
+        // read-only images: no Lock/Unlock/Marshal.Copy overhead.
+        var bitmap = BitmapSource.Create(
+            raw.Width, raw.Height,
+            96.0, 96.0,
+            PixelFormats.Bgra32,
+            null,
+            raw.Pixels,
+            raw.Stride);
         bitmap.Freeze();
 
         return new PageRenderItem
@@ -335,6 +340,8 @@ public sealed class PdfiumPageRenderer : IDisposable
     {
         lock (_lock)
         {
+            _highlightJsonCache.Clear();
+
             if (_docHandle < 0)
             {
                 UnpinPdfData();

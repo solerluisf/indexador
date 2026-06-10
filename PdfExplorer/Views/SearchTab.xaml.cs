@@ -388,12 +388,18 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     async Task<PageRenderItem> IPdfRenderingService.GetOrRenderPageAsync(int pageIdx, List<WordPosition> pagePositions)
     {
+        // Capture the cancellation token at entry — before GetOrAdd,
+        // so that if ClearViewer cancels _selectionCts during an in-flight
+        // render, any new request for the same page is cancelled immediately
+        // instead of wasting ~100ms on a stale native call.
+        var ct = _selectionCts?.Token ?? CancellationToken.None;
+
         // Coalesce concurrent render requests for the same page.
         // Multiple PdfPageView controls can request the same pageIdx
         // simultaneously during VirtualizingStackPanel recycling.
         try
         {
-            return await _pendingRenders.GetOrAdd(pageIdx, idx => RenderPageInternalAsync(idx, pagePositions));
+            return await _pendingRenders.GetOrAdd(pageIdx, idx => RenderPageInternalAsync(idx, pagePositions, ct));
         }
         finally
         {
@@ -401,7 +407,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         }
     }
 
-    private async Task<PageRenderItem> RenderPageInternalAsync(int pageIdx, List<WordPosition> pagePositions)
+    private async Task<PageRenderItem> RenderPageInternalAsync(int pageIdx, List<WordPosition> pagePositions, CancellationToken ct)
     {
         // Capture state identity at the start — ClearViewer may replace _state
         // while this render is in flight, and we must not write into the new state.
@@ -422,7 +428,6 @@ public partial class SearchTab : Page, IPdfRenderingService
                 return cachedLocal;
         }
 
-        var ct = _selectionCts?.Token ?? CancellationToken.None;
         ct.ThrowIfCancellationRequested();
 
         Log($"Rendering page {pageIdx + 1} (0-based={pageIdx})");
@@ -430,7 +435,10 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         try
         {
-            var raw = _renderer.RenderPageRaw(pageIdx, pagePositions);
+            // Run the native PDFium render on a background thread.
+            // RenderPageRaw is thread-safe (takes _lock + GlobalPdfiumLock,
+            // no WPF objects created). This keeps the UI thread responsive.
+            var raw = await Task.Run(() => _renderer.RenderPageRaw(pageIdx, pagePositions));
             ct.ThrowIfCancellationRequested();
 
             var item = await Dispatcher.InvokeAsync(() =>
