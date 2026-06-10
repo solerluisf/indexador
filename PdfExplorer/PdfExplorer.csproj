@@ -54,6 +54,10 @@
     <PackageReference Include="bblanchon.PDFium.Win32" Version="150.0.7869" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="PdfExplorer.Tests" />
+  </ItemGroup>
+
   <!--
     pdfium.dll is deployed by the NuGet package to runtimes/win-x64/native/,
     which .NET Core's native P/Invoke resolver finds automatically.

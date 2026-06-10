@@ -205,155 +205,155 @@ public partial class SearchTab : Page
         try
         {
 
-        if (ResultsList.SelectedItem is not SearchResultViewModel result)
-        {
-            Log("OnResultSelected: no selection");
-            return;
-        }
+            if (ResultsList.SelectedItem is not SearchResultViewModel result)
+            {
+                Log("OnResultSelected: no selection");
+                return;
+            }
 
-        var t0 = DateTime.UtcNow;
-        Log($"OnResultSelected: id={result.Id}, path={result.Path}, collId={result.CollectionId}, query='{_lastQuery}'");
+            var t0 = DateTime.UtcNow;
+            Log($"OnResultSelected: id={result.Id}, path={result.Path}, collId={result.CollectionId}, query='{_lastQuery}'");
 
-        ClearViewer();
-        _state.PdfPath = result.Path;
-        StatusLabel.Text = System.IO.Path.GetFileName(result.Path);
+            ClearViewer();
+            _state.PdfPath = result.Path;
+            StatusLabel.Text = System.IO.Path.GetFileName(result.Path);
 
-        // Read the PDF bytes once and pass to both search + render (fixes double-load)
-        byte[] pdfBytes;
-        try
-        {
-            pdfBytes = System.IO.File.ReadAllBytes(result.Path);
-            Log($"Read PDF file: {pdfBytes.Length} bytes");
-        }
-        catch (Exception ex)
-        {
-            Log($"Failed to read PDF file: {ex.Message}");
-            StatusLabel.Text = $"Failed to read PDF: {ex.Message}";
-            return;
-        }
-
-        // Fetch term positions via PDFium text search (case-insensitive)
-        try
-        {
-            _state.Positions = _engine.SearchTextInPdf(
-                pdfBytes,
-                _lastQuery
-            );
-            var t1 = DateTime.UtcNow;
-            Log($"SearchTextInPdf returned {_state.Positions.Count} positions (took {(t1 - t0).TotalMilliseconds:F0}ms)");
-        }
-        catch (Exception ex)
-        {
-            Log($"SearchTextInPdf warning: {ex.GetType().Name}: {ex.Message}");
-            _state.Positions = new List<WordPosition>();
-        }
-
-        // Fallback: try the indexed position store when PDFium finds nothing
-        if (_state.Positions.Count == 0 && result.CollectionId.HasValue)
-        {
+            // Read the PDF bytes once and pass to both search + render (fixes double-load)
+            byte[] pdfBytes;
             try
             {
-                Log($"SearchTextInPdf found nothing — trying GetTermPositions from position store");
-                _state.Positions = _engine.GetTermPositions(
-                    (uint)result.CollectionId.Value,
-                    result.Id,
-                    _lastQuery
-                );
-                Log($"GetTermPositions returned {_state.Positions.Count} positions");
+                pdfBytes = System.IO.File.ReadAllBytes(result.Path);
+                Log($"Read PDF file: {pdfBytes.Length} bytes");
             }
             catch (Exception ex)
             {
-                Log($"GetTermPositions warning: {ex.GetType().Name}: {ex.Message}");
+                Log($"Failed to read PDF file: {ex.Message}");
+                StatusLabel.Text = $"Failed to read PDF: {ex.Message}";
+                return;
+            }
+
+            // Fetch term positions via PDFium text search (case-insensitive)
+            try
+            {
+                _state.Positions = _engine.SearchTextInPdf(
+                    pdfBytes,
+                    _lastQuery
+                );
+                var t1 = DateTime.UtcNow;
+                Log($"SearchTextInPdf returned {_state.Positions.Count} positions (took {(t1 - t0).TotalMilliseconds:F0}ms)");
+            }
+            catch (Exception ex)
+            {
+                Log($"SearchTextInPdf warning: {ex.GetType().Name}: {ex.Message}");
                 _state.Positions = new List<WordPosition>();
             }
-        }
 
-        if (_state.Positions.Count > 0)
-        {
-            Log($"First position: page={_state.Positions[0].Page}, x_min={_state.Positions[0].XMin}, word_text={_state.Positions[0].WordText}");
-            var lines = new List<string>(_state.Positions.Count + 1);
-            lines.Add($"Positions ({_state.Positions.Count}):");
-            foreach (var p in _state.Positions)
+            // Fallback: try the indexed position store when PDFium finds nothing
+            if (_state.Positions.Count == 0 && result.CollectionId.HasValue)
             {
-                var word = string.IsNullOrWhiteSpace(p.WordText) ? "?" : p.WordText;
-                lines.Add($"  p{p.Page} \"{word}\" ({p.XMin:F1},{p.YMin:F1})-({p.XMax:F1},{p.YMax:F1})");
+                try
+                {
+                    Log($"SearchTextInPdf found nothing — trying GetTermPositions from position store");
+                    _state.Positions = _engine.GetTermPositions(
+                        (uint)result.CollectionId.Value,
+                        result.Id,
+                        _lastQuery
+                    );
+                    Log($"GetTermPositions returned {_state.Positions.Count} positions");
+                }
+                catch (Exception ex)
+                {
+                    Log($"GetTermPositions warning: {ex.GetType().Name}: {ex.Message}");
+                    _state.Positions = new List<WordPosition>();
+                }
             }
-            WordsField.Text = string.Join("\n", lines);
-        }
-        else
-        {
-            WordsField.Text = result.Snippet;
-        }
 
-        var tPos = DateTime.UtcNow;
+            if (_state.Positions.Count > 0)
+            {
+                Log($"First position: page={_state.Positions[0].Page}, x_min={_state.Positions[0].XMin}, word_text={_state.Positions[0].WordText}");
+                var lines = new List<string>(_state.Positions.Count + 1);
+                lines.Add($"Positions ({_state.Positions.Count}):");
+                foreach (var p in _state.Positions)
+                {
+                    var word = string.IsNullOrWhiteSpace(p.WordText) ? "?" : p.WordText;
+                    lines.Add($"  p{p.Page} \"{word}\" ({p.XMin:F1},{p.YMin:F1})-({p.XMax:F1},{p.YMax:F1})");
+                }
+                WordsField.Text = string.Join("\n", lines);
+            }
+            else
+            {
+                WordsField.Text = result.Snippet;
+            }
 
-        // Load PDF from the bytes we already read
-        try
-        {
-            Log($"Loading PDF: {result.Path}");
-            _renderer.OpenDocument(pdfBytes, result.Path);
-            var t2 = DateTime.UtcNow;
-            Log($"PDF loaded, page count={_renderer.GetPageCount()} (took {(t2 - tPos).TotalMilliseconds:F0}ms)");
-        }
-        catch (Exception ex)
-        {
-            Log($"LoadDocumentAsync error: {ex.GetType().Name}: {ex.Message}");
-            StatusLabel.Text = $"Failed to load PDF: {ex.Message}";
-            return;
-        }
+            var tPos = DateTime.UtcNow;
 
-        if (_state.Positions.Count == 0)
-        {
-            Log("No positions found — showing first page without highlights");
-            StatusLabel.Text += " — no highlights";
-        }
+            // Load PDF from the bytes we already read
+            try
+            {
+                Log($"Loading PDF: {result.Path}");
+                _renderer.OpenDocument(pdfBytes, result.Path);
+                var t2 = DateTime.UtcNow;
+                Log($"PDF loaded, page count={_renderer.GetPageCount()} (took {(t2 - tPos).TotalMilliseconds:F0}ms)");
+            }
+            catch (Exception ex)
+            {
+                Log($"LoadDocumentAsync error: {ex.GetType().Name}: {ex.Message}");
+                StatusLabel.Text = $"Failed to load PDF: {ex.Message}";
+                return;
+            }
 
-        var tPdf = DateTime.UtcNow;
+            if (_state.Positions.Count == 0)
+            {
+                Log("No positions found — showing first page without highlights");
+                StatusLabel.Text += " — no highlights";
+            }
 
-        // Determine which pages match (sorted, 0-based)
-        _state.MatchingPages = _state.Positions
-            .Select(p => p.Page - 1)
-            .Where(p => p >= 0)
-            .Distinct()
-            .OrderBy(p => p)
-            .ToList();
+            var tPdf = DateTime.UtcNow;
 
-        // Fallback: if no matches, show the first page of the PDF
-        if (_state.MatchingPages.Count == 0)
-        {
-            _state.MatchingPages = new List<int> { 0 };
-            Log("No matching pages — fallback to page 1");
-        }
+            // Determine which pages match (sorted, 0-based)
+            _state.MatchingPages = _state.Positions
+                .Select(p => p.Page - 1)
+                .Where(p => p >= 0)
+                .Distinct()
+                .OrderBy(p => p)
+                .ToList();
 
-        Log($"Matching pages ({_state.MatchingPages.Count}): [{string.Join(", ", _state.MatchingPages.Select(p => p + 1))}]");
+            // Fallback: if no matches, show the first page of the PDF
+            if (_state.MatchingPages.Count == 0)
+            {
+                _state.MatchingPages = new List<int> { 0 };
+                Log("No matching pages — fallback to page 1");
+            }
 
-        // Group positions by page
-        _state.PositionsByPage = _state.Positions
-            .GroupBy(p => p.Page - 1)
-            .ToDictionary(g => g.Key, g => g.ToList());
+            Log($"Matching pages ({_state.MatchingPages.Count}): [{string.Join(", ", _state.MatchingPages.Select(p => p + 1))}]");
 
-        _state.TotalMatchPages = _state.MatchingPages.Count;
+            // Group positions by page
+            _state.PositionsByPage = _state.Positions
+                .GroupBy(p => p.Page - 1)
+                .ToDictionary(g => g.Key, g => g.ToList());
 
-        // Render only the first match page; remaining pages load on scroll
-        _state.CurrentMatchIndex = 0;
-        _state.CurrentPositionIndex = -1;
-        _state.PageElements = new List<Border?>(_state.MatchingPages.Count);
-        for (int i = 0; i < _state.MatchingPages.Count; i++)
-            _state.PageElements.Add(null);
+            _state.TotalMatchPages = _state.MatchingPages.Count;
 
-        var firstItem = await GetOrRenderPageAsync(_state.MatchingPages[0]);
-        var t3 = DateTime.UtcNow;
-        Log($"First page rendered (took {(t3 - tPdf).TotalMilliseconds:F0}ms)");
-        AddPageToStack(0, firstItem);
-        UpdateMatchNav();
-        UpdatePositionNav();
-        ScrollToMatch(0);
+            // Render only the first match page; remaining pages load on scroll
+            _state.CurrentMatchIndex = 0;
+            _state.CurrentPositionIndex = -1;
+            _state.PageElements = new List<Border?>(_state.MatchingPages.Count);
+            for (int i = 0; i < _state.MatchingPages.Count; i++)
+                _state.PageElements.Add(null);
 
-        PageScroller.ScrollChanged += OnPageScroll;
-        _state.IsLoadingNextPage = false;
+            var firstItem = await GetOrRenderPageAsync(_state.MatchingPages[0]);
+            var t3 = DateTime.UtcNow;
+            Log($"First page rendered (took {(t3 - tPdf).TotalMilliseconds:F0}ms)");
+            AddPageToStack(0, firstItem);
+            UpdateMatchNav();
+            UpdatePositionNav();
+            ScrollToMatch(0);
 
-        var tEnd = DateTime.UtcNow;
-        Log($"OnResultSelected complete (total {(tEnd - t0).TotalMilliseconds:F0}ms)");
+            PageScroller.ScrollChanged += OnPageScroll;
+            _state.IsLoadingNextPage = false;
+
+            var tEnd = DateTime.UtcNow;
+            Log($"OnResultSelected complete (total {(tEnd - t0).TotalMilliseconds:F0}ms)");
         }
         catch (Exception ex)
         {
