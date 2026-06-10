@@ -95,69 +95,80 @@ public sealed class ThumbnailRenderer : IDisposable
                 {
                     Log("RenderAsync: global PDFium lock acquired");
 
-                    // Open document
-                    var docHandle = pdf_open_document_mem(pdfBytes, pdfBytes.Length);
-                    Log($"RenderAsync: pdf_open_document_mem returned {docHandle}");
-                    if (docHandle < 0)
-                    {
-                        Log("RenderAsync ABORT: failed to open document");
-                        return null;
-                    }
-
+                    // Pin the byte array — FPDF_LoadMemDocument stores a pointer
+                    // internally and does NOT copy the data.
+                    var dataHandle = GCHandle.Alloc(pdfBytes, GCHandleType.Pinned);
                     try
                     {
-                        var pageCount = pdf_document_page_count(docHandle);
-                        Log($"RenderAsync: pageCount={pageCount}");
-                        if (pageCount == 0)
+                        // Open document
+                        var docHandle = pdf_open_document_mem(pdfBytes, pdfBytes.Length);
+                        Log($"RenderAsync: pdf_open_document_mem returned {docHandle}");
+                        if (docHandle < 0)
                         {
-                            Log("RenderAsync ABORT: empty PDF");
+                            Log("RenderAsync ABORT: failed to open document");
                             return null;
                         }
 
-                        double dpi = 50.0;
-
-                        Log($"RenderAsync: calling pdf_render_page_bgra(page=0, dpi={dpi})");
-                        var rc = pdf_render_page_bgra(
-                            docHandle, 0, dpi, null,
-                            out var w, out var h, out var stride,
-                            out var wPts, out var hPts, out var pixels);
-
-                        Log($"RenderAsync: pdf_render_page_bgra rc={rc}, {w}x{h} stride={stride}");
-
-                        if (rc < 0 || pixels == IntPtr.Zero)
-                        {
-                            Log("RenderAsync ABORT: render failed");
-                            return null;
-                        }
-
-                        byte[] buffer;
                         try
                         {
-                            var totalBytes = (long)stride * h;
-                            if (totalBytes > int.MaxValue)
-                                throw new InvalidOperationException($"Bitmap too large: {stride} * {h}");
-                            buffer = new byte[(int)totalBytes];
-                            Marshal.Copy(pixels, buffer, 0, buffer.Length);
-                            Log($"RenderAsync: copied {buffer.Length} bytes");
+                            var pageCount = pdf_document_page_count(docHandle);
+                            Log($"RenderAsync: pageCount={pageCount}");
+                            if (pageCount == 0)
+                            {
+                                Log("RenderAsync ABORT: empty PDF");
+                                return null;
+                            }
+
+                            double dpi = 50.0;
+
+                            Log($"RenderAsync: calling pdf_render_page_bgra(page=0, dpi={dpi})");
+                            var rc = pdf_render_page_bgra(
+                                docHandle, 0, dpi, null,
+                                out var w, out var h, out var stride,
+                                out var wPts, out var hPts, out var pixels);
+
+                            Log($"RenderAsync: pdf_render_page_bgra rc={rc}, {w}x{h} stride={stride}");
+
+                            if (rc < 0 || pixels == IntPtr.Zero)
+                            {
+                                Log("RenderAsync ABORT: render failed");
+                                return null;
+                            }
+
+                            byte[] buffer;
+                            try
+                            {
+                                var totalBytes = (long)stride * h;
+                                if (totalBytes > int.MaxValue)
+                                    throw new InvalidOperationException($"Bitmap too large: {stride} * {h}");
+                                buffer = new byte[(int)totalBytes];
+                                Marshal.Copy(pixels, buffer, 0, buffer.Length);
+                                Log($"RenderAsync: copied {buffer.Length} bytes");
+                            }
+                            finally
+                            {
+                                pdf_free_bitmap(pixels);
+                                Log("RenderAsync: bitmap freed");
+                            }
+
+                            return new ThumbnailRawResult
+                            {
+                                Pixels = buffer,
+                                Width = w,
+                                Height = h,
+                                Stride = stride,
+                            };
                         }
                         finally
                         {
-                            pdf_free_bitmap(pixels);
-                            Log("RenderAsync: bitmap freed");
+                            pdf_close_document(docHandle);
+                            Log("RenderAsync: document closed");
                         }
-
-                        return new ThumbnailRawResult
-                        {
-                            Pixels = buffer,
-                            Width = w,
-                            Height = h,
-                            Stride = stride,
-                        };
                     }
                     finally
                     {
-                        pdf_close_document(docHandle);
-                        Log("RenderAsync: document closed");
+                        dataHandle.Free();
+                        Log("RenderAsync: pinned data freed");
                     }
                 }
             }

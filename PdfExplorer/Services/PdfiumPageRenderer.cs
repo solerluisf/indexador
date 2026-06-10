@@ -17,6 +17,7 @@ public sealed class PdfiumPageRenderer : IDisposable
     private int _docHandle = -1;
     private int _pageCount;
     private readonly double _targetDpi;
+    private GCHandle? _pinnedPdfData;
 
     // ── C API imports ─────────────────────────────────────────────
 
@@ -66,6 +67,7 @@ public sealed class PdfiumPageRenderer : IDisposable
             if (_docHandle >= 0)
             {
                 Log($"OpenDocument: closing previous handle={_docHandle}");
+                UnpinPdfData();
                 lock (GlobalPdfiumLock)
                 {
                     pdf_close_document(_docHandle);
@@ -77,6 +79,10 @@ public sealed class PdfiumPageRenderer : IDisposable
             // Read file inside the lock to avoid TOCTOU race and redundant reads.
             var pdfBytes = System.IO.File.ReadAllBytes(pdfPath);
 
+            // Pin the byte array — FPDF_LoadMemDocument stores a pointer to the data
+            // internally and does NOT copy it. The GC must not move the array.
+            _pinnedPdfData = GCHandle.Alloc(pdfBytes, GCHandleType.Pinned);
+
             Log($"OpenDocument: '{pdfPath}' ({pdfBytes.Length} bytes)");
             int rc;
             lock (GlobalPdfiumLock)
@@ -86,7 +92,10 @@ public sealed class PdfiumPageRenderer : IDisposable
             Log($"  pdf_open_document_mem returned {rc}");
 
             if (rc < 0)
+            {
+                UnpinPdfData();
                 throw new InvalidOperationException($"Failed to open PDF: {pdfPath} (error {rc})");
+            }
 
             _docHandle = rc;
             int count;
@@ -119,6 +128,7 @@ public sealed class PdfiumPageRenderer : IDisposable
             if (_docHandle >= 0)
             {
                 Log($"OpenDocument: closing previous handle={_docHandle}");
+                UnpinPdfData();
                 lock (GlobalPdfiumLock)
                 {
                     pdf_close_document(_docHandle);
@@ -126,6 +136,11 @@ public sealed class PdfiumPageRenderer : IDisposable
                 _docHandle = -1;
                 _pageCount = 0;
             }
+
+            // Pin the byte array — FPDF_LoadMemDocument stores a pointer internally
+            // and does NOT copy the data. The GC must not move the array while
+            // the document is open.
+            _pinnedPdfData = GCHandle.Alloc(pdfData, GCHandleType.Pinned);
 
             Log($"OpenDocument: '{debugPath ?? "(bytes)"}' ({pdfData.Length} bytes)");
             int rc;
@@ -136,7 +151,10 @@ public sealed class PdfiumPageRenderer : IDisposable
             Log($"  pdf_open_document_mem returned {rc}");
 
             if (rc < 0)
+            {
+                UnpinPdfData();
                 throw new InvalidOperationException($"Failed to open PDF (error {rc})");
+            }
 
             _docHandle = rc;
             int count;
@@ -293,7 +311,10 @@ public sealed class PdfiumPageRenderer : IDisposable
         lock (_lock)
         {
             if (_docHandle < 0)
+            {
+                UnpinPdfData();
                 return;
+            }
 
             Log($"CloseDocument: handle={_docHandle}");
             lock (GlobalPdfiumLock)
@@ -302,12 +323,22 @@ public sealed class PdfiumPageRenderer : IDisposable
             }
             _docHandle = -1;
             _pageCount = 0;
+            UnpinPdfData();
         }
     }
 
     public void Dispose()
     {
         CloseDocument();
+    }
+
+    private void UnpinPdfData()
+    {
+        if (_pinnedPdfData.HasValue)
+        {
+            _pinnedPdfData.Value.Free();
+            _pinnedPdfData = null;
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────

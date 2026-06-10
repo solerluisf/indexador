@@ -186,16 +186,30 @@ public partial class SearchTab : Page
 
     private async void OnNextPage(object sender, RoutedEventArgs e)
     {
-        _currentPage++;
-        ClearViewer();
-        await RunSearch();
+        try
+        {
+            _currentPage++;
+            ClearViewer();
+            await RunSearch();
+        }
+        catch (Exception ex)
+        {
+            Log($"OnNextPage error: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     private async void OnPrevPage(object sender, RoutedEventArgs e)
     {
-        _currentPage--;
-        ClearViewer();
-        await RunSearch();
+        try
+        {
+            _currentPage--;
+            ClearViewer();
+            await RunSearch();
+        }
+        catch (Exception ex)
+        {
+            Log($"OnPrevPage error: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     // ── Document selection + filtered rendering ─────────────────────
@@ -421,6 +435,19 @@ public partial class SearchTab : Page
     {
         Log($"AddPageToStack: matchIndex={matchIndex}, page={item.PageNumber}, imgSize={item.ImagePixelWidth}x{item.ImagePixelHeight}");
 
+        // Validate state is still valid for this document view
+        if (matchIndex < 0 || matchIndex >= _state.PageElements.Count)
+        {
+            Log($"AddPageToStack: matchIndex={matchIndex} out of range (PageElements.Count={_state.PageElements.Count}) — stale state, discarding");
+            return;
+        }
+
+        if (_state.PageElements[matchIndex] is not null)
+        {
+            Log($"AddPageToStack: matchIndex={matchIndex} already rendered — skipping");
+            return;
+        }
+
         var image = new Image
         {
             Source = item.PageImage,
@@ -530,24 +557,32 @@ public partial class SearchTab : Page
 
     private async void OnPageScroll(object sender, ScrollChangedEventArgs e)
     {
-        if (_state.IsLoadingNextPage) return;
-
-        var nextIdx = _state.PageElements.FindIndex(b => b is null);
-        if (nextIdx < 0 || nextIdx >= _state.MatchingPages.Count) return;
-
-        // Load next page when close to the bottom of the rendered content
-        var remaining = PageScroller.ScrollableHeight - PageScroller.VerticalOffset;
-        if (remaining > 400) return;
-
-        _state.IsLoadingNextPage = true;
         try
         {
-            var item = await GetOrRenderPageAsync(_state.MatchingPages[nextIdx]);
-            AddPageToStack(nextIdx, item);
+            if (_state.IsLoadingNextPage) return;
+
+            var nextIdx = _state.PageElements.FindIndex(b => b is null);
+            if (nextIdx < 0 || nextIdx >= _state.MatchingPages.Count) return;
+
+            // Load next page when close to the bottom of the rendered content
+            var remaining = PageScroller.ScrollableHeight - PageScroller.VerticalOffset;
+            var threshold = Math.Max(200, PageScroller.ViewportHeight * 0.5);
+            if (remaining > threshold) return;
+
+            _state.IsLoadingNextPage = true;
+            try
+            {
+                var item = await GetOrRenderPageAsync(_state.MatchingPages[nextIdx]);
+                AddPageToStack(nextIdx, item);
+            }
+            finally
+            {
+                _state.IsLoadingNextPage = false;
+            }
         }
-        finally
+        catch (Exception ex)
         {
-            _state.IsLoadingNextPage = false;
+            Log($"OnPageScroll error: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
