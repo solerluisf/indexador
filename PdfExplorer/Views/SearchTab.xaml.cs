@@ -403,18 +403,22 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private async Task<PageRenderItem> RenderPageInternalAsync(int pageIdx, List<WordPosition> pagePositions)
     {
-        var cacheKey = (_state.PdfPath, pageIdx);
+        // Capture state identity at the start — ClearViewer may replace _state
+        // while this render is in flight, and we must not write into the new state.
+        var capturedState = _state;
+        var cacheKey = (capturedState.PdfPath, pageIdx);
 
         // Check global cache first (outside lock for fast path)
         lock (_renderCacheLock)
         {
             if (_globalPageCache.TryGetValue(cacheKey, out var cached))
             {
-                _state.PageCache[pageIdx] = cached;
+                if (ReferenceEquals(_state, capturedState))
+                    _state.PageCache[pageIdx] = cached;
                 return cached;
             }
 
-            if (_state.PageCache.TryGetValue(pageIdx, out var cachedLocal))
+            if (capturedState.PageCache.TryGetValue(pageIdx, out var cachedLocal))
                 return cachedLocal;
         }
 
@@ -439,7 +443,8 @@ public partial class SearchTab : Page, IPdfRenderingService
 
             lock (_renderCacheLock)
             {
-                _state.PageCache[pageIdx] = item;
+                if (ReferenceEquals(_state, capturedState))
+                    _state.PageCache[pageIdx] = item;
             }
             AddToGlobalCache(cacheKey, item);
             return item;
@@ -460,7 +465,8 @@ public partial class SearchTab : Page, IPdfRenderingService
             };
             lock (_renderCacheLock)
             {
-                _state.PageCache[pageIdx] = fallback;
+                if (ReferenceEquals(_state, capturedState))
+                    _state.PageCache[pageIdx] = fallback;
             }
             AddToGlobalCache(cacheKey, fallback);
             return fallback;
@@ -505,8 +511,9 @@ public partial class SearchTab : Page, IPdfRenderingService
         if (index < 0 || index >= _state.MatchingPages.Count) return;
         _state.CurrentMatchIndex = index;
 
-        if (index < _state.PageOffsets.Length)
-            PageScroller.ScrollToVerticalOffset(_state.PageOffsets[index]);
+        // With CanContentScroll=True, ScrolToVerticalOffset uses logical units (item indices).
+        // The VirtualizingStackPanel's IScrollInfo converts this to the correct pixel offset.
+        PageScroller.ScrollToVerticalOffset(index);
 
         UpdateMatchNav();
     }
@@ -580,8 +587,8 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         _state.CurrentMatchIndex = matchIdx;
 
-        if (matchIdx < _state.PageOffsets.Length)
-            PageScroller.ScrollToVerticalOffset(_state.PageOffsets[matchIdx]);
+        // With CanContentScroll=True, scroll in logical units (item index)
+        PageScroller.ScrollToVerticalOffset(matchIdx);
 
         UpdateMatchNav();
         UpdatePositionNav();

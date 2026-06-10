@@ -88,7 +88,8 @@
 
                 <!-- Scrollable page list (virtualized) -->
                 <ScrollViewer Grid.Row="1" x:Name="PageScroller" VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollBarVisibility="Auto">
+                              HorizontalScrollBarVisibility="Disabled"
+                              CanContentScroll="True">
                     <ItemsControl x:Name="PageList"
                                   VirtualizingStackPanel.IsVirtualizing="True"
                                   VirtualizingStackPanel.VirtualizationMode="Recycling">
