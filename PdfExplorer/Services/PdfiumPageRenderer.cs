@@ -20,6 +20,7 @@ public sealed class PdfiumPageRenderer : IDisposable
     private readonly double _targetDpi;
     private GCHandle? _pinnedPdfData;
     private readonly ConcurrentDictionary<int, byte[]> _highlightJsonCache = new();
+    private readonly ConcurrentDictionary<int, (double w, double h)> _pageDimsCache = new();
 
     public double TargetDpi => _targetDpi;
 
@@ -97,6 +98,7 @@ public sealed class PdfiumPageRenderer : IDisposable
                 _docHandle = -1;
                 _pageCount = 0;
                 _highlightJsonCache.Clear();
+                _pageDimsCache.Clear();
             }
 
             // Read file inside the lock to avoid TOCTOU race and redundant reads.
@@ -138,10 +140,18 @@ public sealed class PdfiumPageRenderer : IDisposable
 
     public (double WidthPts, double HeightPts) GetPageDimensions(int pageIndex)
     {
+        if (_pageDimsCache.TryGetValue(pageIndex, out var cached))
+            return cached;
+
         lock (_lock)
         {
             if (_docHandle < 0)
                 throw new InvalidOperationException("No document open. Call OpenDocument first.");
+
+            // Double-check cache after acquiring lock
+            if (_pageDimsCache.TryGetValue(pageIndex, out cached))
+                return cached;
+
             lock (GlobalPdfiumLock)
             {
                 int rc = pdf_get_page_dimensions(
@@ -149,6 +159,7 @@ public sealed class PdfiumPageRenderer : IDisposable
                 if (rc < 0)
                     throw new InvalidOperationException(
                         $"Failed to get page {pageIndex} dimensions (rc={rc})");
+                _pageDimsCache[pageIndex] = (w, h);
                 return (w, h);
             }
         }
@@ -177,6 +188,7 @@ public sealed class PdfiumPageRenderer : IDisposable
                 _docHandle = -1;
                 _pageCount = 0;
                 _highlightJsonCache.Clear();
+                _pageDimsCache.Clear();
             }
 
             // Pin the byte array — FPDF_LoadMemDocument stores a pointer internally
@@ -396,6 +408,7 @@ public sealed class PdfiumPageRenderer : IDisposable
         lock (_lock)
         {
             _highlightJsonCache.Clear();
+            _pageDimsCache.Clear();
 
             if (_docHandle < 0)
             {

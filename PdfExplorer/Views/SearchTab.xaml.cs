@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Runtime.InteropServices;
@@ -18,13 +19,14 @@ public partial class SearchTab : Page, IPdfRenderingService
     private readonly Dictionary<(string, int), PageRenderItem> _globalPageCache = new();
     private readonly Queue<(string, int)> _globalPageCacheOrder = new();
     private readonly object _globalCacheLock = new();
-    private const int MaxGlobalCacheEntries = 200;
+    private const int MaxGlobalCacheEntries = 50;
     private readonly object _renderCacheLock = new();
     private readonly ConcurrentDictionary<int, Task<PageRenderItem>> _pendingRenders = new();
     private readonly ThumbnailService _thumbService = new();
     private CancellationTokenSource? _thumbCts;
     private CancellationTokenSource? _selectionCts;
     private const int ThumbnailPreloadCount = 30;
+    private readonly SemaphoreSlim _searchLock = new(1, 1);
     private int _currentPage;
     private long _totalHits;
     private string _lastQuery = string.Empty;
@@ -54,6 +56,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private void OnCollectionFilterChanged(object sender, SelectionChangedEventArgs e)
     {
+        _currentPage = 0;
         if (CollectionFilter.SelectedItem is CollectionInfo coll)
         {
             _selectedCollId = (uint)coll.Id;
@@ -73,10 +76,26 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private async void OnSearchClick(object sender, RoutedEventArgs e)
     {
-        Log("OnSearchClick");
-        _currentPage = 0;
-        ClearViewer();
-        await RunSearch();
+        if (!await _searchLock.WaitAsync(0))
+        {
+            Log("OnSearchClick: skipped (search already in progress)");
+            return;
+        }
+        try
+        {
+            Log("OnSearchClick");
+            _currentPage = 0;
+            ClearViewer();
+            await RunSearch();
+        }
+        catch (Exception ex)
+        {
+            Log($"OnSearchClick error: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            _searchLock.Release();
+        }
     }
 
     private async Task RunSearch()
@@ -88,7 +107,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         try
         {
-            var results = _engine.Search(query, limit: 1000, offset: _currentPage * 1000, collId: _selectedCollId);
+            var results = await Task.Run(() => _engine.Search(query, limit: 1000, offset: _currentPage * 1000, collId: _selectedCollId));
             _totalHits = results.Total;
             Log($"RunSearch: totalHits={_totalHits}, results count={results.Results.Count}");
 
@@ -123,77 +142,65 @@ public partial class SearchTab : Page, IPdfRenderingService
     {
         Log($"PreloadThumbnailsAsync START: items={items.Count}, count={count}");
         var toLoad = items.Take(count).ToList();
-        Log($"PreloadThumbnailsAsync: will process {toLoad.Count} items");
 
+        // Collect raw thumbnail data from background threads first (no UI thread touch)
+        var rawResults = new List<(SearchResultViewModel vm, ThumbnailRawResult? raw)>(toLoad.Count);
         foreach (var vm in toLoad)
         {
-            if (ct.IsCancellationRequested)
-            {
-                Log("PreloadThumbnailsAsync: cancellation requested, breaking loop");
-                break;
-            }
+            if (ct.IsCancellationRequested) break;
 
-            Log($"PreloadThumbnailsAsync: processing item '{vm.FileName}'");
             try
             {
-                Log($"PreloadThumbnailsAsync: calling GetThumbnailAsync for '{vm.FileName}'");
                 var raw = await _thumbService.GetThumbnailAsync(vm.Path, ct);
-                Log($"PreloadThumbnailsAsync: GetThumbnailAsync returned {(raw is null ? "NULL" : $"{raw.Width}x{raw.Height}")} for '{vm.FileName}'");
-
-                if (raw is null || ct.IsCancellationRequested)
-                {
-                    Log($"PreloadThumbnailsAsync: no raw data for '{vm.FileName}'");
-                    continue;
-                }
-
-                // Create BitmapSource on UI thread — WPF media objects must be created on STA thread
-                Log($"PreloadThumbnailsAsync: dispatching bitmap creation for '{vm.FileName}'");
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    try
-                    {
-                        var bmp = BitmapSource.Create(
-                            raw.Width,
-                            raw.Height,
-                            96,
-                            96,
-                            PixelFormats.Bgra32,
-                            null,
-                            raw.Pixels,
-                            raw.Stride);
-                        bmp.Freeze();
-                        Log($"PreloadThumbnailsAsync: BitmapSource created ({bmp.PixelWidth}x{bmp.PixelHeight})");
-
-                        vm.Thumbnail = bmp;
-                        Log($"PreloadThumbnailsAsync: Thumbnail assigned for '{vm.FileName}'");
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        Log("PreloadThumbnailsAsync: cancelled");
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"PreloadThumbnailsAsync EXCEPTION creating bitmap for '{vm.FileName}': {ex.GetType().Name}: {ex.Message}");
-                    }
-                });
+                if (raw is not null && !ct.IsCancellationRequested)
+                    rawResults.Add((vm, raw));
             }
-            catch (OperationCanceledException)
-            {
-                Log($"PreloadThumbnailsAsync: OperationCanceledException for '{vm.FileName}', breaking");
-                break;
-            }
+            catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                Log($"PreloadThumbnailsAsync EXCEPTION for '{vm.FileName}': {ex.GetType().Name}: {ex.Message}");
-                Log($"PreloadThumbnailsAsync EXCEPTION stack: {ex.StackTrace}");
+                Log($"PreloadThumbnailsAsync error for '{vm.FileName}': {ex.Message}");
             }
         }
+
+        if (rawResults.Count == 0 || ct.IsCancellationRequested)
+        {
+            Log("PreloadThumbnailsAsync: no thumbnails to create");
+            return;
+        }
+
+        // Single batch dispatch to UI thread — all BitmapSource creations in one InvokeAsync
+        await Dispatcher.InvokeAsync(() =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (ResultsList.ItemsSource is not System.Collections.IList list)
+            {
+                Log("PreloadThumbnailsAsync: ItemsSource is gone");
+                return;
+            }
+
+            foreach (var (vm, raw) in rawResults)
+            {
+                if (!list.Contains(vm)) continue;
+
+                var bmp = BitmapSource.Create(
+                    raw.Width, raw.Height, 96, 96,
+                    PixelFormats.Bgra32, null, raw.Pixels, raw.Stride);
+                bmp.Freeze();
+                vm.Thumbnail = bmp;
+            }
+        });
 
         Log("PreloadThumbnailsAsync END");
     }
 
     private async void OnNextPage(object sender, RoutedEventArgs e)
     {
+        if (!await _searchLock.WaitAsync(0))
+        {
+            Log("OnNextPage: skipped (search already in progress)");
+            return;
+        }
         try
         {
             _currentPage++;
@@ -204,10 +211,19 @@ public partial class SearchTab : Page, IPdfRenderingService
         {
             Log($"OnNextPage error: {ex.GetType().Name}: {ex.Message}");
         }
+        finally
+        {
+            _searchLock.Release();
+        }
     }
 
     private async void OnPrevPage(object sender, RoutedEventArgs e)
     {
+        if (!await _searchLock.WaitAsync(0))
+        {
+            Log("OnPrevPage: skipped (search already in progress)");
+            return;
+        }
         try
         {
             _currentPage--;
@@ -217,6 +233,10 @@ public partial class SearchTab : Page, IPdfRenderingService
         catch (Exception ex)
         {
             Log($"OnPrevPage error: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            _searchLock.Release();
         }
     }
 
@@ -264,10 +284,7 @@ public partial class SearchTab : Page, IPdfRenderingService
             // Fetch term positions via PDFium text search (case-insensitive)
             try
             {
-                _state.Positions = _engine.SearchTextInPdf(
-                    pdfBytes,
-                    _lastQuery
-                );
+                    _state.Positions = await Task.Run(() => _engine.SearchTextInPdf(pdfBytes, _lastQuery));
                 var t1 = DateTime.UtcNow;
                 Log($"SearchTextInPdf returned {_state.Positions.Count} positions (took {(t1 - t0).TotalMilliseconds:F0}ms)");
             }
@@ -440,59 +457,67 @@ public partial class SearchTab : Page, IPdfRenderingService
             int pixH = (int)(hPts * _renderer.TargetDpi / 72.0);
             int stride = pixW * 4;
 
-            // Allocate and pin the buffer — Rust will render directly into it
-            var buffer = new byte[stride * pixH];
-            var pin = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+            // Rent buffer from pool and pin it — Rust will render directly into it
+            int bufferSize = stride * pixH;
+            var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
             try
             {
-                IntPtr ptr = pin.AddrOfPinnedObject();
-
-                // Native render on background thread (zero-copy: writes into buffer)
-                await Task.Run(() =>
+                var pin = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+                try
                 {
-                    _renderer.RenderToBuffer(pageIdx, pagePositions,
-                        ptr, pixW, pixH, stride,
-                        out var _, out var _);
-                }, ct);
+                    IntPtr ptr = pin.AddrOfPinnedObject();
 
-                ct.ThrowIfCancellationRequested();
+                    // Native render on background thread (zero-copy: writes into buffer)
+                    await Task.Run(() =>
+                    {
+                        _renderer.RenderToBuffer(pageIdx, pagePositions,
+                            ptr, pixW, pixH, stride,
+                            out var _, out var _);
+                    }, ct);
 
-                // Create the frozen WPF bitmap on the UI thread
-                var item = await Dispatcher.InvokeAsync(() =>
-                {
                     ct.ThrowIfCancellationRequested();
 
-                    var bitmap = BitmapSource.Create(
-                        pixW, pixH, 96, 96,
-                        PixelFormats.Bgra32, null,
-                        buffer, stride);
-                    bitmap.Freeze();
-
-                    return new PageRenderItem
+                    // Create the frozen WPF bitmap on the UI thread
+                    var item = await Dispatcher.InvokeAsync(() =>
                     {
-                        PageNumber = pageIdx + 1,
-                        PageImage = bitmap,
-                        ImagePixelWidth = pixW,
-                        ImagePixelHeight = pixH,
-                        PdfPageWidth = wPts,
-                        PdfPageHeight = hPts,
-                        Positions = pagePositions,
-                    };
-                });
+                        ct.ThrowIfCancellationRequested();
 
-                Log($"  rendered: {pixW}x{pixH}");
+                        var bitmap = BitmapSource.Create(
+                            pixW, pixH, 96, 96,
+                            PixelFormats.Bgra32, null,
+                            buffer, stride);
+                        bitmap.Freeze();
 
-                lock (_renderCacheLock)
-                {
-                    if (ReferenceEquals(_state, capturedState))
-                        _state.PageCache[pageIdx] = item;
+                        return new PageRenderItem
+                        {
+                            PageNumber = pageIdx + 1,
+                            PageImage = bitmap,
+                            ImagePixelWidth = pixW,
+                            ImagePixelHeight = pixH,
+                            PdfPageWidth = wPts,
+                            PdfPageHeight = hPts,
+                            Positions = pagePositions,
+                        };
+                    });
+
+                    Log($"  rendered: {pixW}x{pixH}");
+
+                    lock (_renderCacheLock)
+                    {
+                        if (ReferenceEquals(_state, capturedState))
+                            _state.PageCache[pageIdx] = item;
+                    }
+                    AddToGlobalCache(cacheKey, item);
+                    return item;
                 }
-                AddToGlobalCache(cacheKey, item);
-                return item;
+                finally
+                {
+                    pin.Free();
+                }
             }
             finally
             {
-                pin.Free();
+                ArrayPool<byte>.Shared.Return(buffer);
             }
         }
         catch (OperationCanceledException)
@@ -717,7 +742,8 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private void ClearViewer()
     {
-        // Cancel any in-flight renders for the previous document
+        // Cancel any in-flight renders and thumbnail preloads
+        _thumbCts?.Cancel();
         _selectionCts?.Cancel();
         _selectionCts = null;
 

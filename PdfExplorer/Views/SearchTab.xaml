@@ -25,6 +25,8 @@
                 </Grid.RowDefinitions>
                 <TextBlock Grid.Row="0" Text="Results" FontWeight="Bold" Margin="0,0,0,5"/>
                 <ListBox Grid.Row="1" x:Name="ResultsList"
+                         VirtualizingStackPanel.IsVirtualizing="True"
+                         VirtualizingStackPanel.VirtualizationMode="Recycling"
                          SelectionChanged="OnResultSelected">
                     <ListBox.ItemTemplate>
                         <DataTemplate>
