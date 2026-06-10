@@ -1,4 +1,4 @@
-using System.Windows.Controls;
+using System.Collections.ObjectModel;
 
 namespace PdfExplorer.Models;
 
@@ -16,7 +16,9 @@ internal sealed class PdfViewState
     public Dictionary<int, PageRenderItem> PageCache { get; set; } = new();
     public int CurrentMatchIndex { get; set; }
     public int TotalMatchPages { get; set; }
-    public List<Border?> PageElements { get; set; } = new();
     public int CurrentPositionIndex { get; set; } = -1;
-    public bool IsLoadingNextPage { get; set; }
+
+    // Virtualized page view models
+    public ObservableCollection<PdfPageViewModel>? PageViewModels { get; set; }
+    public double[] PageOffsets { get; set; } = Array.Empty<double>();
 }

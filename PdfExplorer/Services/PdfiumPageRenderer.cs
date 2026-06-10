@@ -19,6 +19,8 @@ public sealed class PdfiumPageRenderer : IDisposable
     private readonly double _targetDpi;
     private GCHandle? _pinnedPdfData;
 
+    public double TargetDpi => _targetDpi;
+
     // ── C API imports ─────────────────────────────────────────────
 
     [DllImport("pdf_extractor_capi.dll", CallingConvention = CallingConvention.Cdecl)]
@@ -48,6 +50,11 @@ public sealed class PdfiumPageRenderer : IDisposable
 
     [DllImport("pdf_extractor_capi.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_close_document(int handle);
+
+    [DllImport("pdf_extractor_capi.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_get_page_dimensions(
+        int handle, int pageIndex,
+        out double outWidthPts, out double outHeightPts);
 
     // ── Constructor ───────────────────────────────────────────────
 
@@ -111,6 +118,24 @@ public sealed class PdfiumPageRenderer : IDisposable
     public int GetPageCount()
     {
         lock (_lock) { return _pageCount; }
+    }
+
+    public (double WidthPts, double HeightPts) GetPageDimensions(int pageIndex)
+    {
+        lock (_lock)
+        {
+            if (_docHandle < 0)
+                throw new InvalidOperationException("No document open. Call OpenDocument first.");
+            lock (GlobalPdfiumLock)
+            {
+                int rc = pdf_get_page_dimensions(
+                    _docHandle, pageIndex, out double w, out double h);
+                if (rc < 0)
+                    throw new InvalidOperationException(
+                        $"Failed to get page {pageIndex} dimensions (rc={rc})");
+                return (w, h);
+            }
+        }
     }
 
     [Obsolete("Use GetPageCount() instead")]

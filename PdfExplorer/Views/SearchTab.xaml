@@ -1,6 +1,7 @@
 <Page x:Class="PdfExplorer.Views.SearchTab"
       xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:local="clr-namespace:PdfExplorer.Views"
       Title="Search"
       Background="{DynamicResource PageBackground}" Foreground="{DynamicResource PageForeground}">
     <Grid Margin="10">
@@ -85,10 +86,23 @@
                     </StackPanel>
                 </Border>
 
-                <!-- Scrollable page list -->
+                <!-- Scrollable page list (virtualized) -->
                 <ScrollViewer Grid.Row="1" x:Name="PageScroller" VerticalScrollBarVisibility="Auto"
                               HorizontalScrollBarVisibility="Auto">
-                    <StackPanel x:Name="PageStack" Margin="0,0,10,0"/>
+                    <ItemsControl x:Name="PageList"
+                                  VirtualizingStackPanel.IsVirtualizing="True"
+                                  VirtualizingStackPanel.VirtualizationMode="Recycling">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <VirtualizingStackPanel />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <local:PdfPageView />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
                 </ScrollViewer>
 
                 <!-- Extracted words field -->

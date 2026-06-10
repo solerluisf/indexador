@@ -9,7 +9,7 @@ using PdfExplorer.ViewModels;
 
 namespace PdfExplorer.Views;
 
-public partial class SearchTab : Page
+public partial class SearchTab : Page, IPdfRenderingService
 {
     private readonly PdfEngine _engine;
     private readonly PdfiumPageRenderer _renderer = new(150);
@@ -348,23 +348,14 @@ public partial class SearchTab : Page
 
             _state.TotalMatchPages = _state.MatchingPages.Count;
 
-            // Render only the first match page; remaining pages load on scroll
+            // Build virtualized page view models with pre-calculated heights
             _state.CurrentMatchIndex = 0;
             _state.CurrentPositionIndex = -1;
-            _state.PageElements = new List<Border?>(_state.MatchingPages.Count);
-            for (int i = 0; i < _state.MatchingPages.Count; i++)
-                _state.PageElements.Add(null);
 
-            var firstItem = await GetOrRenderPageAsync(_state.MatchingPages[0]);
-            var t3 = DateTime.UtcNow;
-            Log($"First page rendered (took {(t3 - tPdf).TotalMilliseconds:F0}ms)");
-            AddPageToStack(0, firstItem);
+            BuildPageViewModels();
             UpdateMatchNav();
             UpdatePositionNav();
             ScrollToMatch(0);
-
-            PageScroller.ScrollChanged += OnPageScroll;
-            _state.IsLoadingNextPage = false;
 
             var tEnd = DateTime.UtcNow;
             Log($"OnResultSelected complete (total {(tEnd - t0).TotalMilliseconds:F0}ms)");
@@ -376,9 +367,9 @@ public partial class SearchTab : Page
         }
     }
 
-    // ── Lazy rendering ───────────────────────────────────────────────
+    // ── Lazy rendering (IPdfRenderingService) ───────────────────────
 
-    private async Task<PageRenderItem> GetOrRenderPageAsync(int pageIdx)
+    async Task<PageRenderItem> IPdfRenderingService.GetOrRenderPageAsync(int pageIdx, List<WordPosition> pagePositions)
     {
         var cacheKey = (_state.PdfPath, pageIdx);
 
@@ -398,7 +389,6 @@ public partial class SearchTab : Page
         Log($"Rendering page {pageIdx + 1} (0-based={pageIdx})");
         StatusLabel.Text = $"Rendering page {pageIdx + 1}...";
 
-        var pagePositions = _state.PositionsByPage.GetValueOrDefault(pageIdx, new List<WordPosition>());
         try
         {
             var raw = _renderer.RenderPageRaw(pageIdx, pagePositions);
@@ -431,60 +421,6 @@ public partial class SearchTab : Page
         }
     }
 
-    private void AddPageToStack(int matchIndex, PageRenderItem item)
-    {
-        Log($"AddPageToStack: matchIndex={matchIndex}, page={item.PageNumber}, imgSize={item.ImagePixelWidth}x{item.ImagePixelHeight}");
-
-        // Validate state is still valid for this document view
-        if (matchIndex < 0 || matchIndex >= _state.PageElements.Count)
-        {
-            Log($"AddPageToStack: matchIndex={matchIndex} out of range (PageElements.Count={_state.PageElements.Count}) — stale state, discarding");
-            return;
-        }
-
-        if (_state.PageElements[matchIndex] is not null)
-        {
-            Log($"AddPageToStack: matchIndex={matchIndex} already rendered — skipping");
-            return;
-        }
-
-        var image = new Image
-        {
-            Source = item.PageImage,
-            Stretch = Stretch.Uniform,
-            HorizontalAlignment = HorizontalAlignment.Left,
-        };
-
-        if (item.PageImage is null && item.ImagePixelWidth > 0)
-            image.Source = null;
-
-        var border = new Border
-        {
-            BorderBrush = Brushes.Silver,
-            BorderThickness = new Thickness(1),
-            Margin = new Thickness(0, 0, 0, 10),
-            Padding = new Thickness(5),
-        };
-
-        var header = new TextBlock
-        {
-            Text = item.PageImage is null
-                ? $"{item.PageHeader} — render failed"
-                : item.PageHeader,
-            FontWeight = FontWeights.SemiBold,
-            Margin = new Thickness(0, 0, 0, 4),
-        };
-
-        var stack = new StackPanel();
-        stack.Children.Add(header);
-        stack.Children.Add(image);
-        border.Child = stack;
-        PageStack.Children.Add(border);
-        _state.PageElements[matchIndex] = border;
-
-        Log($"AddPageToStack: matchIndex={matchIndex}, page={item.PageNumber}");
-    }
-
     // ── Match navigation ────────────────────────────────────────────
 
     private async void OnPrevMatch(object sender, RoutedEventArgs e)
@@ -494,12 +430,6 @@ public partial class SearchTab : Page
             if (_state.CurrentMatchIndex <= 0) return;
             var prevIdx = _state.CurrentMatchIndex - 1;
             _state.CurrentMatchIndex = prevIdx;
-
-            if (_state.PageElements[prevIdx] is null)
-            {
-                var item = await GetOrRenderPageAsync(_state.MatchingPages[prevIdx]);
-                AddPageToStack(prevIdx, item);
-            }
             ScrollToMatch(prevIdx);
         }
         catch (Exception ex)
@@ -515,12 +445,6 @@ public partial class SearchTab : Page
             if (_state.CurrentMatchIndex >= _state.TotalMatchPages - 1) return;
             var nextIdx = _state.CurrentMatchIndex + 1;
             _state.CurrentMatchIndex = nextIdx;
-
-            if (_state.PageElements[nextIdx] is null)
-            {
-                var item = await GetOrRenderPageAsync(_state.MatchingPages[nextIdx]);
-                AddPageToStack(nextIdx, item);
-            }
             ScrollToMatch(nextIdx);
         }
         catch (Exception ex)
@@ -533,15 +457,10 @@ public partial class SearchTab : Page
     {
         Log($"ScrollToMatch({index})");
         if (index < 0 || index >= _state.MatchingPages.Count) return;
-        if (index >= _state.PageElements.Count)
-        {
-            Log($"ScrollToMatch: index={index} >= _state.PageElements.Count={_state.PageElements.Count}");
-            return;
-        }
         _state.CurrentMatchIndex = index;
 
-        var element = _state.PageElements[index];
-        element?.BringIntoView();
+        if (index < _state.PageOffsets.Length)
+            PageScroller.ScrollToVerticalOffset(_state.PageOffsets[index]);
 
         UpdateMatchNav();
     }
@@ -553,37 +472,6 @@ public partial class SearchTab : Page
             : "0 matches";
         PrevMatch.IsEnabled = _state.CurrentMatchIndex > 0;
         NextMatch.IsEnabled = _state.CurrentMatchIndex < _state.TotalMatchPages - 1;
-    }
-
-    private async void OnPageScroll(object sender, ScrollChangedEventArgs e)
-    {
-        try
-        {
-            if (_state.IsLoadingNextPage) return;
-
-            var nextIdx = _state.PageElements.FindIndex(b => b is null);
-            if (nextIdx < 0 || nextIdx >= _state.MatchingPages.Count) return;
-
-            // Load next page when close to the bottom of the rendered content
-            var remaining = PageScroller.ScrollableHeight - PageScroller.VerticalOffset;
-            var threshold = Math.Max(200, PageScroller.ViewportHeight * 0.5);
-            if (remaining > threshold) return;
-
-            _state.IsLoadingNextPage = true;
-            try
-            {
-                var item = await GetOrRenderPageAsync(_state.MatchingPages[nextIdx]);
-                AddPageToStack(nextIdx, item);
-            }
-            finally
-            {
-                _state.IsLoadingNextPage = false;
-            }
-        }
-        catch (Exception ex)
-        {
-            Log($"OnPageScroll error: {ex.GetType().Name}: {ex.Message}");
-        }
     }
 
     // ── Position (individual match) navigation ─────────────────────
@@ -638,24 +526,66 @@ public partial class SearchTab : Page
         var pageIdx = pos.Page - 1;
 
         var matchIdx = _state.MatchingPages.IndexOf(pageIdx);
-        if (matchIdx < 0 || matchIdx >= _state.PageElements.Count)
+        if (matchIdx < 0 || matchIdx >= _state.PageViewModels?.Count)
         {
-            Log($"NavigateToPosition: matchIdx={matchIdx} out of range (pages={_state.PageElements.Count})");
+            Log($"NavigateToPosition: matchIdx={matchIdx} out of range (pages={_state.PageViewModels?.Count})");
             return;
         }
 
-        // Ensure the page is loaded
-        if (_state.PageElements[matchIdx] is null)
+        _state.CurrentMatchIndex = matchIdx;
+
+        if (matchIdx < _state.PageOffsets.Length)
+            PageScroller.ScrollToVerticalOffset(_state.PageOffsets[matchIdx]);
+
+        UpdateMatchNav();
+        UpdatePositionNav();
+    }
+
+    // ── Build virtualized page models ─────────────────────────────
+
+    private void BuildPageViewModels()
+    {
+        double scale = _renderer.TargetDpi / 72.0;
+        double viewportWidth = Math.Max(200, PageScroller.ViewportWidth - 20);
+        var list = new List<PdfPageViewModel>(_state.MatchingPages.Count);
+        var offsets = new double[_state.MatchingPages.Count];
+        double acc = 0;
+
+        for (int i = 0; i < _state.MatchingPages.Count; i++)
         {
-            var item = await GetOrRenderPageAsync(pageIdx);
-            AddPageToStack(matchIdx, item);
+            int pageIdx = _state.MatchingPages[i];
+            offsets[i] = acc;
+
+            double totalH = 1100; // fallback
+
+            try
+            {
+                var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
+                double renderedW = wPts * scale;
+                double renderedH = hPts * scale;
+                double imageH = renderedW > 0 ? renderedH * (viewportWidth / renderedW) : 0;
+                totalH = 10 + 24 + 4 + imageH + 10 + 10; // padding + header + img + margin
+            }
+            catch (Exception ex)
+            {
+                Log($"BuildPageViewModels: failed to get dimensions for page {pageIdx}: {ex.Message}");
+            }
+
+            _state.PositionsByPage.TryGetValue(pageIdx, out var pos);
+            list.Add(new PdfPageViewModel
+            {
+                PageIndex = pageIdx,
+                MatchIndex = i,
+                DisplayHeight = totalH,
+                Positions = pos ?? new List<WordPosition>(),
+            });
+
+            acc += totalH;
         }
 
-        _state.CurrentMatchIndex = matchIdx;
-        _state.PageElements[matchIdx]?.BringIntoView();
-        UpdateMatchNav();
-
-        UpdatePositionNav();
+        _state.PageViewModels = new ObservableCollection<PdfPageViewModel>(list);
+        _state.PageOffsets = offsets;
+        PageList.ItemsSource = _state.PageViewModels;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────
@@ -679,8 +609,7 @@ public partial class SearchTab : Page
 
     private void ClearViewer()
     {
-        PageScroller.ScrollChanged -= OnPageScroll;
-        PageStack.Children.Clear();
+        PageList.ItemsSource = null;
         _state = new PdfViewState();
         _state.CurrentPositionIndex = -1;
 
