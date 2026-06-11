@@ -403,7 +403,7 @@ fn indexer_thread(
     let mut done_ids: Vec<(i64, bool, String)> = Vec::new();
     let mut doc_count: u64 = 0;
     let mut last_commit = Instant::now();
-    let writer = std::sync::Mutex::new(index_writer);
+    let mut writer = index_writer;
 
     loop {
         let timeout = Duration::from_secs(commit_timeout);
@@ -413,7 +413,7 @@ fn indexer_thread(
                 buf.push(record);
                 if buf.len() >= batch_size {
                     let batch: Vec<DocumentRecord> = buf.drain(..).collect();
-                    flush_batch(&writer, indexer, &mut done_ids, &batch, log_cb);
+                    flush_batch(&mut writer, indexer, &mut done_ids, &batch, log_cb);
                     doc_count += batch.len() as u64;
                 }
             }
@@ -421,7 +421,7 @@ fn indexer_thread(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 if !buf.is_empty() {
                     let batch: Vec<DocumentRecord> = buf.drain(..).collect();
-                    flush_batch(&writer, indexer, &mut done_ids, &batch, log_cb);
+                    flush_batch(&mut writer, indexer, &mut done_ids, &batch, log_cb);
                 }
                 break;
             }
@@ -436,11 +436,7 @@ fn indexer_thread(
             // same id, so re-processing after a crash is idempotent.
             // This way a crash between w.commit() and batch_mark_done() only
             // causes harmless re-indexing — never permanent search loss.
-            let commit_ok = if let Ok(mut w) = writer.lock() {
-                w.commit().is_ok()
-            } else {
-                false
-            };
+            let commit_ok = writer.commit().is_ok();
 
             if commit_ok {
                 let _ = jobs.batch_mark_done(&done_ids);
@@ -465,68 +461,55 @@ fn indexer_thread(
     }
 
     // Final commit: Tantivy first, then mark done in SQLite.
-    if let Ok(mut w) = writer.lock() {
-        if w.commit().is_ok() {
-            if !done_ids.is_empty() {
-                jobs.batch_mark_done(&done_ids).ok();
-                done_ids.clear();
-            }
-            let total = indexer.metrics().docs_indexed();
-            metrics.set_indexer_docs_indexed(total);
-            metrics.set_indexer_last_commit_age(0);
-        } else {
-            log_msg(log_cb, "[indexer_thread] final commit failed — some indexed documents may not be searchable");
+    if writer.commit().is_ok() {
+        if !done_ids.is_empty() {
+            jobs.batch_mark_done(&done_ids).ok();
+            done_ids.clear();
         }
+        let total = indexer.metrics().docs_indexed();
+        metrics.set_indexer_docs_indexed(total);
+        metrics.set_indexer_last_commit_age(0);
     } else {
-        log_msg(log_cb, "[indexer_thread] final commit skipped — writer mutex poisoned");
-    };
+        log_msg(log_cb, "[indexer_thread] final commit failed — some indexed documents may not be searchable");
+    }
 }
 
 fn flush_batch(
-    writer: &std::sync::Mutex<tantivy::IndexWriter>,
+    writer: &mut tantivy::IndexWriter,
     indexer: &Indexer,
     done_ids: &mut Vec<(i64, bool, String)>,
     batch: &[DocumentRecord],
     log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) {
-    // Phase 1: add documents to Tantivy under the writer lock (fast, in-memory).
-    // Collect records that need position storage for phase 2 outside the lock.
+    // Phase 1: add documents to Tantivy (fast, in-memory).
+    // Collect records that need position storage for phase 2.
     let mut positions_to_store: Vec<(i64, Vec<(usize, crate::extractor::WordPosition)>)> = Vec::new();
-    {
-        let mut w = match writer.lock() {
-            Ok(w) => w,
-            Err(_) => {
-                log_msg(log_cb, "[flush_batch] writer mutex poisoned — skipping batch");
-                return;
-            }
-        };
-        for record in batch {
-            if let Err(e) = indexer.search_index().add_document(
-                &mut w,
-                record.id,
-                &record.path,
-                &record.text,
-                None,
-            ) {
-                log_msg(log_cb, &format!(
-                    "[flush_batch] add_document failed for id={} path='{}': {}",
-                    record.id, record.path, e
-                ));
-            } else {
-                indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                done_ids.push((record.id, record.ocr_flag, record.checksum.clone()));
+    for record in batch {
+        if let Err(e) = indexer.search_index().add_document(
+            writer,
+            record.id,
+            &record.path,
+            &record.text,
+            None,
+        ) {
+            log_msg(log_cb, &format!(
+                "[flush_batch] add_document failed for id={} path='{}': {}",
+                record.id, record.path, e
+            ));
+        } else {
+            indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            done_ids.push((record.id, record.ocr_flag, record.checksum.clone()));
 
-                if !record.word_positions.is_empty() {
-                    let aligned = align_offsets_to_tantivy(&record.text, &record.word_positions);
-                    if !aligned.is_empty() {
-                        positions_to_store.push((record.id, aligned));
-                    }
+            if !record.word_positions.is_empty() {
+                let aligned = align_offsets_to_tantivy(&record.text, &record.word_positions);
+                if !aligned.is_empty() {
+                    positions_to_store.push((record.id, aligned));
                 }
             }
         }
-    } // writer lock released here
+    }
 
-    // Phase 2: store word positions outside the writer lock (SQLite I/O).
+    // Phase 2: store word positions (SQLite I/O).
     if !positions_to_store.is_empty() {
         if let Ok(pos_store) = indexer.position_store.lock() {
             for (id, aligned) in &positions_to_store {

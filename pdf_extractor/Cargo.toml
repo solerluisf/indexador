@@ -26,7 +26,6 @@ tempfile = "3"
 regex = "1.12.3"
 imageproc = "0.25"
 whatlang = "0.18.0"
-lindera = { version = "3", default-features = false, features = ["embed-ipadic"] }
 tracing = "0.1"
 windows = { version = "0.58", optional = true, features = [
     "Win32_Foundation",

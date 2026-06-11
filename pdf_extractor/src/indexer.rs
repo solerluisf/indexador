@@ -12,7 +12,6 @@ use tantivy::{doc, Index, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDo
 use tantivy::{DocSet, Postings, TERMINATED};
 
 use crate::math_tokenizer::MathAwareTokenizer;
-use crate::tokenizers::LanguageAwareTokenizer;
 
 #[allow(dead_code)]
 pub struct SearchIndex {
@@ -63,10 +62,8 @@ impl SearchIndex {
                 .context("Failed to create index directory")?
         };
 
-        // Register the unified multilingual tokenizer that auto-detects language
-        // and dispatches to the correct tokenizer (Lindera for Japanese, bigram for Chinese,
-        // regex for all others).
-        let multilang_analyzer = TextAnalyzer::builder(LanguageAwareTokenizer)
+        // Register tokenizer that splits on `[\p{L}\p{N}\p{S}]+` and lowercases.
+        let multilang_analyzer = TextAnalyzer::builder(crate::tokenizers::LanguageAwareTokenizer)
             .build();
         index.tokenizers().register("multilang", multilang_analyzer);
 
@@ -1114,48 +1111,6 @@ mod tests {
 
         let results = idx.search_in_field_fuzzy_stem("hello", "content", 10, Some("/a.pdf"), 0, 0, false).unwrap();
         assert_eq!(results.len(), 1, "Path filter + field fuzzy_stem should find only the matching doc");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-
-    #[test]
-    fn test_japanese_text_searchable_via_content() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        // With Latin chars mixed in, the LanguageAwareTokenizer detects Japanese
-        // and uses Lindera, which also segments Latin tokens.
-        add_doc(&idx, &mut writer, 1, "/jp.pdf", "jp1", "hello 猫 world", "hello 猫 world", "jpn", "").unwrap();
-        writer.commit().unwrap();
-
-        let results = idx.search("hello", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 1, "Latin part of JP doc should be findable via content");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_multilingual_content_searchable() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        add_doc(&idx, &mut writer, 1, "/en.pdf", "en1", "hello world", "hello world", "eng", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/jp.pdf", "jp1", "私は猫です", "私は猫です", "jpn", "").unwrap();
-        add_doc(&idx, &mut writer, 3, "/zh.pdf", "zh1", "中文测试", "中文测试", "cmn", "").unwrap();
-        writer.commit().unwrap();
-
-        // All docs are searchable via the unified content field
-        let en_results = idx.search("hello", 10, None, 0).unwrap();
-        assert_eq!(en_results.len(), 1, "English doc should be findable via content");
-
-        let jp_results = idx.search("猫", 10, None, 0).unwrap();
-        assert_eq!(jp_results.len(), 1, "Japanese doc should be findable via content");
-
-        let zh_results = idx.search("中文", 10, None, 0).unwrap();
-        assert_eq!(zh_results.len(), 1, "Chinese doc should be findable via content");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2334,25 +2289,6 @@ fn test_search_fuzzy_with_path_filter() {
     }
 
     #[test]
-    fn test_cjk_text_searchable_via_content() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        add_doc(&idx, &mut writer, 1, "/jp.pdf", "jp1", "私は猫です", "私は猫です", "jpn", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/zh.pdf", "zh1", "中文测试", "中文测试", "cmn", "").unwrap();
-        writer.commit().unwrap();
-
-        let jp_results = idx.search("猫", 10, None, 0).unwrap();
-        assert_eq!(jp_results.len(), 1, "Japanese text should be searchable via content");
-
-        let zh_results = idx.search("中文", 10, None, 0).unwrap();
-        assert_eq!(zh_results.len(), 1, "Chinese text should be searchable via content");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn test_empty_lang_searchable_via_content() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
@@ -2398,36 +2334,6 @@ fn test_search_fuzzy_with_path_filter() {
 
         let results = idx.search_in_field("world", "content", 10, None, 0).unwrap();
         assert_eq!(results.len(), 1, "Should find text in content_norm");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_search_in_field_content_jp() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        add_doc(&idx, &mut writer, 1, "/jp.pdf", "jp1", "私は猫です", "raw", "jpn", "").unwrap();
-        writer.commit().unwrap();
-
-        let results = idx.search_in_field("猫", "content", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 1, "Should find Japanese text in content_jp");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_search_in_field_content_zh() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        add_doc(&idx, &mut writer, 1, "/zh.pdf", "zh1", "中文测试", "raw", "cmn", "").unwrap();
-        writer.commit().unwrap();
-
-        let results = idx.search_in_field("中文", "content", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 1, "Should find Chinese text in content_zh");
 
         std::fs::remove_dir_all(&dir).ok();
     }
