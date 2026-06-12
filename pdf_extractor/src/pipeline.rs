@@ -275,7 +275,7 @@ pub fn run_pipeline(
     let is_cancelled = move || cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed));
 
     // Throttle progress callback to at most once per 500 docs to reduce FFI overhead.
-    let progress_throttle = 500u64;
+    let progress_throttle = 50u64;
 
     let writer_start = Instant::now();
     let mut writer_jsonl_time = Duration::ZERO;
@@ -504,14 +504,17 @@ fn flush_batch(
     batch: &[DocumentRecord],
     log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) {
+    use rayon::prelude::*;
+
     let batch_size = batch.len();
     let phase1_start = Instant::now();
     let mut add_time = Duration::ZERO;
     let mut align_time = Duration::ZERO;
 
-    // Phase 1: add documents to Tantivy (fast, in-memory).
-    // Collect records that need position storage for phase 2.
-    let mut positions_to_store: Vec<(i64, Vec<(usize, crate::extractor::WordPosition)>)> = Vec::new();
+    // Phase 1a: add documents to Tantivy (sequential, touches IndexWriter).
+    // Collect IDs of successful docs and work items for parallel alignment.
+    let mut pending_done: Vec<(i64, bool, String)> = Vec::new();
+    let mut pending_align: Vec<(i64, &str, &[crate::extractor::WordPosition])> = Vec::new();
     for record in batch {
         let add_start = Instant::now();
         if let Err(e) = indexer.search_index().add_document(
@@ -529,20 +532,25 @@ fn flush_batch(
         } else {
             add_time += add_start.elapsed();
             indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            done_ids.push((record.id, record.ocr_flag, record.checksum.clone()));
+            pending_done.push((record.id, record.ocr_flag, record.checksum.clone()));
 
             if !record.word_positions.is_empty() {
-                let align_start = Instant::now();
-                let aligned = align_offsets_to_tantivy(&record.text, &record.word_positions);
-                align_time += align_start.elapsed();
-                if !aligned.is_empty() {
-                    positions_to_store.push((record.id, aligned));
-                }
+                pending_align.push((record.id, &record.text, &record.word_positions));
             }
         }
     }
 
-    let phase1_elapsed = phase1_start.elapsed();
+    // Phase 1b: align offsets in parallel (each doc is independent).
+    let align_start = Instant::now();
+    let positions_to_store: Vec<(i64, Vec<(usize, crate::extractor::WordPosition)>)> = pending_align
+        .par_iter()
+        .filter_map(|&(id, text, wps)| {
+            let aligned = align_offsets_to_tantivy(text, wps);
+            if aligned.is_empty() { None } else { Some((id, aligned)) }
+        })
+        .collect();
+    done_ids.extend(pending_done);
+    align_time += align_start.elapsed();
 
     let phase2_start = Instant::now();
 
