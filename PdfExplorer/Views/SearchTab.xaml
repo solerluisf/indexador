@@ -141,7 +141,8 @@
                       SelectionChanged="OnCollectionFilterChanged" />
 
             <Label Grid.Column="2" Content="Search:" VerticalAlignment="Center" Margin="10,0,0,0"/>
-            <TextBox Grid.Column="3" x:Name="SearchBox" Height="28" IsEnabled="False"/>
+            <TextBox Grid.Column="3" x:Name="SearchBox" Height="28" IsEnabled="False"
+                     KeyDown="OnSearchBoxKeyDown"/>
             <Button Grid.Column="4" x:Name="SearchButton" Content="Search" Height="28" Margin="5,0,0,0"
                     Click="OnSearchClick" IsEnabled="False"/>
 

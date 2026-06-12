@@ -796,39 +796,18 @@ unsafe fn search_text_in_pdf_impl(
 
     // Collect all matching word positions (page, bbox, matched text)
     let mut matches: Vec<(u32, f32, f32, f32, f32, String)> = Vec::new();
-    let mut page_debug: HashMap<u32, serde_json::Value> = HashMap::new();
-
     for page_idx in 0..page_count {
         let pdf_page = unsafe { (pdfium.FPDF_LoadPage)(doc, page_idx) };
         if pdf_page.is_null() {
             continue;
         }
 
-        // ── Page debug & CropBox info ──
+        // ── CropBox offset ──
         let page_num = (page_idx + 1) as u32;
-        let page_rotation = pdfium.FPDF_GetPageRotation.map_or(0, |f| unsafe { f(pdf_page) });
         let mut crop_rect = pdf_extractor::pdfium::FS_RECTF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
         let crop_valid = pdfium.FPDF_GetPageBoundingBox.map_or(false, |f| unsafe { f(pdf_page, &mut crop_rect) != 0 });
-        // Offset to shift MediaBox coords into CropBox space
         let crop_x_offset = if crop_valid { crop_rect.left as f64 } else { 0.0 };
         let crop_y_offset = if crop_valid { crop_rect.bottom as f64 } else { 0.0 };
-        let crop_box_height = if crop_valid {
-            (crop_rect.bottom - crop_rect.top).abs()
-        } else {
-            -1.0
-        };
-        let media_box_height = unsafe { (pdfium.FPDF_GetPageHeightF)(pdf_page) };
-        let media_box_width = unsafe { (pdfium.FPDF_GetPageWidthF)(pdf_page) };
-        let base_height = if crop_box_height >= 0.0 { crop_box_height } else { media_box_height };
-        let page_height = if page_rotation == 1 || page_rotation == 3 { media_box_width } else { base_height };
-        page_debug.insert(page_num, serde_json::json!({
-            "page_rotation": page_rotation,
-            "crop_box_height": crop_box_height,
-            "media_box_height": media_box_height,
-            "crop_x_offset": crop_x_offset,
-            "crop_y_offset": crop_y_offset,
-            "page_height": page_height,
-        }));
 
         let text_page = unsafe { (pdfium.FPDFText_LoadPage)(pdf_page) };
         if text_page.is_null() {
@@ -1028,18 +1007,14 @@ unsafe fn search_text_in_pdf_impl(
 
     // Build JSON output
     let json_entries: Vec<serde_json::Value> = matches.iter().map(|(page, x_min, y_min, x_max, y_max, word_text)| {
-        let mut entry = serde_json::json!({
+        serde_json::json!({
             "page": page,
             "x_min": x_min,
             "y_min": y_min,
             "x_max": x_max,
             "y_max": y_max,
             "word_text": word_text,
-        });
-        if let Some(debug) = page_debug.get(page) {
-            entry["debug"] = debug.clone();
-        }
-        entry
+        })
     }).collect();
 
     let json_str = serde_json::to_string(&json_entries).unwrap_or_else(|_| "[]".into());

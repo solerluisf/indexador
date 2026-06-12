@@ -4,6 +4,7 @@ using System.Collections.ObjectModel;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using PdfExplorer.Models;
@@ -73,6 +74,14 @@ public partial class SearchTab : Page, IPdfRenderingService
     }
 
     // ── Search ──────────────────────────────────────────────────────
+
+    private void OnSearchBoxKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            OnSearchClick(sender, e);
+        }
+    }
 
     private async void OnSearchClick(object sender, RoutedEventArgs e)
     {

@@ -955,16 +955,14 @@ pub fn align_offsets_to_tantivy(
             break;
         }
 
-        let cleaned = crate::extractor::clean_word_text(&word_positions[wp_idx].text);
-        let cleaned_lower = cleaned.to_lowercase();
+        let cleaned_lower = word_positions[wp_idx].text.to_lowercase();
 
         if cleaned_lower == *token_text {
             result.push((pos, word_positions[wp_idx].clone()));
             wp_idx += 1;
         } else if wp_idx + 1 < word_positions.len() {
             // Look ahead: does the next WordPosition match this token?
-            let next_cleaned = crate::extractor::clean_word_text(&word_positions[wp_idx + 1].text);
-            let next_lower = next_cleaned.to_lowercase();
+            let next_lower = word_positions[wp_idx + 1].text.to_lowercase();
             if next_lower == *token_text {
                 // Current WordPosition has no corresponding token → skip it
                 result.push((pos, word_positions[wp_idx + 1].clone()));

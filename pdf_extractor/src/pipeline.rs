@@ -277,16 +277,23 @@ pub fn run_pipeline(
     // Throttle progress callback to at most once per 500 docs to reduce FFI overhead.
     let progress_throttle = 500u64;
 
+    let writer_start = Instant::now();
+    let mut writer_jsonl_time = Duration::ZERO;
+    let mut writer_docs: u64 = 0;
+
     macro_rules! process_record {
         ($record:expr) => {{
             let record = $record;
             metrics.set_result_queue_depth(result_rx.len() as u64);
+            let write_start = Instant::now();
             if let Err(e) = writer.write_record(&record) {
                 jobs.mark_error(record.id, &format!("write failed: {}", e))
                     .ok();
                 metrics.increment_errored();
                 continue;
             }
+            writer_jsonl_time += write_start.elapsed();
+            writer_docs += 1;
             let processed = metrics.increment_processed();
 
             if may_index {
@@ -363,6 +370,13 @@ pub fn run_pipeline(
     // These are PDFs the worker did not get to process before crashing.
     // Must run before the indexer-failed bail so stuck jobs are recoverable.
     jobs.reprocess_extracting()?;
+
+    log_msg(log_cb, &format!(
+        "[timing] writer: {:.3}s total, {:.3}s in JSONL writes, {} docs",
+        writer_start.elapsed().as_secs_f64(),
+        writer_jsonl_time.as_secs_f64(),
+        writer_docs,
+    ));
 
     let processed = metrics.processed();
     let errored = metrics.errored();
@@ -461,6 +475,7 @@ fn indexer_thread(
     }
 
     // Final commit: Tantivy first, then mark done in SQLite.
+    let commit_start = Instant::now();
     if writer.commit().is_ok() {
         if !done_ids.is_empty() {
             jobs.batch_mark_done(&done_ids).ok();
@@ -469,8 +484,16 @@ fn indexer_thread(
         let total = indexer.metrics().docs_indexed();
         metrics.set_indexer_docs_indexed(total);
         metrics.set_indexer_last_commit_age(0);
+        log_msg(log_cb, &format!(
+            "[timing] indexer: final commit took {:.3}s for {} docs total",
+            commit_start.elapsed().as_secs_f64(),
+            total,
+        ));
     } else {
-        log_msg(log_cb, "[indexer_thread] final commit failed — some indexed documents may not be searchable");
+        log_msg(log_cb, &format!(
+            "[timing] indexer: final commit FAILED after {:.3}s",
+            commit_start.elapsed().as_secs_f64(),
+        ));
     }
 }
 
@@ -481,10 +504,16 @@ fn flush_batch(
     batch: &[DocumentRecord],
     log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) {
+    let batch_size = batch.len();
+    let phase1_start = Instant::now();
+    let mut add_time = Duration::ZERO;
+    let mut align_time = Duration::ZERO;
+
     // Phase 1: add documents to Tantivy (fast, in-memory).
     // Collect records that need position storage for phase 2.
     let mut positions_to_store: Vec<(i64, Vec<(usize, crate::extractor::WordPosition)>)> = Vec::new();
     for record in batch {
+        let add_start = Instant::now();
         if let Err(e) = indexer.search_index().add_document(
             writer,
             record.id,
@@ -492,22 +521,30 @@ fn flush_batch(
             &record.text,
             None,
         ) {
+            add_time += add_start.elapsed();
             log_msg(log_cb, &format!(
                 "[flush_batch] add_document failed for id={} path='{}': {}",
                 record.id, record.path, e
             ));
         } else {
+            add_time += add_start.elapsed();
             indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             done_ids.push((record.id, record.ocr_flag, record.checksum.clone()));
 
             if !record.word_positions.is_empty() {
+                let align_start = Instant::now();
                 let aligned = align_offsets_to_tantivy(&record.text, &record.word_positions);
+                align_time += align_start.elapsed();
                 if !aligned.is_empty() {
                     positions_to_store.push((record.id, aligned));
                 }
             }
         }
     }
+
+    let phase1_elapsed = phase1_start.elapsed();
+
+    let phase2_start = Instant::now();
 
     // Phase 2: store word positions (SQLite I/O).
     if !positions_to_store.is_empty() {
@@ -517,6 +554,18 @@ fn flush_batch(
             }
         }
     }
+
+    let phase2_elapsed = phase2_start.elapsed();
+
+    log_msg(log_cb, &format!(
+        "[timing] flush_batch({}): add={:.3}s align={:.3}s store={:.3}s wall={:.3}s docs_with_positions={}",
+        batch_size,
+        add_time.as_secs_f64(),
+        align_time.as_secs_f64(),
+        phase2_elapsed.as_secs_f64(),
+        (add_time + align_time + phase2_elapsed).as_secs_f64(),
+        positions_to_store.len(),
+    ));
 }
 
 /// Resolve the effective number of OCR worker threads.
