@@ -940,7 +940,7 @@ pub fn tokenize_with_math(text: &str) -> Vec<(usize, String)> {
 /// word_offsets match `search_term_positions` results.
 ///
 /// Iterates Tantivy tokens and matches each to the next available WordPosition
-/// whose cleaned text matches the token (case-insensitive). One-word look-ahead
+/// whose cleaned text equals the token (case-insensitive). One-word look-ahead
 /// allows skipping extraneous WordPositions that have no corresponding token.
 pub fn align_offsets_to_tantivy(
     text: &str,
@@ -958,21 +958,14 @@ pub fn align_offsets_to_tantivy(
         let cleaned = crate::extractor::clean_word_text(&word_positions[wp_idx].text);
         let cleaned_lower = cleaned.to_lowercase();
 
-        let matched = cleaned_lower == *token_text
-            || token_text.contains(&cleaned_lower)
-            || cleaned_lower.contains(token_text);
-
-        if matched {
+        if cleaned_lower == *token_text {
             result.push((pos, word_positions[wp_idx].clone()));
             wp_idx += 1;
         } else if wp_idx + 1 < word_positions.len() {
             // Look ahead: does the next WordPosition match this token?
             let next_cleaned = crate::extractor::clean_word_text(&word_positions[wp_idx + 1].text);
             let next_lower = next_cleaned.to_lowercase();
-            if next_lower == *token_text
-                || token_text.contains(&next_lower)
-                || next_lower.contains(token_text)
-            {
+            if next_lower == *token_text {
                 // Current WordPosition has no corresponding token → skip it
                 result.push((pos, word_positions[wp_idx + 1].clone()));
                 wp_idx += 2;

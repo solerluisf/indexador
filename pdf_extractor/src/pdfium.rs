@@ -14,6 +14,26 @@ macro_rules! load_fn {
     };
 }
 
+/// Load an optional PDFium symbol — returns `None` if the DLL doesn't export it.
+macro_rules! load_fn_opt {
+    ($lib:expr, $name:ident, $ty:ty) => {
+        unsafe {
+            $lib.get::<$ty>(stringify!($name).as_bytes())
+                .ok()
+                .map(|sym| *sym)
+        }
+    };
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FS_RECTF {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
 pub struct Pdfium {
     #[allow(dead_code)]
     lib: Library,
@@ -36,6 +56,8 @@ pub struct Pdfium {
     pub FPDF_ClosePage: unsafe extern "C" fn(page: *mut c_void),
     pub FPDF_GetPageWidthF: unsafe extern "C" fn(page: *mut c_void) -> f32,
     pub FPDF_GetPageHeightF: unsafe extern "C" fn(page: *mut c_void) -> f32,
+    pub FPDF_GetPageRotation: Option<unsafe extern "C" fn(page: *mut c_void) -> i32>,
+    pub FPDF_GetPageBoundingBox: Option<unsafe extern "C" fn(page: *mut c_void, rect: *mut FS_RECTF) -> i32>,
 
     // Text
     pub FPDFText_LoadPage: unsafe extern "C" fn(page: *mut c_void) -> *mut c_void,
@@ -73,6 +95,26 @@ pub struct Pdfium {
 static PDFIUM: Mutex<Option<&'static Pdfium>> = Mutex::new(None);
 
 impl Pdfium {
+    /// Try to open pdfium.dll, first by bare name (standard search),
+    /// then by absolute path relative to the current executable.
+    fn open_pdfium() -> Result<Library> {
+        unsafe {
+            match Library::new("pdfium.dll") {
+                Ok(lib) => return Ok(lib),
+                Err(_) => {}
+            }
+            let exe = std::env::current_exe().ok().and_then(|p| {
+                p.parent().map(|d| d.join("pdfium.dll"))
+            });
+            if let Some(path) = exe {
+                if let Ok(lib) = Library::new(path.as_os_str()) {
+                    return Ok(lib);
+                }
+            }
+        }
+        Err(anyhow::anyhow!("pdfium.dll not found"))
+    }
+
     /// Get the global PDFium instance, loading pdfium.dll on first call.
     /// Returns `None` if the DLL cannot be loaded.
     /// Errors are **not** cached — if the DLL is missing on first call,
@@ -113,7 +155,7 @@ impl Pdfium {
     }
 
     unsafe fn load_inner() -> Result<Self> {
-        let lib = Library::new("pdfium.dll")
+        let lib = Self::open_pdfium()
             .context("Failed to load pdfium.dll — ensure pdfium.dll is in the application directory or PATH")?;
 
         let init_fn: unsafe extern "C" fn() = load_fn!(lib, FPDF_InitLibrary, unsafe extern "C" fn());
@@ -131,6 +173,8 @@ impl Pdfium {
             FPDF_ClosePage: load_fn!(lib, FPDF_ClosePage, unsafe extern "C" fn(*mut c_void)),
             FPDF_GetPageWidthF: load_fn!(lib, FPDF_GetPageWidthF, unsafe extern "C" fn(*mut c_void) -> f32),
             FPDF_GetPageHeightF: load_fn!(lib, FPDF_GetPageHeightF, unsafe extern "C" fn(*mut c_void) -> f32),
+            FPDF_GetPageRotation: load_fn_opt!(lib, FPDF_GetPageRotation, unsafe extern "C" fn(*mut c_void) -> i32),
+            FPDF_GetPageBoundingBox: load_fn_opt!(lib, FPDF_GetPageBoundingBox, unsafe extern "C" fn(*mut c_void, *mut FS_RECTF) -> i32),
 
             FPDFText_LoadPage: load_fn!(lib, FPDFText_LoadPage, unsafe extern "C" fn(*mut c_void) -> *mut c_void),
             FPDFText_ClosePage: load_fn!(lib, FPDFText_ClosePage, unsafe extern "C" fn(*mut c_void)),
@@ -177,6 +221,15 @@ pub const FPDF_ANNOT: i32 = 0x02;
 pub const FPDF_LCD_TEXT: i32 = 0x04;
 pub const FPDF_GRAYSCALE: i32 = 0x10;
 pub const FPDF_PRINTING: i32 = 0x200;
+
+/// Coordinate transform: Y-flip PDF user-space (bottom-left) → bitmap (top-left).
+/// - `pdf_y`: Y in PDF user space (origin bottom-left, points).
+/// - `page_height`: effective page height (points) — caller should pass the
+///   correct value considering CropBox/MediaBox and rotation swap.
+/// - `rotation`: `FPDF_GetPageRotation` result (0/1/2/3 → 0°/90°/180°/270°).
+pub fn flip_y(pdf_y: f64, page_height: f64, _rotation: i32) -> f64 {
+    page_height - pdf_y
+}
 
 // ---------------------------------------------------------------------------
 // Helper: convert a filesystem path to a null-terminated UTF-16 wide string

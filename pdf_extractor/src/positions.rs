@@ -139,7 +139,7 @@ impl PositionStore {
             .collect())
     }
 
-    /// Get all positions for `doc_id` where `word_text` contains `term`
+    /// Get all positions for `doc_id` where `word_text` equals `term`
     /// (case-insensitive).
     ///
     /// Unlike the old schema, this cannot delegate filtering to SQLite;
@@ -155,7 +155,7 @@ impl PositionStore {
         let term_lower = term.to_lowercase();
         Ok(all
             .into_iter()
-            .filter(|p| p.word_text.to_lowercase().contains(&term_lower))
+            .filter(|p| p.word_text.to_lowercase() == term_lower)
             .collect())
     }
 

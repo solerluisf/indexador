@@ -2062,6 +2062,22 @@ mod tests {
         frames
     }
 
+    fn spawn_worker_with_stdin(worker: &Path, paths: &[&std::path::Path]) -> std::process::Output {
+        let mut child = std::process::Command::new(worker)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn pdf_worker");
+        {
+            let mut stdin = child.stdin.take().expect("failed to open worker stdin");
+            for p in paths {
+                let _ = writeln!(stdin, "{}", p.display());
+            }
+        }
+        child.wait_with_output().expect("failed to wait for pdf_worker")
+    }
+
     #[test]
     fn test_worker_binary_with_valid_pdf() {
         let worker = match find_worker_binary() {
@@ -2077,12 +2093,7 @@ mod tests {
 
         let pdf = make_test_pdf(&tmp, "This is a longer English sentence that should be reliably detected by the language detector with enough characters");
 
-        let output = std::process::Command::new(&worker)
-            .arg(&pdf)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .expect("failed to spawn pdf_worker");
+        let output = spawn_worker_with_stdin(&worker, &[&pdf]);
 
         assert!(output.status.success(), "worker exited with code {}: {}\nstdout: {}",
             output.status.code().unwrap_or(-1),
@@ -2093,7 +2104,7 @@ mod tests {
         assert_eq!(frames.len(), 1, "should produce 1 frame");
         let wo = match &frames[0] {
             WorkerFrame::Success(wo) => wo,
-            _ => panic!("expected Success frame"),
+            _ => panic!("expected Success frame, got: {:?}", frames[0]),
         };
 
         assert_eq!(wo.path, pdf.to_string_lossy(), "path mismatch");
@@ -2103,7 +2114,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
     fn test_worker_binary_with_missing_file() {
         let worker = match find_worker_binary() {
             Some(w) => w,
@@ -2112,12 +2122,7 @@ mod tests {
 
         let missing = Path::new(r"C:\__pdf_worker_test_nonexistent__\missing.pdf");
 
-        let output = std::process::Command::new(&worker)
-            .arg(missing)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .expect("failed to spawn pdf_worker");
+        let output = spawn_worker_with_stdin(&worker, &[missing]);
 
         let frames = parse_worker_frames(&output.stdout);
         assert_eq!(frames.len(), 1, "should produce 1 frame");
@@ -2146,14 +2151,7 @@ mod tests {
         let pdf2 = make_test_pdf(&tmp, "Second document content");
         let missing = tmp.join("nonexistent.pdf");
 
-        let output = std::process::Command::new(&worker)
-            .arg(&pdf1)
-            .arg(&pdf2)
-            .arg(&missing)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .expect("failed to spawn pdf_worker");
+        let output = spawn_worker_with_stdin(&worker, &[&pdf1, &pdf2, &missing]);
 
         assert!(output.status.success(), "worker exited with code {}: {}\nstdout: {}",
             output.status.code().unwrap_or(-1),
@@ -2235,12 +2233,7 @@ mod tests {
         let text = "Price: 99.95 USD (discount 15%) #sale!";
         let pdf = make_test_pdf(&tmp, text);
 
-        let output = std::process::Command::new(&worker)
-            .arg(&pdf)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .expect("failed to spawn pdf_worker");
+        let output = spawn_worker_with_stdin(&worker, &[&pdf]);
 
         assert!(output.status.success(), "worker failed for special chars PDF: {}",
             String::from_utf8_lossy(&output.stderr));
@@ -2275,12 +2268,7 @@ mod tests {
         // Create a PDF with no text content (whitespace only)
         let pdf = make_test_pdf(&tmp, "   ");
 
-        let output = std::process::Command::new(&worker)
-            .arg(&pdf)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .expect("failed to spawn pdf_worker");
+        let output = spawn_worker_with_stdin(&worker, &[&pdf]);
 
         assert!(output.status.success(), "worker failed for empty-text PDF: {}",
             String::from_utf8_lossy(&output.stderr));

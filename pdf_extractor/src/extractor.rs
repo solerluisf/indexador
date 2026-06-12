@@ -3,6 +3,7 @@ use regex::Regex;
 use std::path::Path;
 
 use crate::pdfium;
+use crate::pdfium::FS_RECTF;
 
 /// Lazily-initialized regex for cleaning word text to match Tantivy's
 /// `[\p{L}\p{N}\p{S}]+` tokenizer pattern.
@@ -63,6 +64,18 @@ unsafe fn extract_text_and_positions(
 
         // Wrap in catch_unwind so FFI handles are always closed on panic.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // ── Page orientation / crop info for Y-flip ──
+            let rotation = pdfium.FPDF_GetPageRotation.map_or(0, |f| unsafe { f(page) });
+            let mut crop_rect = FS_RECTF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
+            let crop_valid = pdfium.FPDF_GetPageBoundingBox.map_or(false, |f| unsafe { f(page, &mut crop_rect) != 0 });
+            let crop_h = if crop_valid { (crop_rect.bottom - crop_rect.top).abs() as f64 } else { -1.0 };
+            let media_h = (pdfium.FPDF_GetPageHeightF)(page) as f64;
+            let media_w = (pdfium.FPDF_GetPageWidthF)(page) as f64;
+            let base_h = if crop_h >= 0.0 { crop_h } else { media_h };
+            // Y-flip height: CropBox > MediaBox; swap width↔height when rotated 90/270
+            let eff_height = if rotation == 1 || rotation == 3 { media_w } else { base_h };
+
+            let start_pos = word_positions.len();
             let char_count = (pdfium.FPDFText_CountChars)(text_page);
             let mut current_word = String::new();
             let mut left_min = 0.0f64;
@@ -161,6 +174,14 @@ unsafe fn extract_text_and_positions(
                     y_max: top_max as f32,
                     text: clean_word_text(&current_word),
                 });
+            }
+
+            // Apply Y-flip to all word positions on this page (PDF bottom-left → bitmap top-left)
+            for pos in word_positions[start_pos..].iter_mut() {
+                let new_ymin = pdfium::flip_y(pos.y_max as f64, eff_height, rotation) as f32;
+                let new_ymax = pdfium::flip_y(pos.y_min as f64, eff_height, rotation) as f32;
+                pos.y_min = new_ymin;
+                pos.y_max = new_ymax;
             }
 
             total_chars += char_count as usize;
