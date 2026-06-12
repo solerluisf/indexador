@@ -7,7 +7,7 @@ use tantivy::collector::{Count, TopDocs};
 use tantivy::merge_policy::LogMergePolicy;
 use tantivy::query::{BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery, TermQuery};
 use tantivy::schema::*;
-use tantivy::tokenizer::TextAnalyzer;
+use tantivy::tokenizer::{TextAnalyzer, TokenStream, Tokenizer};
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDocument, Term};
 use tantivy::{DocSet, Postings, TERMINATED};
 
@@ -912,26 +912,14 @@ impl Indexer {
 /// This is the canonical tokenizer — all word_offset values in SQLite should
 /// be derived from these positions so they align with Tantivy's term positions.
 pub fn tokenize_with_math(text: &str) -> Vec<(usize, String)> {
-    use std::sync::{Mutex, PoisonError, OnceLock};
     use tantivy::tokenizer::RegexTokenizer;
-    static ANALYZER: OnceLock<Mutex<TextAnalyzer>> = OnceLock::new();
-    let mut analyzer = match ANALYZER.get_or_init(|| {
-        let tokenizer = RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
-            .unwrap_or_else(|_| RegexTokenizer::new(r"\S+").unwrap());
-        Mutex::new(
-            TextAnalyzer::builder(tokenizer)
-                .filter(tantivy::tokenizer::LowerCaser)
-                .build(),
-        )
-    }).lock() {
-        Ok(guard) => guard,
-        Err(PoisonError { .. }) => return Vec::new(),
-    };
-    let mut stream = analyzer.token_stream(text);
+    let mut tokenizer = RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
+        .expect("Hardcoded regex pattern should never fail");
+    let mut stream = tokenizer.token_stream(text);
     let mut tokens = Vec::new();
     while stream.advance() {
         let t = stream.token();
-        tokens.push((t.position as usize, t.text.clone()));
+        tokens.push((t.position as usize, t.text.to_lowercase()));
     }
     tokens
 }
