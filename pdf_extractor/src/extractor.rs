@@ -32,6 +32,10 @@ pub struct ExtractionResult {
     pub ocr_flag: bool,
     /// Per-word bounding boxes, aligned with tokenized text.
     pub word_positions: Vec<WordPosition>,
+    /// Total number of pages processed in the PDF.
+    pub page_count: u32,
+    /// Wall-clock time for the entire extraction in milliseconds.
+    pub extraction_ms: u64,
 }
 
 /// Extract text and word bounding boxes from a loaded PDFium document handle.
@@ -44,7 +48,7 @@ pub struct ExtractionResult {
 unsafe fn extract_text_and_positions(
     pdfium: &pdfium::Pdfium,
     doc: *mut std::ffi::c_void,
-) -> (String, Vec<WordPosition>, usize) {
+) -> (String, Vec<WordPosition>, usize, u32) {
     let page_count = (pdfium.FPDF_GetPageCount)(doc);
     let mut text = String::new();
     let mut word_positions: Vec<WordPosition> = Vec::new();
@@ -237,7 +241,7 @@ unsafe fn extract_text_and_positions(
         }
     }
 
-    (text, word_positions, total_chars)
+    (text, word_positions, total_chars, page_count as u32)
 }
 
 /// Extract text and word bounding boxes from a PDF using PDFium.
@@ -250,6 +254,7 @@ unsafe fn extract_text_and_positions(
 ///      In both paths, `FPDF_CloseDocument` is always called and the buffer
 ///      (if any) is freed after CloseDocument.  No `ManuallyDrop` leak.
 pub fn extract_pdf(path: &Path) -> Result<ExtractionResult> {
+    let extract_start = std::time::Instant::now();
     let pdfium = pdfium::Pdfium::global().ok_or_else(|| {
         anyhow::anyhow!("pdfium.dll not available — install pdfium.dll in the application directory")
     })?;
@@ -263,8 +268,9 @@ pub fn extract_pdf(path: &Path) -> Result<ExtractionResult> {
 
     if !doc.is_null() {
         let result = unsafe { extract_text_and_positions(pdfium, doc) };
+        let extraction_ms = extract_start.elapsed().as_millis() as u64;
         unsafe { (pdfium.FPDF_CloseDocument)(doc); }
-        return Ok(build_result(result.0, result.1, result.2));
+        return Ok(build_result(result.0, result.1, result.2, result.3, extraction_ms));
     }
 
     // File-path loading failed — fall back to memory loading.
@@ -283,14 +289,17 @@ pub fn extract_pdf(path: &Path) -> Result<ExtractionResult> {
             text: String::new(),
             ocr_flag: true,
             word_positions: Vec::new(),
+            page_count: 0,
+            extraction_ms: extract_start.elapsed().as_millis() as u64,
         });
     }
 
     let result = unsafe { extract_text_and_positions(pdfium, doc) };
+    let extraction_ms = extract_start.elapsed().as_millis() as u64;
     // CloseDocument while the buffer is still alive
     unsafe { (pdfium.FPDF_CloseDocument)(doc); }
     // pdf_data is dropped here, after CloseDocument
-    Ok(build_result(result.0, result.1, result.2))
+    Ok(build_result(result.0, result.1, result.2, result.3, extraction_ms))
 }
 
 /// Build an ExtractionResult from raw extraction output.
@@ -299,12 +308,16 @@ fn build_result(
     mut text: String,
     word_positions: Vec<WordPosition>,
     total_chars: usize,
+    page_count: u32,
+    extraction_ms: u64,
 ) -> ExtractionResult {
     if total_chars == 0 || text.trim().is_empty() {
         ExtractionResult {
             text: String::new(),
             ocr_flag: true,
             word_positions: Vec::new(),
+            page_count,
+            extraction_ms,
         }
     } else {
         let trimmed_len = text.trim_end().len();
@@ -313,6 +326,8 @@ fn build_result(
             text,
             ocr_flag: false,
             word_positions,
+            page_count,
+            extraction_ms,
         }
     }
 }
@@ -324,6 +339,7 @@ fn build_result(
 /// This is useful for callers (e.g. CAPI) that already have the PDF bytes
 /// in memory and want to avoid reading the file a second time.
 pub fn extract_pdf_bytes(data: &[u8]) -> Result<ExtractionResult> {
+    let extract_start = std::time::Instant::now();
     let pdfium = pdfium::Pdfium::global().ok_or_else(|| {
         anyhow::anyhow!("pdfium.dll not available — install pdfium.dll in the application directory")
     })?;
@@ -340,12 +356,16 @@ pub fn extract_pdf_bytes(data: &[u8]) -> Result<ExtractionResult> {
             text: String::new(),
             ocr_flag: true,
             word_positions: Vec::new(),
+            page_count: 0,
+            extraction_ms: extract_start.elapsed().as_millis() as u64,
         });
     }
 
-    let (text, word_positions, total_chars) = unsafe { extract_text_and_positions(pdfium, doc) };
+    let (text, word_positions, total_chars, page_count) =
+        unsafe { extract_text_and_positions(pdfium, doc) };
+    let extraction_ms = extract_start.elapsed().as_millis() as u64;
     unsafe { (pdfium.FPDF_CloseDocument)(doc); }
-    Ok(build_result(text, word_positions, total_chars))
+    Ok(build_result(text, word_positions, total_chars, page_count, extraction_ms))
 }
 
 // ---------------------------------------------------------------------------
@@ -565,14 +585,14 @@ mod tests {
 
     #[test]
     fn test_extraction_result_ocr_flag() {
-        let result = ExtractionResult { text: String::new(), ocr_flag: true, word_positions: Vec::new() };
+        let result = ExtractionResult { text: String::new(), ocr_flag: true, word_positions: Vec::new(), page_count: 0, extraction_ms: 0 };
         assert!(result.ocr_flag);
         assert!(result.text.is_empty());
     }
 
     #[test]
     fn test_extraction_result_has_text() {
-        let result = ExtractionResult { text: "hello".into(), ocr_flag: false, word_positions: Vec::new() };
+        let result = ExtractionResult { text: "hello".into(), ocr_flag: false, word_positions: Vec::new(), page_count: 1, extraction_ms: 0 };
         assert!(!result.ocr_flag);
         assert_eq!(result.text, "hello");
     }

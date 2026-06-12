@@ -14,6 +14,10 @@ pub struct DocumentRecord {
     pub text: String,
     #[serde(skip)]
     pub word_positions: Vec<crate::extractor::WordPosition>,
+    /// Wall-clock time for extraction in milliseconds.
+    pub file_extraction_ms: u64,
+    /// Number of pages in the PDF.
+    pub page_count: u32,
 }
 
 pub struct JsonlWriter {
@@ -69,6 +73,8 @@ mod tests {
             ocr_flag: false,
             text: "hello world".into(),
             word_positions: Vec::new(),
+            file_extraction_ms: 0,
+            page_count: 0,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"id\":42"));
@@ -86,6 +92,8 @@ mod tests {
             ocr_flag: false,
             text: "line1\nline2\ttabbed \"quoted\" \\backslash".into(),
             word_positions: Vec::new(),
+            file_extraction_ms: 0,
+            page_count: 0,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -101,6 +109,8 @@ mod tests {
             ocr_flag: false,
             text: "こんにちは世界 ∑∫".into(),
             word_positions: Vec::new(),
+            file_extraction_ms: 0,
+            page_count: 0,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -123,6 +133,8 @@ mod tests {
             ocr_flag: false,
             text: "hello".into(),
             word_positions: Vec::new(),
+            file_extraction_ms: 0,
+            page_count: 0,
         };
         writer.write_record(&record).unwrap();
 
@@ -145,11 +157,15 @@ mod tests {
             id: 1, path: "/a.pdf".into(), checksum: "a".into(),
             ocr_flag: false, text: "one".into(),
             word_positions: Vec::new(),
+            file_extraction_ms: 0,
+            page_count: 0,
         }).unwrap();
         writer.write_record(&DocumentRecord {
             id: 2, path: "/b.pdf".into(), checksum: "b".into(),
             ocr_flag: true, text: "two".into(),
             word_positions: Vec::new(),
+            file_extraction_ms: 0,
+            page_count: 0,
         }).unwrap();
 
         let mut content = String::new();
@@ -172,6 +188,8 @@ mod tests {
             id: 1, path: "/a.pdf".into(), checksum: "x".into(),
             ocr_flag: false, text: "t".into(),
             word_positions: Vec::new(),
+            file_extraction_ms: 0,
+            page_count: 0,
         };
         writer.write_record(&rec()).unwrap();
         assert_eq!(writer.count(), 1);
@@ -204,6 +222,8 @@ mod tests {
             ocr_flag: false,
             text: "x".repeat(100_000),
             word_positions: Vec::new(),
+            file_extraction_ms: 0,
+            page_count: 0,
         };
         writer.write_record(&record).unwrap();
 
@@ -226,6 +246,8 @@ mod tests {
             id: 1, path: "/a.pdf".into(), checksum: "x".into(),
             ocr_flag: false, text: "first".into(),
             word_positions: Vec::new(),
+            file_extraction_ms: 0,
+            page_count: 0,
         }).unwrap();
         drop(w1);
 
@@ -234,6 +256,8 @@ mod tests {
             id: 2, path: "/b.pdf".into(), checksum: "y".into(),
             ocr_flag: true, text: "second".into(),
             word_positions: Vec::new(),
+            file_extraction_ms: 0,
+            page_count: 0,
         }).unwrap();
         drop(w2);
 

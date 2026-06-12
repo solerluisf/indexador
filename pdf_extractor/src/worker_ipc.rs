@@ -9,6 +9,10 @@ pub struct WorkerOutput {
     pub ocr_flag: bool,
     pub text: String,
     pub word_positions: Vec<crate::extractor::WordPosition>,
+    /// Wall-clock time for this file's extraction in milliseconds.
+    pub file_extraction_ms: u64,
+    /// Number of pages in the PDF.
+    pub page_count: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -28,6 +32,8 @@ mod tests {
             ocr_flag: false,
             text: "extracted content".into(),
             word_positions: vec![],
+            file_extraction_ms: 0,
+            page_count: 1,
         }
     }
 
@@ -47,7 +53,7 @@ mod tests {
 
     #[test]
     fn test_worker_output_ocr_flag_true() {
-        let json = r#"{"path":"/scan.pdf","checksum":"x","ocr_flag":true,"text":"","word_positions":[]}"#;
+        let json = r#"{"path":"/scan.pdf","checksum":"x","ocr_flag":true,"text":"","word_positions":[],"file_extraction_ms":0,"page_count":1}"#;
         let wo: WorkerOutput = serde_json::from_str(json).unwrap();
         assert!(wo.ocr_flag);
         assert!(wo.text.is_empty());

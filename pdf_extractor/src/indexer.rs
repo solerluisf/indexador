@@ -913,8 +913,17 @@ impl Indexer {
 /// be derived from these positions so they align with Tantivy's term positions.
 pub fn tokenize_with_math(text: &str) -> Vec<(usize, String)> {
     use tantivy::tokenizer::RegexTokenizer;
-    let mut tokenizer = RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
-        .expect("Hardcoded regex pattern should never fail");
+    static TOKENIZER: std::sync::OnceLock<std::sync::Mutex<RegexTokenizer>> =
+        std::sync::OnceLock::new();
+    let mut tokenizer = TOKENIZER
+        .get_or_init(|| {
+            std::sync::Mutex::new(
+                RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
+                    .expect("Hardcoded regex pattern should never fail"),
+            )
+        })
+        .lock()
+        .expect("RegexTokenizer mutex poisoned");
     let mut stream = tokenizer.token_stream(text);
     let mut tokens = Vec::new();
     while stream.advance() {
@@ -934,8 +943,19 @@ pub fn align_offsets_to_tantivy(
     text: &str,
     word_positions: &[crate::extractor::WordPosition],
 ) -> Vec<(usize, crate::extractor::WordPosition)> {
+    if word_positions.is_empty() {
+        return Vec::new();
+    }
+
+    // Pre-compute lowercase once per word position instead of per-comparison
+    let wp_lower: Vec<String> = word_positions
+        .iter()
+        .map(|wp| wp.text.to_lowercase())
+        .collect();
+
     let tokens = tokenize_with_math(text);
-    let mut result = Vec::new();
+
+    let mut result = Vec::with_capacity(tokens.len().min(word_positions.len()));
     let mut wp_idx = 0;
 
     for &(pos, ref token_text) in &tokens {
@@ -943,21 +963,15 @@ pub fn align_offsets_to_tantivy(
             break;
         }
 
-        let cleaned_lower = word_positions[wp_idx].text.to_lowercase();
-
-        if cleaned_lower == *token_text {
+        if wp_lower[wp_idx] == *token_text {
             result.push((pos, word_positions[wp_idx].clone()));
             wp_idx += 1;
         } else if wp_idx + 1 < word_positions.len() {
-            // Look ahead: does the next WordPosition match this token?
-            let next_lower = word_positions[wp_idx + 1].text.to_lowercase();
-            if next_lower == *token_text {
-                // Current WordPosition has no corresponding token → skip it
+            if wp_lower[wp_idx + 1] == *token_text {
                 result.push((pos, word_positions[wp_idx + 1].clone()));
                 wp_idx += 2;
-            } // else: this token has no bounding box → skip it
+            }
         }
-        // else: this token has no bounding box → skip it
     }
 
     result

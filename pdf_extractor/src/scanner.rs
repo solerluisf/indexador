@@ -202,7 +202,7 @@ impl JobStore {
         Ok(result)
     }
 
-    pub fn claim_pending(&self, limit: i64) -> Result<Vec<(i64, String, String)>> {
+    pub fn claim_pending(&self, limit: i64) -> Result<Vec<(i64, String, String, i64)>> {
         let mut conn = self.pool.get().context("Failed to get DB connection")?;
         let clamped = if limit < 0 { 0 } else { limit };
 
@@ -213,9 +213,9 @@ impl JobStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .context("Failed to begin immediate transaction for claim")?;
 
-        let rows: Vec<(i64, String, String)> = {
+        let rows: Vec<(i64, String, String, i64)> = {
             let mut select = tx
-                .prepare("SELECT id, path, checksum FROM jobs WHERE status = 'pending' LIMIT ?1")
+                .prepare("SELECT id, path, checksum, COALESCE(file_size, 0) FROM jobs WHERE status = 'pending' LIMIT ?1")
                 .context("Failed to prepare claim select")?;
 
             let r = select
@@ -224,6 +224,7 @@ impl JobStore {
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 })
                 .context("Failed to query pending jobs for claim")?
@@ -237,7 +238,7 @@ impl JobStore {
             return Ok(Vec::new());
         }
 
-        let id_list: Vec<String> = rows.iter().map(|(id, _, _)| id.to_string()).collect();
+        let id_list: Vec<String> = rows.iter().map(|(id, _, _, _)| id.to_string()).collect();
         let placeholders = id_list.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
             "UPDATE jobs SET status = 'extracting' WHERE id IN ({})",
@@ -1356,7 +1357,7 @@ mod tests {
             store.upsert_file(&format!("/{}.pdf", i), &format!("cs{}", i)).unwrap();
         }
         let batch = store.claim_pending(10).unwrap();
-        for (id, _, _) in &batch {
+        for (id, _, _, _) in &batch {
             store.mark_done(*id, true).unwrap();
         }
 
@@ -1954,7 +1955,7 @@ mod tests {
                 for _ in 0..jobs_per_thread {
                     let batch = store.claim_pending(1).unwrap();
                     if !batch.is_empty() {
-                        let (id, _, _) = batch[0];
+                        let (id, _, _, _) = batch[0];
                         store.mark_done(id, false).unwrap();
                     }
                 }
@@ -2001,7 +2002,7 @@ mod tests {
                 if batch.is_empty() {
                     break;
                 }
-                for (id, _, _) in &batch {
+                for (id, _, _, _) in &batch {
                     store_clone.mark_done(*id, false).unwrap();
                 }
                 total += batch.len();

@@ -35,7 +35,7 @@ use crate::worker_ipc::WorkerFrame;
 //   peak memory ≈ (CHANNEL_CAP + INDEXER_BATCH) × avg_text_size
 //   = (256 + 500) × text_size
 const DEFAULT_CHANNEL_CAPACITY: usize = 256;
-const BATCH_SIZE: i64 = 100;
+const BATCH_SIZE: i64 = 30;
 const DEFAULT_INDEXER_BATCH_SIZE: usize = 500;
 const DEFAULT_COMMIT_INTERVAL: u64 = 50000;
 const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 30;
@@ -89,7 +89,7 @@ impl PipelineConfig {
                 let cores = num_cpus::get();
                 // Each worker is a full subprocess loading pdfium.dll (~40 MB+).
                 // Cap the auto-detected default so we don't OOM on high-core machines.
-                std::cmp::min(std::cmp::max(1, cores.saturating_sub(2)), 4)
+                std::cmp::min(std::cmp::max(1, cores.saturating_sub(2)), 8)
             })
     }
 
@@ -185,8 +185,10 @@ pub fn run_pipeline(
     let indexer_threads = config.indexer_threads();
 
 
-    // Producer: claim pending jobs from DB and send batches to task channel.
-    // Batching reduces channel lock contention vs one send() per task.
+    // Producer: claim pending jobs from DB and distribute them round-robin
+    // across workers sorted by file size descending.  This ensures the
+    // largest PDFs are spread evenly so no worker is stuck with all the
+    // stragglers while others sit idle.
     let producer_jobs = Arc::clone(&jobs);
     let producer_metrics = Arc::clone(&metrics);
     let producer_cancel = config.cancel_flag.clone();
@@ -196,18 +198,33 @@ pub fn run_pipeline(
                 if producer_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
                     break;
                 }
-                match producer_jobs.claim_pending(BATCH_SIZE) {
+                // Claim a larger pool so we can sort and distribute evenly
+                let claim_size = num_workers as i64 * BATCH_SIZE;
+                match producer_jobs.claim_pending(claim_size) {
                     Ok(batch) => {
                         if batch.is_empty() {
                             break;
                         }
-                        let tasks: Vec<ExtractorTask> = batch
-                            .into_iter()
-                            .map(|(id, path, checksum)| ExtractorTask { id, path, checksum })
-                            .collect();
-                        producer_metrics.set_task_queue_depth(task_tx.len() as u64);
-                        if task_tx.send(tasks).is_err() {
-                            return;
+
+                        // Sort by file_size descending — largest files assigned first
+                        let mut batch = batch;
+                        batch.sort_by(|a, b| b.3.cmp(&a.3));
+
+                        // Distribute round-robin across workers
+                        let mut worker_batches: Vec<Vec<ExtractorTask>> =
+                            (0..num_workers).map(|_| Vec::new()).collect();
+                        for (i, (id, path, checksum, _size)) in batch.into_iter().enumerate() {
+                            worker_batches[i % num_workers]
+                                .push(ExtractorTask { id, path, checksum });
+                        }
+
+                        for tasks in worker_batches {
+                            if !tasks.is_empty() {
+                                producer_metrics.set_task_queue_depth(task_tx.len() as u64);
+                                if task_tx.send(tasks).is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
                     Err(_e) => {
@@ -295,6 +312,15 @@ pub fn run_pipeline(
             writer_jsonl_time += write_start.elapsed();
             writer_docs += 1;
             let processed = metrics.increment_processed();
+
+            if record.file_extraction_ms > 0 {
+                log_msg(log_cb, &format!(
+                    "[timing] file={} pages={} extraction={:.3}s",
+                    record.path,
+                    record.page_count,
+                    record.file_extraction_ms as f64 / 1000.0,
+                ));
+            }
 
             if may_index {
                 let id = record.id;
@@ -663,6 +689,8 @@ pub fn run_ocr_post_processing(
                     ocr_flag: false,
                     text: ocr_text.clone(),
                     word_positions: Vec::new(),
+                    file_extraction_ms: 0,
+                    page_count: 0,
                 };
                 if let Err(e) = writer.write_record(&record) {
                     log_msg(consumer_log_cb, &format!(
@@ -1018,6 +1046,8 @@ fn drain_crash_frames<R: io::Read>(
                         ocr_flag: wo.ocr_flag,
                         text: wo.text,
                         word_positions: wo.word_positions,
+                        file_extraction_ms: wo.file_extraction_ms,
+                        page_count: wo.page_count,
                     };
                     let _ = result_tx.send(record);
                     ok += 1;
@@ -1191,6 +1221,8 @@ fn run_extraction_process(
                         ocr_flag: wo.ocr_flag,
                         text: wo.text,
                         word_positions: wo.word_positions,
+                        file_extraction_ms: wo.file_extraction_ms,
+                        page_count: wo.page_count,
                     };
                     if result_tx.send(record).is_err() {
                         // Cannot send downstream — pipeline shutting down.
@@ -1951,7 +1983,7 @@ mod tests {
         assert_eq!(batch.len(), 2, "should claim up to batch_size=2");
         let tasks: Vec<ExtractorTask> = batch
             .into_iter()
-            .map(|(id, path, checksum)| ExtractorTask { id, path, checksum })
+            .map(|(id, path, checksum, _size)| ExtractorTask { id, path, checksum })
             .collect();
         task_tx.send(tasks).unwrap();
 
@@ -2006,6 +2038,8 @@ mod tests {
             ocr_flag: false,
             text: "hello from mock".into(),
             word_positions: vec![],
+            file_extraction_ms: 0,
+            page_count: 1,
         });
         let bytes = make_frame_bytes(&frame);
         let mut reader = io::BufReader::new(std::io::Cursor::new(&bytes));
@@ -2053,6 +2087,8 @@ mod tests {
             ocr_flag: false,
             text: "test".into(),
             word_positions: vec![],
+            file_extraction_ms: 0,
+            page_count: 1,
         });
         let mut bytes = make_frame_bytes(&frame);
         bytes.truncate(bytes.len() - 3); // remove last 3 bytes

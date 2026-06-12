@@ -13,7 +13,7 @@ public class AppSettings
     public uint IndexerBatchSize { get; set; } = 500;
     public uint CommitInterval { get; set; } = 5000;
     public uint CommitTimeout { get; set; } = 30;
-    public uint ExtractWorkers { get; set; } = 6;
+    public uint ExtractWorkers { get; set; } = 8;
     public uint ChannelCapacity { get; set; } = 500;
 
     [JsonInclude]
