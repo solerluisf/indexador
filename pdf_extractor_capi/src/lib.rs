@@ -845,6 +845,16 @@ unsafe fn search_text_in_pdf_impl(
         let mut word_bottom = 0.0f64;
         let mut word_top = 0.0f64;
         let mut has_word = false;
+        // Previous character bbox for gap detection
+        let mut prev_left = 0.0f64;
+        let mut prev_right = 0.0f64;
+        let mut prev_bottom = 0.0f64;
+        let mut prev_top = 0.0f64;
+        let mut has_prev = false;
+        // Running average character metrics for relative gap thresholds
+        let mut total_height = 0.0f64;
+        let mut total_width = 0.0f64;
+        let mut char_count_in_page = 0usize;
         // Track per-page word positions for phrase matching
         let mut page_words: Vec<(String, f32, f32, f32, f32)> = Vec::new();
 
@@ -870,6 +880,7 @@ unsafe fn search_text_in_pdf_impl(
                     page_words.push((clean_word_text(&current_word), word_left as f32, word_bottom as f32, word_right as f32, word_top as f32));
                     current_word.clear();
                     has_word = false;
+                    has_prev = false;
                 }
                 continue;
             }
@@ -881,6 +892,7 @@ unsafe fn search_text_in_pdf_impl(
                         page_words.push((clean_word_text(&current_word), word_left as f32, word_bottom as f32, word_right as f32, word_top as f32));
                         current_word.clear();
                         has_word = false;
+                        has_prev = false;
                     }
                     continue;
                 }
@@ -893,8 +905,21 @@ unsafe fn search_text_in_pdf_impl(
                     page_words.push((clean_word_text(&current_word), word_left as f32, word_bottom as f32, word_right as f32, word_top as f32));
                     current_word.clear();
                     has_word = false;
+                    has_prev = false;
                 }
             } else {
+                // Gap detection: flush if vertical gap > 0.7×avg_h or horizontal gap magnitude > 1.5×avg_w
+                if has_word && has_prev && char_count_in_page > 0 {
+                    let avg_h = total_height / char_count_in_page as f64;
+                    let avg_w = total_width / char_count_in_page as f64;
+                    let vert_gap = (bottom - prev_bottom).abs();
+                    let horiz_gap = left - prev_right;
+                    if vert_gap > avg_h * 0.7 || horiz_gap.abs() > avg_w * 1.5 {
+                        page_words.push((clean_word_text(&current_word), word_left as f32, word_bottom as f32, word_right as f32, word_top as f32));
+                        current_word.clear();
+                        has_word = false;
+                    }
+                }
                 if has_word {
                     word_left = word_left.min(left);
                     word_bottom = word_bottom.min(bottom);
@@ -908,6 +933,14 @@ unsafe fn search_text_in_pdf_impl(
                     has_word = true;
                 }
                 current_word.push(c);
+                total_height += (top - bottom).abs();
+                total_width += (right - left).abs();
+                char_count_in_page += 1;
+                prev_left = left;
+                prev_right = right;
+                prev_bottom = bottom;
+                prev_top = top;
+                has_prev = true;
             }
         }
 
@@ -934,24 +967,44 @@ unsafe fn search_text_in_pdf_impl(
                     }
                 }
                 if all_match {
-                    // Merge bounding boxes of phrase words
-                    let mut mx_min = f32::MAX;
-                    let mut my_min = f32::MAX;
-                    let mut mx_max = f32::MIN;
-                    let mut my_max = f32::MIN;
-                    let mut merged_text = String::new();
-                    for q_idx in 0..query_words.len() {
-                        let (txt, x_min, y_min, x_max, y_max) = &page_words[start + q_idx];
-                        mx_min = mx_min.min(*x_min);
-                        my_min = my_min.min(*y_min);
-                        mx_max = mx_max.max(*x_max);
-                        my_max = my_max.max(*y_max);
-                        if !merged_text.is_empty() {
-                            merged_text.push(' ');
+                    // All words must be on the same line (vertical overlap)
+                    // page_words stores (text, x_min, y_min, x_max, y_max)
+                    //   y_min = word_bottom = min of char bottoms (smaller PDF y = lower on page)  
+                    //   y_max = word_top   = max of char tops   (larger  PDF y = higher on page)
+                    // PDF coords: y increases upward. Word occupies [y_min, y_max].
+                    // Same line iff y-ranges overlap:
+                    //   y_max1 >= y_min2 AND y_max2 >= y_min1
+                    let on_same_line = (1..query_words.len()).all(|i| {
+                        let (_, _, y_min1, _, y_max1) = &page_words[start + i - 1];
+                        let (_, _, y_min2, _, y_max2) = &page_words[start + i];
+                        y_max1 >= y_min2 && y_max2 >= y_min1
+                    });
+                    if on_same_line {
+                        // Merge bounding boxes of phrase words (same line)
+                        let mut mx_min = f32::MAX;
+                        let mut my_min = f32::MAX;
+                        let mut mx_max = f32::MIN;
+                        let mut my_max = f32::MIN;
+                        let mut merged_text = String::new();
+                        for q_idx in 0..query_words.len() {
+                            let (txt, x_min, y_min, x_max, y_max) = &page_words[start + q_idx];
+                            mx_min = mx_min.min(*x_min);
+                            my_min = my_min.min(*y_min);
+                            mx_max = mx_max.max(*x_max);
+                            my_max = my_max.max(*y_max);
+                            if !merged_text.is_empty() {
+                                merged_text.push(' ');
+                            }
+                            merged_text.push_str(txt);
                         }
-                        merged_text.push_str(txt);
+                        matches.push((page_num, mx_min, my_min, mx_max, my_max, merged_text));
+                    } else {
+                        // Phrase spans multiple lines → emit per-word matches with individual boxes
+                        for q_idx in 0..query_words.len() {
+                            let (txt, x_min, y_min, x_max, y_max) = &page_words[start + q_idx];
+                            matches.push((page_num, *x_min, *y_min, *x_max, *y_max, txt.clone()));
+                        }
                     }
-                    matches.push((page_num, mx_min, my_min, mx_max, my_max, merged_text));
                 }
             }
         } else {

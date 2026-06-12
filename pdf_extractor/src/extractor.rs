@@ -84,6 +84,16 @@ unsafe fn extract_text_and_positions(
             let mut top_max = 0.0f64;
             let mut has_word = false;
             let mut last_char_was_space = true;
+            // Previous character bbox for gap detection
+            let mut prev_left = 0.0f64;
+            let mut prev_right = 0.0f64;
+            let mut prev_bottom = 0.0f64;
+            let mut prev_top = 0.0f64;
+            let mut has_prev = false;
+            // Running average character metrics for relative gap thresholds
+            let mut total_height = 0.0f64;
+            let mut total_width = 0.0f64;
+            let mut char_count_in_page = 0usize;
 
             for i in 0..char_count {
                 let ch = (pdfium.FPDFText_GetUnicode)(text_page, i);
@@ -110,6 +120,7 @@ unsafe fn extract_text_and_positions(
                         });
                         current_word.clear();
                         has_word = false;
+                        has_prev = false;
                     }
                     if !last_char_was_space {
                         text.push(' ');
@@ -138,6 +149,7 @@ unsafe fn extract_text_and_positions(
                         });
                         current_word.clear();
                         has_word = false;
+                        has_prev = false;
                     }
                     if is_newline {
                         text.push('\n');
@@ -146,6 +158,26 @@ unsafe fn extract_text_and_positions(
                     }
                     last_char_was_space = true;
                 } else {
+                    // Gap detection: flush if vertical gap > 0.7×avg_h or horizontal gap magnitude > 1.5×avg_w
+                    if has_word && has_prev && char_count_in_page > 0 {
+                        let avg_h = total_height / char_count_in_page as f64;
+                        let avg_w = total_width / char_count_in_page as f64;
+                        let vert_gap = (bottom - prev_bottom).abs();
+                        let horiz_gap = left - prev_right;
+                        if vert_gap > avg_h * 0.7 || horiz_gap.abs() > avg_w * 1.5 {
+                            let page_num = (page_idx + 1) as u32;
+                            word_positions.push(WordPosition {
+                                page: page_num,
+                                x_min: left_min as f32,
+                                y_min: bottom_min as f32,
+                                x_max: right_max as f32,
+                                y_max: top_max as f32,
+                                text: clean_word_text(&current_word),
+                            });
+                            current_word.clear();
+                            has_word = false;
+                        }
+                    }
                     current_word.push(c);
                     if has_word {
                         left_min = left_min.min(left);
@@ -161,6 +193,14 @@ unsafe fn extract_text_and_positions(
                     }
                     text.push(c);
                     last_char_was_space = false;
+                    total_height += (top - bottom).abs();
+                    total_width += (right - left).abs();
+                    char_count_in_page += 1;
+                    prev_left = left;
+                    prev_right = right;
+                    prev_bottom = bottom;
+                    prev_top = top;
+                    has_prev = true;
                 }
             }
 
