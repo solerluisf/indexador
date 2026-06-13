@@ -172,6 +172,8 @@ public sealed class PdfEngine : IDisposable
 
         var json = Encoding.UTF8.GetString(buf, 0, (int)len);
         var result = JsonSerializer.Deserialize<SearchResponse>(json) ?? new SearchResponse(0, Array.Empty<SearchResult>());
+        if (result.Results is null)
+            result = new SearchResponse(result.Total, Array.Empty<SearchResult>());
         Log($"Search returned: total={result.Total}");
         return result;
     }

@@ -32,7 +32,7 @@ public partial class SearchTab : Page, IPdfRenderingService
     private long _totalHits;
     private string _lastQuery = string.Empty;
     private PdfViewState _state = new();
-    private uint _selectedCollId;
+    private uint? _selectedCollId;
 
     private static void Log(string msg)
     {
@@ -67,7 +67,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         }
         else
         {
-            _selectedCollId = 0;
+            _selectedCollId = null;
             SearchBox.IsEnabled = false;
             SearchButton.IsEnabled = false;
         }
@@ -131,8 +131,18 @@ public partial class SearchTab : Page, IPdfRenderingService
             Log("RunSearch: cancelling previous thumbnail CTS");
             _thumbCts?.Cancel();
             _thumbCts = new CancellationTokenSource();
+            var thumbCt = _thumbCts.Token;
             Log($"RunSearch: starting PreloadThumbnailsAsync with count={Math.Min(viewModels.Count, ThumbnailPreloadCount)}");
-            _ = PreloadThumbnailsAsync(viewModels, ThumbnailPreloadCount, _thumbCts.Token);
+            _ = PreloadThumbnailsAsync(viewModels, ThumbnailPreloadCount, thumbCt)
+                .ContinueWith(t =>
+                {
+                    if (t.Exception is null)
+                        _ = LoadRemainingThumbnailsAsync(viewModels, ThumbnailPreloadCount, thumbCt)
+                            .ContinueWith(t2 => Log($"LoadRemaining faulted: {t2.Exception?.InnerException?.Message}"),
+                                TaskContinuationOptions.OnlyOnFaulted);
+                    else
+                        Log($"PreloadThumbnails faulted: {t.Exception?.InnerException?.Message}");
+                }, TaskContinuationOptions.NotOnCanceled);
 
             var totalPages = _totalHits > 0 ? (int)System.Math.Ceiling(_totalHits / 1000.0) : 0;
             PageInfo.Content = $"{_currentPage + 1} / {totalPages}";
@@ -201,6 +211,45 @@ public partial class SearchTab : Page, IPdfRenderingService
         });
 
         Log("PreloadThumbnailsAsync END");
+    }
+
+    private async Task LoadRemainingThumbnailsAsync(List<SearchResultViewModel> items, int skipCount, CancellationToken ct)
+    {
+        var remaining = items.Skip(skipCount).ToList();
+        Log($"LoadRemainingThumbnailsAsync START: {remaining.Count} items to load (skipped first {skipCount})");
+
+        foreach (var vm in remaining)
+        {
+            if (ct.IsCancellationRequested) break;
+            if (vm.Thumbnail is not null) continue;
+
+            try
+            {
+                var raw = await _thumbService.GetThumbnailAsync(vm.Path, ct);
+                if (raw is null || ct.IsCancellationRequested) continue;
+
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    if (ResultsList.ItemsSource is not System.Collections.IList list) return;
+                    if (!list.Contains(vm)) return;
+
+                    var bmp = BitmapSource.Create(
+                        raw.Width, raw.Height, 96, 96,
+                        PixelFormats.Bgra32, null, raw.Pixels, raw.Stride);
+                    bmp.Freeze();
+                    vm.Thumbnail = bmp;
+                });
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
+            {
+                Log($"LoadRemainingThumbnailsAsync error for '{vm.FileName}': {ex.Message}");
+            }
+        }
+
+        Log("LoadRemainingThumbnailsAsync END");
     }
 
     private async void OnNextPage(object sender, RoutedEventArgs e)
