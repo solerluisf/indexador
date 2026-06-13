@@ -39,6 +39,7 @@ const BATCH_SIZE: i64 = 30;
 const DEFAULT_INDEXER_BATCH_SIZE: usize = 500;
 const DEFAULT_COMMIT_INTERVAL: u64 = 50000;
 const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 30;
+const RESERVOIR_FACTOR: usize = 4;
 
 pub struct PipelineConfig {
     pub num_extract_workers: Option<usize>,
@@ -122,6 +123,11 @@ impl PipelineConfig {
             .map(|v| std::cmp::max(1, v))
             .unwrap_or_else(|| num_cpus::get())
     }
+
+    pub fn reservoir_size(&self) -> usize {
+        let nw = self.extract_workers();
+        std::cmp::min(200, nw * RESERVOIR_FACTOR)
+    }
 }
 
 struct ExtractorTask {
@@ -185,50 +191,120 @@ pub fn run_pipeline(
     let indexer_threads = config.indexer_threads();
 
 
-    // Producer: claim pending jobs from DB and distribute them round-robin
-    // across workers sorted by file size descending.  This ensures the
-    // largest PDFs are spread evenly so no worker is stuck with all the
-    // stragglers while others sit idle.
+    // Producer: claim pending jobs from DB, distribute via heap-greedy
+    // to balance total MB across workers, and keep a bounded reservoir
+    // of extra docs for the next claim round.
     let producer_jobs = Arc::clone(&jobs);
     let producer_metrics = Arc::clone(&metrics);
     let producer_cancel = config.cancel_flag.clone();
+    let r_size = config.reservoir_size() as i64;
     let producer_handle = {
         thread::spawn(move || {
+            let mut reserved: Vec<(i64, String, String, i64)> = Vec::new();
+
             loop {
                 if producer_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
                     break;
                 }
-                // Claim a larger pool so we can sort and distribute evenly
-                let claim_size = num_workers as i64 * BATCH_SIZE;
-                match producer_jobs.claim_pending(claim_size) {
-                    Ok(batch) => {
-                        if batch.is_empty() {
-                            break;
+
+                // 1. Drain reserved docs from previous claim round first
+                let mut claim_size = num_workers as i64 * BATCH_SIZE;
+                let mut all: Vec<(i64, String, String, i64)>;
+
+                if !reserved.is_empty() {
+                    let take = std::cmp::min(claim_size, reserved.len() as i64) as usize;
+                    all = reserved.drain(..take).collect();
+                    claim_size -= all.len() as i64;
+                } else {
+                    all = Vec::new();
+                }
+
+                // 2. Extended claim from DB if we still need docs
+                if claim_size > 0 {
+                    match producer_jobs.claim_pending(claim_size + r_size) {
+                        Ok(batch) => {
+                            all.extend(batch);
                         }
-
-                        // Sort by file_size descending — largest files assigned first
-                        let mut batch = batch;
-                        batch.sort_by(|a, b| b.3.cmp(&a.3));
-
-                        // Distribute round-robin across workers
-                        let mut worker_batches: Vec<Vec<ExtractorTask>> =
-                            (0..num_workers).map(|_| Vec::new()).collect();
-                        for (i, (id, path, checksum, _size)) in batch.into_iter().enumerate() {
-                            worker_batches[i % num_workers]
-                                .push(ExtractorTask { id, path, checksum });
-                        }
-
-                        for tasks in worker_batches {
-                            if !tasks.is_empty() {
-                                producer_metrics.set_task_queue_depth(task_tx.len() as u64);
-                                if task_tx.send(tasks).is_err() {
-                                    return;
-                                }
+                        Err(_e) => {
+                            if all.is_empty() {
+                                break;
                             }
                         }
                     }
-                    Err(_e) => {
-                        break;
+                }
+
+                if all.is_empty() {
+                    break;
+                }
+
+                // 3. Sort descending by file_size — largest files first
+                all.sort_by(|a, b| b.3.cmp(&a.3));
+
+                // 4. Heap-greedy distribution across workers
+                let target = num_workers * BATCH_SIZE as usize;
+                let distribute_end = std::cmp::min(target, all.len());
+
+                let mut worker_batches: Vec<Vec<ExtractorTask>> =
+                    (0..num_workers).map(|_| Vec::new()).collect();
+
+                #[derive(Clone, Eq, PartialEq)]
+                struct HeapEntry {
+                    total_mb: i64,
+                    count: usize,
+                    worker_idx: usize,
+                }
+                impl Ord for HeapEntry {
+                    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                        other
+                            .total_mb
+                            .cmp(&self.total_mb)
+                            .then(other.count.cmp(&self.count))
+                    }
+                }
+                impl PartialOrd for HeapEntry {
+                    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                        Some(self.cmp(other))
+                    }
+                }
+
+                let mut heap: std::collections::BinaryHeap<HeapEntry> =
+                    std::collections::BinaryHeap::new();
+                for i in 0..num_workers {
+                    heap.push(HeapEntry {
+                        total_mb: 0,
+                        count: 0,
+                        worker_idx: i,
+                    });
+                }
+
+                for &(id, ref path, ref checksum, size) in &all[..distribute_end] {
+                    let mut entry = loop {
+                        let e = heap.pop().expect("heap should not be empty");
+                        if e.count < BATCH_SIZE as usize {
+                            break e;
+                        }
+                    };
+
+                    worker_batches[entry.worker_idx].push(ExtractorTask {
+                        id,
+                        path: path.clone(),
+                        checksum: checksum.clone(),
+                    });
+                    entry.total_mb += size;
+                    entry.count += 1;
+                    heap.push(entry);
+                }
+
+                // 5. Store leftover docs as reserved (already status='extracting')
+                reserved.extend(all.into_iter().skip(distribute_end));
+
+                // 6. Send batches through channel (backpressure: blocks if channel full)
+                for tasks in worker_batches {
+                    if !tasks.is_empty() {
+                        producer_metrics.set_task_queue_depth(task_tx.len() as u64);
+                        if task_tx.send(tasks).is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -2378,5 +2454,128 @@ mod tests {
         assert!(wo.text.is_empty(), "text should be empty, got: {}", wo.text);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // --- Heap greedy distribution ---
+
+    /// Simulates the heap-greedy distribution logic used in the producer thread.
+    /// Returns per-worker total MB and per-worker doc count.
+    fn simulate_heap_distribution(
+        docs: &[(i64, i64)], // (id, file_size_mb)
+        num_workers: usize,
+        batch_cap: usize,
+    ) -> Vec<(i64, usize)> {
+        let mut sorted = docs.to_vec();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Cap at num_workers * batch_cap (matches real pipeline logic)
+        let target = num_workers * batch_cap;
+        let n = std::cmp::min(target, sorted.len());
+
+        let mut worker_mb: Vec<i64> = vec![0; num_workers];
+        let mut worker_count: Vec<usize> = vec![0; num_workers];
+
+        #[derive(Clone, Eq, PartialEq)]
+        struct Entry {
+            total_mb: i64,
+            count: usize,
+            idx: usize,
+        }
+        impl Ord for Entry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other.total_mb.cmp(&self.total_mb).then(other.count.cmp(&self.count))
+            }
+        }
+        impl PartialOrd for Entry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut heap: std::collections::BinaryHeap<Entry> = std::collections::BinaryHeap::new();
+        for i in 0..num_workers {
+            heap.push(Entry { total_mb: 0, count: 0, idx: i });
+        }
+
+        for &(_id, size) in &sorted[..n] {
+            let mut entry = loop {
+                let e = heap.pop().unwrap();
+                if e.count < batch_cap { break e; }
+            };
+            worker_mb[entry.idx] += size;
+            worker_count[entry.idx] += 1;
+            entry.total_mb += size;
+            entry.count += 1;
+            heap.push(entry);
+        }
+
+        worker_mb.into_iter().zip(worker_count.into_iter()).collect()
+    }
+
+    #[test]
+    fn test_heap_distribution_balances_mb() {
+        // 4 workers, docs: [100, 80, 60, 40, 20, 10] MB
+        // Heap greedy assigns: W0=100, W1=80, W2=60+10=70, W3=40+20=60
+        // Round-robin would give: W0=100+40=140, W1=80+20=100, W2=60+10=70, W3=0
+        // Heap greedy spread = 100-60 = 40 vs round-robin = 140-0 = 140
+        let docs: Vec<(i64, i64)> = vec![
+            (1, 100), (2, 80), (3, 60), (4, 40), (5, 20), (6, 10),
+        ];
+        let result = simulate_heap_distribution(&docs, 4, 30);
+        let max_mb = result.iter().map(|(mb, _)| *mb).max().unwrap();
+        let min_mb = result.iter().map(|(mb, _)| *mb).filter(|x| *x > 0).min().unwrap();
+        // Heap greedy should never produce a worse spread than round-robin (140)
+        // With 6 docs across 4 workers, max spread is bounded by the largest doc
+        assert!(max_mb - min_mb <= 100, "spread worse than largest doc: max={} min={} delta={}", max_mb, min_mb, max_mb - min_mb);
+        // Every worker should have at least 1 doc (6 docs, 4 workers)
+        assert!(result.iter().all(|(_, c)| *c >= 1), "all workers should have at least 1 doc");
+    }
+
+    #[test]
+    fn test_heap_distribution_respects_batch_cap() {
+        // 2 workers, 70 docs of 1 MB each, cap=30
+        // Should fill W0=30, W1=30, leftover=10
+        let docs: Vec<(i64, i64)> = (1..=70).map(|i| (i, 1)).collect();
+        let result = simulate_heap_distribution(&docs, 2, 30);
+        let total: usize = result.iter().map(|(_, c)| *c).sum();
+        assert_eq!(total, 60, "should assign exactly 60 docs (2 workers × 30 cap)");
+        for (mb, count) in &result {
+            assert!(*count <= 30, "worker exceeded batch cap: count={}", count);
+            assert_eq!(*mb, *count as i64, "each doc is 1 MB");
+        }
+    }
+
+    #[test]
+    fn test_heap_distribution_single_worker() {
+        let docs: Vec<(i64, i64)> = vec![(1, 50), (2, 30), (3, 20)];
+        let result = simulate_heap_distribution(&docs, 1, 30);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 100); // total MB
+        assert_eq!(result[0].1, 3);   // doc count
+    }
+
+    #[test]
+    fn test_heap_distribution_more_docs_than_cap() {
+        // 2 workers, cap=30, 100 docs → only 60 assigned
+        let docs: Vec<(i64, i64)> = (1..=100).map(|i| (i, 1)).collect();
+        let result = simulate_heap_distribution(&docs, 2, 30);
+        let total: usize = result.iter().map(|(_, c)| *c).sum();
+        assert_eq!(total, 60);
+    }
+
+    #[test]
+    fn test_reservoir_size_default() {
+        let cfg = PipelineConfig::default();
+        let workers = cfg.extract_workers();
+        assert_eq!(cfg.reservoir_size(), std::cmp::min(200, workers * RESERVOIR_FACTOR));
+    }
+
+    #[test]
+    fn test_reservoir_size_capped_at_200() {
+        let cfg = PipelineConfig {
+            num_extract_workers: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(cfg.reservoir_size(), 200);
     }
 }

@@ -913,24 +913,22 @@ impl Indexer {
 /// be derived from these positions so they align with Tantivy's term positions.
 pub fn tokenize_with_math(text: &str) -> Vec<(usize, String)> {
     use tantivy::tokenizer::RegexTokenizer;
-    static TOKENIZER: std::sync::OnceLock<std::sync::Mutex<RegexTokenizer>> =
-        std::sync::OnceLock::new();
-    let mut tokenizer = TOKENIZER
-        .get_or_init(|| {
-            std::sync::Mutex::new(
-                RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
-                    .expect("Hardcoded regex pattern should never fail"),
-            )
-        })
-        .lock()
-        .expect("RegexTokenizer mutex poisoned");
-    let mut stream = tokenizer.token_stream(text);
-    let mut tokens = Vec::new();
-    while stream.advance() {
-        let t = stream.token();
-        tokens.push((t.position as usize, t.text.to_lowercase()));
+    thread_local! {
+        static TOKENIZER: std::cell::RefCell<RegexTokenizer> = std::cell::RefCell::new(
+            RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
+                .expect("Hardcoded regex pattern should never fail"),
+        );
     }
-    tokens
+    TOKENIZER.with(|tokenizer| {
+        let mut tokenizer = tokenizer.borrow_mut();
+        let mut stream = tokenizer.token_stream(text);
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            let t = stream.token();
+            tokens.push((t.position as usize, t.text.to_lowercase()));
+        }
+        tokens
+    })
 }
 
 /// Align WordPosition offsets to Tantivy token positions so SQLite

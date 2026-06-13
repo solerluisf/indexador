@@ -215,7 +215,7 @@ impl JobStore {
 
         let rows: Vec<(i64, String, String, i64)> = {
             let mut select = tx
-                .prepare("SELECT id, path, checksum, COALESCE(file_size, 0) FROM jobs WHERE status = 'pending' LIMIT ?1")
+                .prepare("SELECT id, path, checksum, COALESCE(file_size, 0) FROM jobs WHERE status = 'pending' ORDER BY file_size DESC LIMIT ?1")
                 .context("Failed to prepare claim select")?;
 
             let r = select
