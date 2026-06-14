@@ -936,35 +936,36 @@ pub fn tokenize_with_math(text: &str) -> Vec<(usize, String)> {
 }
 
 /// Walk WordPositions in document order and assign consecutive token positions.
-/// Each WP can produce multiple entries if its text contains multiple segments
-/// (e.g. "state of the art" → 4 entries, all pointing to the same WP).
+/// Each WP now contains exactly one token (no spaces in the text), so the
+/// alignment is 1:1 — one position entry per WordPosition.
 ///
 /// This is O(N) lockstep alignment. The `text` parameter is kept only for a
 /// `debug_assert_eq!` sanity check that fires when Tantivy token count diverges
-/// from WP segment count.
+/// from WP count.
 pub fn align_offsets_to_tantivy(
     text: &str,
     word_positions: &[crate::extractor::WordPosition],
 ) -> Vec<(usize, crate::extractor::WordPosition)> {
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(word_positions.len());
     let mut pos = 0usize;
 
     for wp in word_positions {
-        for seg in wp.text.split(' ').filter(|s| !s.is_empty()) {
-            result.push((pos, wp.clone()));
-            pos += 1;
+        if wp.text.is_empty() {
+            continue;
         }
+        result.push((pos, wp.clone()));
+        pos += 1;
     }
 
-    // Freno de mano: log de advertencia si el conteo de segmentos de WPs no
-    // coincide con los tokens de Tantivy. Solo en debug (cero overhead en release).
+    // Freno de mano: log de advertencia si el conteo de WPs no coincide con
+    // los tokens de Tantivy. Solo en debug (cero overhead en release).
     #[cfg(debug_assertions)]
     {
         let tantivy_count = tokenize_with_math(text).len();
         if tantivy_count != pos {
             eprintln!(
-                "[LOCKSTEP] WARNING: Tantivy token count ({}) != WP segment count ({}). \
-                 Tokenizer drift detected — update TOKEN_PATTERN or clean_word_text logic.",
+                "[LOCKSTEP] WARNING: Tantivy token count ({}) != WP count ({}). \
+                 Tokenizer drift detected — update TOKEN_PATTERN or extraction logic.",
                 tantivy_count, pos,
             );
         }
@@ -2940,33 +2941,25 @@ fn test_search_fuzzy_with_path_filter() {
     }
 
     #[test]
-    fn test_align_offsets_to_tantivy_multi_segment_wp() {
-        // Una WP con texto multi-segmento (e.g. "state of the art") produce
-        // multiples entries, todas apuntando a la misma WP.
+    fn test_align_offsets_to_tantivy_single_token_wp() {
+        // Cada WP ahora tiene exactamente un token (sin espacios).
+        // La alineación es 1:1.
         let wp = vec![
             crate::extractor::WordPosition {
-                page: 1, x_min: 0.0, y_min: 0.0, x_max: 50.0, y_max: 10.0,
-                text: "state of the art".to_string(),
+                page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "hello".to_string(),
             },
             crate::extractor::WordPosition {
-                page: 1, x_min: 0.0, y_min: 10.0, x_max: 20.0, y_max: 20.0,
-                text: "foo".to_string(),
+                page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
+                text: "world".to_string(),
             },
         ];
-        let aligned = align_offsets_to_tantivy("state of the art foo", &wp);
-        assert_eq!(aligned.len(), 5);
-        // state@0, of@1, the@2, art@3 → mismas WP, diferentes posiciones
+        let aligned = align_offsets_to_tantivy("hello world", &wp);
+        assert_eq!(aligned.len(), 2);
         assert_eq!(aligned[0].0, 0);
-        assert_eq!(aligned[0].1.text, "state of the art");
+        assert_eq!(aligned[0].1.text, "hello");
         assert_eq!(aligned[1].0, 1);
-        assert_eq!(aligned[1].1.text, "state of the art");
-        assert_eq!(aligned[2].0, 2);
-        assert_eq!(aligned[2].1.text, "state of the art");
-        assert_eq!(aligned[3].0, 3);
-        assert_eq!(aligned[3].1.text, "state of the art");
-        // foo@4 → WP independiente
-        assert_eq!(aligned[4].0, 4);
-        assert_eq!(aligned[4].1.text, "foo");
+        assert_eq!(aligned[1].1.text, "world");
     }
 
     // ── Regression: tokenize_with_math caches TextAnalyzer (OnceLock<Mutex<>>) ──

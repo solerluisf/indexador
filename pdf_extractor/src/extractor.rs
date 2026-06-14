@@ -17,6 +17,7 @@ pub fn clean_word_text(s: &str) -> String {
 
 /// A word's bounding box on a single PDF page.
 /// Coordinates are in PDF user space (origin bottom-left, units in points, 1/72 inch).
+/// `text` is always a single token (no spaces) after extraction.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WordPosition {
     pub page: u32,
@@ -25,6 +26,49 @@ pub struct WordPosition {
     pub x_max: f32,
     pub y_max: f32,
     pub text: String,
+}
+
+/// Per-character bounding box in PDF user space.
+#[derive(Debug, Clone, Copy)]
+struct CharPosition {
+    left: f32,
+    bottom: f32,
+    right: f32,
+    top: f32,
+}
+
+/// Split a word into individual token segments based on TOKEN_PATTERN,
+/// computing each segment's exact bounding box from per-character positions.
+/// Returns one WordPosition per segment (no spaces in any text field).
+fn split_word_into_segments(
+    raw_word: &str,
+    char_positions: &[CharPosition],
+    page: u32,
+) -> Vec<WordPosition> {
+    static INIT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = INIT.get_or_init(|| Regex::new(TOKEN_PATTERN).unwrap());
+
+    let matches: Vec<_> = re.find_iter(raw_word).collect();
+    if matches.is_empty() {
+        return Vec::new();
+    }
+
+    matches
+        .into_iter()
+        .map(|m| {
+            let char_start = raw_word[..m.start()].chars().count();
+            let char_end = char_start + m.as_str().chars().count();
+            let positions = &char_positions[char_start..char_end];
+            WordPosition {
+                page,
+                x_min: positions.iter().map(|c| c.left).reduce(f32::min).unwrap_or(0.0),
+                y_min: positions.iter().map(|c| c.bottom).reduce(f32::min).unwrap_or(0.0),
+                x_max: positions.iter().map(|c| c.right).reduce(f32::max).unwrap_or(0.0),
+                y_max: positions.iter().map(|c| c.top).reduce(f32::max).unwrap_or(0.0),
+                text: m.as_str().to_string(),
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -75,10 +119,7 @@ unsafe fn extract_text_and_positions(
             let start_pos = word_positions.len();
             let char_count = (pdfium.FPDFText_CountChars)(text_page);
             let mut current_word = String::new();
-            let mut left_min = 0.0f64;
-            let mut bottom_min = 0.0f64;
-            let mut right_max = 0.0f64;
-            let mut top_max = 0.0f64;
+            let mut current_char_positions: Vec<CharPosition> = Vec::new();
             let mut has_word = false;
             let mut last_char_was_space = true;
             // Previous character bbox for gap detection
@@ -107,15 +148,10 @@ unsafe fn extract_text_and_positions(
                 if ch == 0 || !bbox_ok {
                     if has_word {
                         let page_num = (page_idx + 1) as u32;
-                        word_positions.push(WordPosition {
-                            page: page_num,
-                            x_min: left_min as f32,
-                            y_min: bottom_min as f32,
-                            x_max: right_max as f32,
-                            y_max: top_max as f32,
-                            text: clean_word_text(&current_word),
-                        });
+                        word_positions
+                            .extend(split_word_into_segments(&current_word, &current_char_positions, page_num));
                         current_word.clear();
+                        current_char_positions.clear();
                         has_word = false;
                         has_prev = false;
                     }
@@ -136,15 +172,10 @@ unsafe fn extract_text_and_positions(
                 if c.is_whitespace() || is_newline {
                     if has_word {
                         let page_num = (page_idx + 1) as u32;
-                        word_positions.push(WordPosition {
-                            page: page_num,
-                            x_min: left_min as f32,
-                            y_min: bottom_min as f32,
-                            x_max: right_max as f32,
-                            y_max: top_max as f32,
-                            text: clean_word_text(&current_word),
-                        });
+                        word_positions
+                            .extend(split_word_into_segments(&current_word, &current_char_positions, page_num));
                         current_word.clear();
+                        current_char_positions.clear();
                         has_word = false;
                         has_prev = false;
                     }
@@ -163,30 +194,23 @@ unsafe fn extract_text_and_positions(
                         let horiz_gap = left - prev_right;
                         if vert_gap > avg_h * 0.7 || horiz_gap.abs() > avg_w * 1.5 {
                             let page_num = (page_idx + 1) as u32;
-                            word_positions.push(WordPosition {
-                                page: page_num,
-                                x_min: left_min as f32,
-                                y_min: bottom_min as f32,
-                                x_max: right_max as f32,
-                                y_max: top_max as f32,
-                                text: clean_word_text(&current_word),
-                            });
+                            word_positions.extend(
+                                split_word_into_segments(&current_word, &current_char_positions, page_num),
+                            );
                             current_word.clear();
+                            current_char_positions.clear();
                             has_word = false;
                             text.push(' ');
                         }
                     }
                     current_word.push(c);
-                    if has_word {
-                        left_min = left_min.min(left);
-                        bottom_min = bottom_min.min(bottom);
-                        right_max = right_max.max(right);
-                        top_max = top_max.max(top);
-                    } else {
-                        left_min = left;
-                        bottom_min = bottom;
-                        right_max = right;
-                        top_max = top;
+                    current_char_positions.push(CharPosition {
+                        left: left as f32,
+                        bottom: bottom as f32,
+                        right: right as f32,
+                        top: top as f32,
+                    });
+                    if !has_word {
                         has_word = true;
                     }
                     text.push(c);
@@ -204,14 +228,8 @@ unsafe fn extract_text_and_positions(
 
             if has_word {
                 let page_num = (page_idx + 1) as u32;
-                word_positions.push(WordPosition {
-                    page: page_num,
-                    x_min: left_min as f32,
-                    y_min: bottom_min as f32,
-                    x_max: right_max as f32,
-                    y_max: top_max as f32,
-                    text: clean_word_text(&current_word),
-                });
+                word_positions
+                    .extend(split_word_into_segments(&current_word, &current_char_positions, page_num));
                 text.push(' ');
             }
 
