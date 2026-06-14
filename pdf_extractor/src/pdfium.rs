@@ -295,7 +295,10 @@ impl PageGeometry {
     /// Convert a PDF user-space point (bottom-left, unrotated) to stored
     /// coordinates (top-left, unrotated) — this is what extractor stores.
     pub fn pdf_to_stored(&self, x: f64, y: f64) -> (f64, f64) {
-        (x, self.unrotated_height() - y)
+        match self.crop_rect {
+            Some(cr) => (x - cr.left as f64, cr.top as f64 - y),
+            None => (x, self.unrotated_height() - y),
+        }
     }
 
     /// Convert stored coordinates (top-left, unrotated) back to PDF user space
