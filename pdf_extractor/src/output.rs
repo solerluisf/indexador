@@ -1,8 +1,9 @@
 use anyhow::Result;
 use serde::Serialize;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[derive(Debug, Serialize)]
@@ -20,9 +21,20 @@ pub struct DocumentRecord {
     pub page_count: u32,
 }
 
+/// Buffered JSONL writer with periodic fsync.
+///
+/// Writes are buffered in a `BufWriter` for performance; the caller
+/// should call `flush()` periodically (e.g. every N records and at
+/// shutdown) to guarantee durability.  On `Drop` the buffer is also
+/// flushed and fsynced so a graceful shutdown always persists all data.
+///
+/// Crash safety: at most the last buffered-but-not-yet-fsynced batch
+/// of records may be lost.  Because each record is written as a
+/// complete JSON line, a partially-written trailing line is never
+/// produced — the `BufWriter` either flushes a full buffer or nothing.
 pub struct JsonlWriter {
-    file: Mutex<Box<dyn Write + Send>>,
-    count: Mutex<u64>,
+    inner: Mutex<BufWriter<File>>,
+    count: AtomicU64,
 }
 
 impl JsonlWriter {
@@ -30,27 +42,64 @@ impl JsonlWriter {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
-            .map(|f| Box::new(f) as Box<dyn Write + Send>)?;
+            .open(path)?;
 
         Ok(Self {
-            file: Mutex::new(file),
-            count: Mutex::new(0),
+            inner: Mutex::new(BufWriter::new(file)),
+            count: AtomicU64::new(0),
         })
     }
 
+    /// Append one record as a JSON line.
+    /// The line is buffered in memory; call `flush()` to persist.
+    /// Auto-flushes every 500 records to bound crash data loss.
     pub fn write_record(&self, record: &DocumentRecord) -> Result<()> {
         let json = serde_json::to_string(record)?;
-        let mut file = self.file.lock().unwrap();
-        writeln!(file, "{}", json)?;
-        let mut count = self.count.lock().unwrap();
-        *count += 1;
+        let mut inner = self.inner.lock().unwrap();
+        writeln!(inner, "{}", json)?;
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % 500 == 0 {
+            inner.flush()?;
+            inner.get_ref().sync_all()?;
+        }
         Ok(())
     }
 
-    #[allow(dead_code)]
+    /// Write pre-serialized JSON bytes (must include trailing newline).
+    /// Lock is held only for the BufWriter write, making this suitable
+    /// for use from a dedicated writer thread.
+    pub fn write_json_bytes(&self, json_bytes: &[u8]) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.write_all(json_bytes)?;
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % 500 == 0 {
+            inner.flush()?;
+            inner.get_ref().sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Flush the buffer and fsync the underlying file.
+    /// Call periodically (every N records, or at pipeline end)
+    /// to bound the window of lost data on crash.
+    pub fn flush(&self) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.flush()?;
+        inner.get_ref().sync_all()?;
+        Ok(())
+    }
+
     pub fn count(&self) -> u64 {
-        *self.count.lock().unwrap()
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for JsonlWriter {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let _ = inner.flush();
+            let _ = inner.get_ref().sync_all();
+        }
     }
 }
 
@@ -122,6 +171,7 @@ mod tests {
     #[test]
     fn test_jsonl_writer_writes_records() {
         let dir = temp_dir().join("pdf_extractor_test_jsonl");
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.jsonl");
 
@@ -137,6 +187,8 @@ mod tests {
             page_count: 0,
         };
         writer.write_record(&record).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
 
         let mut content = String::new();
         fs::File::open(&path).unwrap().read_to_string(&mut content).unwrap();
@@ -149,6 +201,8 @@ mod tests {
     #[test]
     fn test_jsonl_writer_appends() {
         let dir = temp_dir().join("pdf_extractor_test_append");
+        // Clean slate from any previous failed run
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.jsonl");
 
@@ -167,10 +221,13 @@ mod tests {
             file_extraction_ms: 0,
             page_count: 0,
         }).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
 
         let mut content = String::new();
         fs::File::open(&path).unwrap().read_to_string(&mut content).unwrap();
-        assert_eq!(content.lines().count(), 2);
+        let line_count = content.lines().count();
+        assert_eq!(line_count, 2, "Expected 2 lines, got {}. Content:\n{}", line_count, content);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -178,6 +235,7 @@ mod tests {
     #[test]
     fn test_jsonl_writer_count() {
         let dir = temp_dir().join("pdf_extractor_test_count");
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.jsonl");
 
@@ -211,6 +269,7 @@ mod tests {
     #[test]
     fn test_jsonl_writer_write_large_text() {
         let dir = temp_dir().join("pdf_extractor_test_large");
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.jsonl");
 
@@ -226,6 +285,8 @@ mod tests {
             page_count: 0,
         };
         writer.write_record(&record).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
 
         let mut content = String::new();
         fs::File::open(&path).unwrap().read_to_string(&mut content).unwrap();

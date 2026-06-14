@@ -27,7 +27,29 @@ use crate::metrics::Metrics;
 use crate::ocr;
 use crate::output::{DocumentRecord, JsonlWriter};
 use crate::scanner::{scan_directory, JobStore};
-use crate::worker_ipc::WorkerFrame;
+use crate::worker_ipc::{frame_crc32, WorkerFrame};
+
+/// Dedicated rayon thread pool for token alignment in the indexer.
+///
+/// Alignment (`align_offsets_to_tantivy`) is CPU-intensive and runs on the
+/// full batch via `par_iter()`.  Using a small dedicated pool prevents these
+/// parallel tasks from saturating all cores and starving other pipeline
+/// components (producer, IPC reader, writer).  The pool size is capped at 4
+/// threads — alignment is memory-bound (large text buffers + word positions)
+/// so beyond 4 threads the gains are marginal while the memory pressure grows
+/// linearly.
+static ALIGN_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+fn align_pool() -> &'static rayon::ThreadPool {
+    ALIGN_POOL.get_or_init(|| {
+        let threads = std::cmp::min(std::cmp::max(1, num_cpus::get() / 2), 4);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("align-{}", i))
+            .build()
+            .expect("Failed to create alignment thread pool")
+    })
+}
 
 // Channel capacity for DocumentRecord queues.  Each record carries the full
 // extracted text (up to several MB for large PDFs), so a small default bounds
@@ -157,7 +179,7 @@ where
 
 pub fn run_pipeline(
     jobs: Arc<JobStore>,
-    writer: &JsonlWriter,
+    writer: Arc<JsonlWriter>,
     metrics: Arc<Metrics>,
     input: &PathBuf,
     indexer: Option<Arc<Indexer>>,
@@ -344,6 +366,9 @@ pub fn run_pipeline(
     let (index_tx, index_rx) = bounded::<DocumentRecord>(cap);
     let may_index = indexer.is_some();
 
+    // JSONL channel: pre-serialized bytes sent to a dedicated writer thread
+    let (jsonl_tx, jsonl_rx) = bounded::<Vec<u8>>(cap);
+
     let indexer_handle = match indexer {
         Some(ref idx) => {
             let idx = Arc::clone(idx);
@@ -360,11 +385,26 @@ pub fn run_pipeline(
         None => None,
     };
 
+    // Dedicated JSONL writer thread — decouples I/O from consumer loop
+    let jsonl_writer = Arc::clone(&writer);
+    let writer_thread = thread::Builder::new()
+        .name("jsonl-writer".into())
+        .spawn(move || {
+            for json_bytes in &jsonl_rx {
+                if let Err(e) = jsonl_writer.write_json_bytes(&json_bytes) {
+                    log_msg(log_cb, &format!("[jsonl-writer] write failed: {}", e));
+                    break;
+                }
+            }
+            let _ = jsonl_writer.flush();
+        })
+        .expect("Failed to spawn writer thread");
+
     let total_pending = pending as u64;
     let progress_cb = &config.progress_cb;
     let cancel_flag = config.cancel_flag.clone();
 
-    // Writer: consume results and persist
+    // Consumer: receive results, serialize JSON, forward to writer + indexer
     let is_cancelled = move || cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed));
 
     // Throttle progress callback to at most once per 500 docs to reduce FFI overhead.
@@ -379,11 +419,19 @@ pub fn run_pipeline(
             let record = $record;
             metrics.set_result_queue_depth(result_rx.len() as u64);
             let write_start = Instant::now();
-            if let Err(e) = writer.write_record(&record) {
-                jobs.mark_error(record.id, &format!("write failed: {}", e))
-                    .ok();
-                metrics.increment_errored();
-                continue;
+            let mut json_bytes = match serde_json::to_vec(&record) {
+                Ok(j) => j,
+                Err(e) => {
+                    jobs.mark_error(record.id, &format!("json serialize failed: {}", e))
+                        .ok();
+                    metrics.increment_errored();
+                    continue;
+                }
+            };
+            json_bytes.push(b'\n');
+            if jsonl_tx.send(json_bytes).is_err() {
+                log_msg(log_cb, "[pipeline] jsonl-writer channel disconnected");
+                break;
             }
             writer_jsonl_time += write_start.elapsed();
             writer_docs += 1;
@@ -422,18 +470,12 @@ pub fn run_pipeline(
     // Phase 1: normal blocking receive, check cancel between records
     for record in &result_rx {
         if is_cancelled() {
-
             break;
         }
         process_record!(record);
     }
 
     // Phase 2: drain any records still in-flight from workers
-    //
-    // Workers may have already extracted PDFs and pushed to result_tx
-    // before the producer stopped.  Drain non-blocking until the channel
-    // is empty, then join workers and drain one last time in case a
-    // worker snuck one more in during the drain.
     if is_cancelled() {
         loop {
             match result_rx.try_recv() {
@@ -443,7 +485,6 @@ pub fn run_pipeline(
             }
         }
 
-        // Let workers finish their current extraction, then drain again
         for h in worker_handles {
             h.join().expect("Worker panicked");
         }
@@ -462,15 +503,22 @@ pub fn run_pipeline(
     }
 
     drop(index_tx);
+    drop(jsonl_tx);
 
     producer_handle.join().expect("Producer panicked");
+    writer_thread.join().expect("Writer panicked");
     if let Some(h) = indexer_handle {
         h.join().expect("Indexer panicked");
     }
 
+    log_msg(log_cb, &format!(
+        "[timing] writer: {:.3}s total, {:.3}s in JSONL serialize, {} docs",
+        writer_start.elapsed().as_secs_f64(),
+        writer_jsonl_time.as_secs_f64(),
+        writer_docs,
+    ));
+
     // Reset any tasks still in 'extracting' back to 'pending'.
-    // These are PDFs the worker did not get to process before crashing.
-    // Must run before the indexer-failed bail so stuck jobs are recoverable.
     jobs.reprocess_extracting()?;
 
     log_msg(log_cb, &format!(
@@ -642,15 +690,21 @@ fn flush_batch(
         }
     }
 
-    // Phase 1b: align offsets in parallel (each doc is independent).
+    // Phase 1b: align offsets in parallel using a dedicated small thread-pool.
+    // Using the global rayon pool here could starve other pipeline components
+    // (producer, IPC reader, writer) on large batches.  The ALIGN_POOL is
+    // capped to at most 4 threads, balancing throughput vs memory pressure.
     let align_start = Instant::now();
-    let positions_to_store: Vec<(i64, Vec<(usize, crate::extractor::WordPosition)>)> = pending_align
-        .par_iter()
-        .filter_map(|&(id, text, wps)| {
-            let aligned = align_offsets_to_tantivy(text, wps);
-            if aligned.is_empty() { None } else { Some((id, aligned)) }
-        })
-        .collect();
+    let positions_to_store: Vec<(i64, Vec<(usize, crate::extractor::WordPosition)>)> = align_pool()
+        .install(|| {
+            pending_align
+                .par_iter()
+                .filter_map(|&(id, text, wps)| {
+                    let aligned = align_offsets_to_tantivy(text, wps);
+                    if aligned.is_empty() { None } else { Some((id, aligned)) }
+                })
+                .collect()
+        });
     done_ids.extend(pending_done);
     align_time += align_start.elapsed();
 
@@ -1083,12 +1137,24 @@ fn collect_batch(
 }
 
 /// Read one length-prefixed bincode WorkerFrame from a buffered reader.
+/// Wire format: [4 bytes data_len][data_len bytes bincode][4 bytes CRC32]
+/// CRC is validated after deserialization; mismatches are reported as InvalidData.
 fn read_frame<R: io::Read>(reader: &mut io::BufReader<R>) -> io::Result<WorkerFrame> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     let mut data = vec![0u8; len];
     reader.read_exact(&mut data)?;
+    let mut crc_buf = [0u8; 4];
+    reader.read_exact(&mut crc_buf)?;
+    let expected_crc = u32::from_le_bytes(crc_buf);
+    let actual_crc = frame_crc32(&data);
+    if actual_crc != expected_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("CRC mismatch: expected {:08x}, actual {:08x} ({} bytes)", expected_crc, actual_crc, len),
+        ));
+    }
     bincode::deserialize(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
@@ -2100,9 +2166,11 @@ mod tests {
 
     fn make_frame_bytes(frame: &WorkerFrame) -> Vec<u8> {
         let data = bincode::serialize(frame).unwrap();
-        let mut out = Vec::with_capacity(4 + data.len());
+        let crc = frame_crc32(&data);
+        let mut out = Vec::with_capacity(8 + data.len());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         out.extend_from_slice(&data);
+        out.extend_from_slice(&crc.to_le_bytes());
         out
     }
 
@@ -2156,6 +2224,28 @@ mod tests {
     }
 
     #[test]
+    fn test_read_frame_crc_mismatch_returns_error() {
+        let frame = WorkerFrame::Success(WorkerOutput {
+            path: "/test.pdf".into(),
+            checksum: "dummy".into(),
+            ocr_flag: false,
+            text: "test".into(),
+            word_positions: vec![],
+            file_extraction_ms: 0,
+            page_count: 1,
+        });
+        let mut bytes = make_frame_bytes(&frame);
+        // Corrupt the last CRC byte (flip all bits)
+        let last = bytes.len() - 1;
+        bytes[last] = !bytes[last];
+        let mut reader = io::BufReader::new(std::io::Cursor::new(&bytes));
+        let result = read_frame(&mut reader);
+        assert!(result.is_err(), "corrupted CRC should error");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("CRC mismatch"), "error should mention CRC, got: {}", err);
+    }
+
+    #[test]
     fn test_read_frame_truncated_returns_error() {
         let frame = WorkerFrame::Success(WorkerOutput {
             path: "/test.pdf".into(),
@@ -2188,7 +2278,7 @@ mod tests {
         std::fs::write(books.join("dummy.pdf"), b"dummy").unwrap();
 
         let jobs = Arc::new(JobStore::open_in_memory().unwrap());
-        let writer = JsonlWriter::new(&tmp.join("out.jsonl")).unwrap();
+        let writer = Arc::new(JsonlWriter::new(&tmp.join("out.jsonl")).unwrap());
         let metrics = Arc::new(Metrics::new());
 
         scan_directory(&jobs, &books).unwrap();
@@ -2198,7 +2288,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = run_pipeline(jobs, &writer, metrics, &books, None, &config);
+        let result = run_pipeline(jobs, Arc::clone(&writer), metrics, &books, None, &config);
         assert!(result.is_err(), "run_pipeline should error when worker_path=None");
         let err = format!("{}", result.unwrap_err());
         assert!(
@@ -2220,13 +2310,13 @@ mod tests {
                 data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
             ]) as usize;
             offset += 4;
-            if offset + len > data.len() {
+            if offset + len + 4 > data.len() {
                 break;
             }
             if let Ok(frame) = bincode::deserialize(&data[offset..offset + len]) {
                 frames.push(frame);
             }
-            offset += len;
+            offset += len + 4; // skip data + CRC
         }
         frames
     }

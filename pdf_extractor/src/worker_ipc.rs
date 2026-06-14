@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+/// CRC32 of the serialized frame payload (everything except the CRC field itself).
+/// Computed by `frame_crc32()` on the write side and validated on `read_frame()`.
+/// A CRC of 0 means "not checked" (backward-compat mode).
+///
+/// Wire format: [4 bytes frame_len][frame bytes][4 bytes CRC]
+pub fn frame_crc32(data: &[u8]) -> u32 {
+    crc32fast::hash(data)
+}
+
 /// One output line from the worker process (stdout).
 /// The pipeline reads these, looks up the DB id by path, and builds a DocumentRecord.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]

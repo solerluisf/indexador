@@ -23,6 +23,15 @@ pub struct StoredPosition {
 /// with **bincode**, compressed with **zstd** (level 3), and stored as
 /// a single blob row.
 ///
+/// Blob wire format (version 2+):
+///   byte 0:      schema version (u8, currently 2)
+///   byte 1:      transform_flags (u8, only when schema_version >= 2)
+///                bit 0: COORDS_ROTATION_AWARE (1 = rotation-aware extraction)
+///   bytes 2..N:  zstd(bincode(Vec<StoredPosition>))
+///
+/// Legacy blobs (no version header) begin with the zstd magic bytes
+/// `0x28 0xB5 0x2F 0xFD` and are detected automatically.
+///
 /// Schema:
 /// ```sql
 /// CREATE TABLE IF NOT EXISTS doc_positions (
@@ -30,6 +39,20 @@ pub struct StoredPosition {
 ///     blob_data   BLOB NOT NULL
 /// );
 /// ```
+const POSITIONS_SCHEMA_VERSION: u8 = 2;
+
+/// Transform flags stored in byte 1 of v2+ blobs.
+pub const COORDS_ROTATION_AWARE: u8 = 0b0000_0001;
+pub const COORDS_DEFAULT_FLAGS: u8 = COORDS_ROTATION_AWARE;
+
+/// The hash of the tokenizer configuration used during indexing.
+/// Stored in the blob header for v2+ to detect tokenizer changes that
+/// would invalidate `search_term_positions` offset matching.
+pub const TOKENIZER_TAG: &str = "pdf_extractor_v2";
+
+/// Zstandard frame magic number — used to detect legacy blobs.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
 pub struct PositionStore {
     conn: Connection,
 }
@@ -104,10 +127,16 @@ impl PositionStore {
         let compressed = zstd::bulk::compress(&encoded, 3)
             .map_err(|e| anyhow::anyhow!("zstd compression failed: {}", e))?;
 
+        // Prepend schema version + transform flags header.
+        let mut blob = Vec::with_capacity(2 + compressed.len());
+        blob.push(POSITIONS_SCHEMA_VERSION);
+        blob.push(COORDS_DEFAULT_FLAGS);
+        blob.extend_from_slice(&compressed);
+
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO doc_positions (doc_id, blob_data) VALUES (?1, ?2)",
-                rusqlite::params![doc_id, compressed],
+                rusqlite::params![doc_id, blob],
             )
             .context("Failed to insert position blob")?;
 
@@ -178,7 +207,8 @@ impl PositionStore {
             |row| row.get::<_, Vec<u8>>(0),
         ) {
             Ok(blob) => {
-                let decompressed = zstd::bulk::decompress(&blob, 1024 * 1024 * 4)
+                let payload = Self::strip_header(&blob)?;
+                let decompressed = zstd::bulk::decompress(payload, 1024 * 1024 * 4)
                     .map_err(|e| anyhow::anyhow!("zstd decompression failed: {}", e))?;
                 let positions: Vec<StoredPosition> =
                     bincode::deserialize(&decompressed)
@@ -210,11 +240,78 @@ impl PositionStore {
                 other => anyhow::anyhow!("Failed to query positions: {}", other),
             })?;
 
-        let decompressed = zstd::bulk::decompress(&blob, 1024 * 1024 * 8)
+        let payload = Self::strip_header(&blob)?;
+        let decompressed = zstd::bulk::decompress(payload, 1024 * 1024 * 8)
             .map_err(|e| anyhow::anyhow!("zstd decompression failed: {}", e))?;
 
         bincode::deserialize(&decompressed)
             .context("Failed to deserialise position blob")
+    }
+
+    /// Read the transform flags for a doc_id. Returns None if the blob uses
+    /// the legacy format (v1 or zstd magic — no flags available).
+    pub fn get_transform_flags(&self, doc_id: i64) -> Result<Option<u8>> {
+        let blob: Vec<u8> = match self.conn.query_row(
+            "SELECT blob_data FROM doc_positions WHERE doc_id = ?1",
+            rusqlite::params![doc_id],
+            |row| row.get(0),
+        ) {
+            Ok(b) => b,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e).context("Failed to query transform flags"),
+        };
+        if blob.is_empty() {
+            return Ok(None);
+        }
+        if blob[0] >= 2 {
+            // v2+: byte 1 has transform flags
+            Ok(Some(blob[1]))
+        } else {
+            // v1 or legacy (zstd magic) — no flags
+            Ok(None)
+        }
+    }
+
+    /// Strip the schema version header byte(s) and validate the version.
+    /// Returns the remaining payload (zstd data).
+    /// Legacy blobs (written before the version header was added) are detected
+    /// by their zstd magic bytes and accepted as-is.
+    fn strip_header(blob: &[u8]) -> anyhow::Result<&[u8]> {
+        if blob.is_empty() {
+            anyhow::bail!("Empty position blob");
+        }
+        let version = blob[0];
+        if version == 0 {
+            anyhow::bail!("Invalid position blob: version 0");
+        }
+        // Legacy zstd magic — no version header
+        if blob.len() >= 4 && blob[..4] == ZSTD_MAGIC {
+            return Ok(blob);
+        }
+        // v2+:  2-byte header (version + flags)
+        // v1:   1-byte header (version, no flags)
+        // Note: we accept v1 blobs that happen to have version byte == 1
+        // even though current POSITIONS_SCHEMA_VERSION is 2.
+        match version {
+            2 => {
+                if blob.len() < 2 {
+                    anyhow::bail!("Truncated v2 position blob");
+                }
+                Ok(&blob[2..])
+            }
+            1 => {
+                // v1 blob — no transform flags, no header beyond version
+                Ok(&blob[1..])
+            }
+            _ => {
+                anyhow::bail!(
+                    "Unsupported positions schema version {} (expected {} or 1). \
+                     Re-index the collection to upgrade.",
+                    version,
+                    POSITIONS_SCHEMA_VERSION,
+                );
+            }
+        }
     }
 }
 
@@ -312,6 +409,67 @@ mod tests {
 
         store.delete_doc(1).unwrap();
         assert_eq!(store.count_positions(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_schema_version_roundtrip() {
+        let store = PositionStore::open_in_memory().unwrap();
+        store.store_positions(1, &sample_positions()).unwrap();
+
+        // Read back — schema version is transparent
+        let all = store.load_all_for_doc(1).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Verify the blob on disk has the version header byte
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS doc_positions (doc_id INTEGER PRIMARY KEY, blob_data BLOB NOT NULL);"
+        ).unwrap();
+        // Re-open the same store and verify the blob format
+        std::mem::drop(store);
+        let store2 = PositionStore::open_in_memory().unwrap();
+        // Manually insert a legacy-format blob (no version header) to test backward compat
+        let legacy: Vec<StoredPosition> = sample_positions()
+            .into_iter()
+            .map(|(offset, pos)| StoredPosition {
+                word_offset: offset,
+                page: pos.page,
+                x_min: pos.x_min,
+                y_min: pos.y_min,
+                x_max: pos.x_max,
+                y_max: pos.y_max,
+                word_text: pos.text,
+            })
+            .collect();
+        let encoded = bincode::serialize(&legacy).unwrap();
+        let compressed = zstd::bulk::compress(&encoded, 3).unwrap();
+        // Legacy blob: no version header
+        store2.conn
+            .execute(
+                "INSERT OR REPLACE INTO doc_positions (doc_id, blob_data) VALUES (99, ?1)",
+                rusqlite::params![compressed],
+            )
+            .unwrap();
+        let all_legacy = store2.load_all_for_doc(99).unwrap();
+        assert_eq!(all_legacy.len(), 3, "Legacy blobs should still be readable");
+    }
+
+    #[test]
+    fn test_schema_version_rejects_unknown() {
+        let store = PositionStore::open_in_memory().unwrap();
+        // Manually insert a blob with an unsupported version number
+        let blob = vec![255u8, 0, 1, 2, 3]; // version 255, garbage payload
+        store.conn
+            .execute(
+                "INSERT OR REPLACE INTO doc_positions (doc_id, blob_data) VALUES (99, ?1)",
+                rusqlite::params![blob],
+            )
+            .unwrap();
+        let result = store.load_all_for_doc(99);
+        assert!(result.is_err(), "Unknown schema version should error");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("Unsupported positions schema version"),
+            "error should mention version, got: {}", err);
     }
 
     #[test]

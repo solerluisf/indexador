@@ -224,11 +224,239 @@ pub const FPDF_PRINTING: i32 = 0x200;
 
 /// Coordinate transform: Y-flip PDF user-space (bottom-left) → bitmap (top-left).
 /// - `pdf_y`: Y in PDF user space (origin bottom-left, points).
-/// - `page_height`: effective page height (points) — caller should pass the
-///   correct value considering CropBox/MediaBox and rotation swap.
-/// - `rotation`: `FPDF_GetPageRotation` result (0/1/2/3 → 0°/90°/180°/270°).
-pub fn flip_y(pdf_y: f64, page_height: f64, _rotation: i32) -> f64 {
+/// - `page_height`: effective page height (points).
+pub fn flip_y(pdf_y: f64, page_height: f64) -> f64 {
     page_height - pdf_y
+}
+
+/// Describes the geometry of a single PDF page for coordinate transforms.
+///
+/// All dimensions are in the UNROTATED PDF user space (points, 1/72 inch).
+/// Rotation transforms are applied via the `stored_to_render_*` methods.
+#[derive(Debug, Clone, Copy)]
+pub struct PageGeometry {
+    /// MediaBox width (unrotated).
+    pub media_width: f64,
+    /// MediaBox height (unrotated).
+    pub media_height: f64,
+    /// Page rotation: 0/1/2/3 → 0°/90°/180°/270° clockwise.
+    pub rotation: i32,
+    /// CropBox bounding rectangle, if present.
+    pub crop_rect: Option<FS_RECTF>,
+}
+
+impl PageGeometry {
+    /// Construct page geometry from a loaded PDFium page handle.
+    ///
+    /// # Safety
+    /// `page` must be a valid, non-null PDFium page handle.
+    pub unsafe fn from_page(pdfium: &Pdfium, page: *mut c_void) -> Self {
+        let media_width = (pdfium.FPDF_GetPageWidthF)(page) as f64;
+        let media_height = (pdfium.FPDF_GetPageHeightF)(page) as f64;
+        let rotation = pdfium.FPDF_GetPageRotation.map_or(0, |f| unsafe { f(page) });
+        let mut crop_rect = FS_RECTF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
+        let crop_valid = pdfium.FPDF_GetPageBoundingBox
+            .map_or(false, |f| unsafe { f(page, &mut crop_rect) != 0 });
+        Self {
+            media_width,
+            media_height,
+            rotation,
+            crop_rect: if crop_valid { Some(crop_rect) } else { None },
+        }
+    }
+
+    /// Unrotated page height — uses CropBox height if available, else MediaBox height.
+    pub fn unrotated_height(&self) -> f64 {
+        match self.crop_rect {
+            Some(cr) => (cr.bottom - cr.top).abs() as f64,
+            None => self.media_height,
+        }
+    }
+
+    /// Unrotated page width — uses CropBox width if available, else MediaBox width.
+    pub fn unrotated_width(&self) -> f64 {
+        match self.crop_rect {
+            Some(cr) => (cr.right - cr.left).abs() as f64,
+            None => self.media_width,
+        }
+    }
+
+    /// Rendered bitmap dimensions, accounting for rotation.
+    /// For 90°/270° the rendered width is the unrotated height and vice versa.
+    pub fn render_size(&self) -> (f64, f64) {
+        let w = self.unrotated_width();
+        let h = self.unrotated_height();
+        match self.rotation {
+            1 | 3 => (h, w),
+            _ => (w, h),
+        }
+    }
+
+    /// Convert a PDF user-space point (bottom-left, unrotated) to stored
+    /// coordinates (top-left, unrotated) — this is what extractor stores.
+    pub fn pdf_to_stored(&self, x: f64, y: f64) -> (f64, f64) {
+        (x, self.unrotated_height() - y)
+    }
+
+    /// Convert stored coordinates (top-left, unrotated) back to PDF user space
+    /// (bottom-left, unrotated).
+    pub fn stored_to_pdf(&self, x: f64, y: f64) -> (f64, f64) {
+        (x, self.unrotated_height() - y)
+    }
+
+    /// Convert a stored (top-left, unrotated) point to rendered bitmap pixel
+    /// coordinates (top-left, rotated), given a scale factor (dpi / 72).
+    pub fn stored_to_render(&self, x: f64, y: f64) -> (f64, f64) {
+        // Step 1: stored (top-left, unrotated) → PDF (bottom-left, unrotated)
+        let (pdf_x, pdf_y) = self.stored_to_pdf(x, y);
+        // Step 2: PDF (bottom-left, unrotated) → render (top-left, rotated)
+        let u_w = self.unrotated_width();
+        let u_h = self.unrotated_height();
+        match self.rotation {
+            1 => (pdf_y, u_w - pdf_x),      //  90°
+            2 => (u_w - pdf_x, u_h - pdf_y),// 180°
+            3 => (u_h - pdf_y, pdf_x),      // 270°
+            _ => (pdf_x, self.unrotated_height() - pdf_y), // 0°: flip to top-left
+        }
+    }
+
+    /// Convert a stored bounding box (top-left, unrotated) to rendered bitmap
+    /// pixel coordinates. Returns (render_x_min, render_y_min, render_x_max, render_y_max).
+    pub fn bbox_stored_to_render(
+        &self,
+        x_min: f64, y_min: f64,
+        x_max: f64, y_max: f64,
+    ) -> (f64, f64, f64, f64) {
+        let (r_x1, r_y1) = self.stored_to_render(x_min, y_min);
+        let (r_x2, r_y2) = self.stored_to_render(x_max, y_max);
+        (
+            r_x1.min(r_x2),
+            r_y1.min(r_y2),
+            r_x1.max(r_x2),
+            r_y1.max(r_y2),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_page_geometry_no_rotation_no_crop() {
+        let g = PageGeometry {
+            media_width: 612.0,
+            media_height: 792.0,
+            rotation: 0,
+            crop_rect: None,
+        };
+        assert_eq!(g.unrotated_width(), 612.0);
+        assert_eq!(g.unrotated_height(), 792.0);
+        let (rw, rh) = g.render_size();
+        assert_eq!(rw, 612.0);
+        assert_eq!(rh, 792.0);
+
+        // Stored → render for rotation 0: identity (both are top-left, unrotated)
+        let (rx, ry) = g.stored_to_render(100.0, 100.0);
+        assert!((rx - 100.0).abs() < 0.001);
+        assert!((ry - 100.0).abs() < 0.001);
+
+        // bbox round-trip
+        let (x1, y1, x2, y2) = g.bbox_stored_to_render(100.0, 80.0, 200.0, 92.0);
+        assert!((x1 - 100.0).abs() < 0.001);
+        assert!((y1 - 80.0).abs() < 0.001);
+        assert!((x2 - 200.0).abs() < 0.001);
+        assert!((y2 - 92.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_page_geometry_rotation_90() {
+        // Page with MediaBox [0 0 612 792], /Rotate 90
+        let g = PageGeometry {
+            media_width: 612.0,
+            media_height: 792.0,
+            rotation: 1,
+            crop_rect: None,
+        };
+        assert_eq!(g.unrotated_width(), 612.0);
+        assert_eq!(g.unrotated_height(), 792.0);
+        let (rw, rh) = g.render_size();
+        assert_eq!(rw, 792.0); // swapped
+        assert_eq!(rh, 612.0); // swapped
+
+        // PDF coord (100, 700) → stored (top-left, unrotated): flip Y
+        // stored_y = 792 - 700 = 92
+        // → render: (pdf_y, u_w - pdf_x) = (700, 612 - 100) = (700, 512)
+        let (rx, ry) = g.stored_to_render(100.0, 92.0);
+        assert!((rx - 700.0).abs() < 0.001);
+        assert!((ry - 512.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_page_geometry_rotation_270() {
+        let g = PageGeometry {
+            media_width: 612.0,
+            media_height: 792.0,
+            rotation: 3,
+            crop_rect: None,
+        };
+        let (rw, rh) = g.render_size();
+        assert_eq!(rw, 792.0);
+        assert_eq!(rh, 612.0);
+
+        // PDF coord (100, 700) → stored: (100, 792-700=92)
+        // → render: (u_h - pdf_y, pdf_x) = (792 - 700, 100) = (92, 100)
+        let (rx, ry) = g.stored_to_render(100.0, 92.0);
+        assert!((rx - 92.0).abs() < 0.001);
+        assert!((ry - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_page_geometry_rotation_180() {
+        let g = PageGeometry {
+            media_width: 612.0,
+            media_height: 792.0,
+            rotation: 2,
+            crop_rect: None,
+        };
+        // PDF coord (100, 700) → stored: (100, 792-700=92)
+        // → render: (u_w - pdf_x, u_h - pdf_y) = (612-100, 792-700) = (512, 92)
+        let (rx, ry) = g.stored_to_render(100.0, 92.0);
+        assert!((rx - 512.0).abs() < 0.001);
+        assert!((ry - 92.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_page_geometry_with_crop() {
+        let g = PageGeometry {
+            media_width: 612.0,
+            media_height: 792.0,
+            rotation: 0,
+            crop_rect: Some(FS_RECTF { left: 50.0, top: 50.0, right: 562.0, bottom: 742.0 }),
+        };
+        assert!((g.unrotated_height() - 692.0).abs() < 0.001); // 742 - 50
+        assert!((g.unrotated_width() - 512.0).abs() < 0.001);  // 562 - 50
+    }
+
+    #[test]
+    fn test_bbox_rotation_90() {
+        let g = PageGeometry {
+            media_width: 612.0,
+            media_height: 792.0,
+            rotation: 1,
+            crop_rect: None,
+        };
+        // PDF bbox: x=[100,200], y=[700,712]
+        // stored (top-left, unrotated): x=[100,200], y=[792-712, 792-700] = [80, 92]
+        // render 90°: x' = pdf_y, y' = u_w - pdf_x
+        //   (stored_x=100, stored_y=80) → pdf: (100, 792-80=712) → render: (712, 612-100=512)
+        //   (stored_x=200, stored_y=92) → pdf: (200, 792-92=700) → render: (700, 612-200=412)
+        let (x1, y1, x2, y2) = g.bbox_stored_to_render(100.0, 80.0, 200.0, 92.0);
+        assert!((x1 - 700.0).abs() < 0.001); // min of 712, 700
+        assert!((y1 - 412.0).abs() < 0.001); // min of 412, 512
+        assert!((x2 - 712.0).abs() < 0.001); // max of 712, 700
+        assert!((y2 - 512.0).abs() < 0.001); // max of 412, 512
+    }
 }
 
 // ---------------------------------------------------------------------------

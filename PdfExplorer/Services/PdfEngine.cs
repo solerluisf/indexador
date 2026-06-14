@@ -126,12 +126,6 @@ public sealed class PdfEngine : IDisposable
     private static extern int pdf_get_term_positions(uint collId, long docId, byte[] term, byte[] outJson, ref uint outLen);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-    private static extern int pdf_search_text_in_pdf(byte[] path, byte[] term, byte[] outJson, ref uint outLen);
-
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-    private static extern int pdf_search_text_in_mem(byte[] data, int len, byte[] term, byte[] outJson, ref uint outLen);
-
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern void pdf_free_string(IntPtr ptr);
 
     public SearchResponse Search(string query, int limit = 1000, int offset = 0, uint? collId = null)
@@ -184,24 +178,6 @@ public sealed class PdfEngine : IDisposable
         var json = CallBuf((buf, ref len) => pdf_get_term_positions(collId, docId, Utf8(term), buf, ref len));
         var result = JsonSerializer.Deserialize<List<WordPosition>>(json) ?? new List<WordPosition>();
         Log($"GetTermPositions returned: {result.Count} positions");
-        return result;
-    }
-
-    public List<WordPosition> SearchTextInPdf(string path, string term)
-    {
-        Log($"SearchTextInPdf(path='{path}', term='{term}')");
-        var json = CallBuf((buf, ref len) => pdf_search_text_in_pdf(Utf8(path), Utf8(term), buf, ref len));
-        var result = JsonSerializer.Deserialize<List<WordPosition>>(json) ?? new List<WordPosition>();
-        Log($"SearchTextInPdf returned: {result.Count} positions");
-        return result;
-    }
-
-    public List<WordPosition> SearchTextInPdf(byte[] pdfData, string term)
-    {
-        Log($"SearchTextInPdf({pdfData.Length} bytes, term='{term}')");
-        var json = CallBuf((buf, ref len) => pdf_search_text_in_mem(pdfData, pdfData.Length, Utf8(term), buf, ref len));
-        var result = JsonSerializer.Deserialize<List<WordPosition>>(json) ?? new List<WordPosition>();
-        Log($"SearchTextInPdf returned: {result.Count} positions");
         return result;
     }
 

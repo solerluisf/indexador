@@ -752,340 +752,7 @@ pub unsafe extern "C" fn pdf_get_term_positions(
     rc
 }
 
-// ---------------------------------------------------------------------------
-// pdf_search_text_in_mem / pdf_search_text_in_pdf
-// Searches for `term` inside the PDF using PDFium's text search API
-// ---------------------------------------------------------------------------
 
-/// Internal implementation shared by both `pdf_search_text_in_mem` and
-/// `pdf_search_text_in_pdf`.  Takes raw PDF bytes, loads them via PDFium,
-/// and returns JSON-encoded positions.
-///
-/// Uses word-level extraction (same logic as `extract_text_and_positions`)
-/// instead of character-level matching with NFKC normalization, ensuring
-/// that bounding boxes match exactly between search highlights and the
-/// extraction pipeline.
-unsafe fn search_text_in_pdf_impl(
-    pdf_data: &[u8],
-    term_str: &str,
-    out_json: *mut c_char,
-    out_len: *mut u32,
-) -> i32 {
-    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
-        Some(pdf) => pdf,
-        None => {
-            set_error("pdfium.dll not available".into());
-            return ERR_GENERAL;
-        }
-    };
-
-    let doc = unsafe { (pdfium.FPDF_LoadMemDocument)(pdf_data.as_ptr(), pdf_data.len() as i32, std::ptr::null()) };
-    if doc.is_null() {
-        let err = unsafe { (pdfium.FPDF_GetLastError)() };
-        set_error(format!("PDFium error {}: {}", err, pdf_extractor::pdfium::error_str(err)));
-        return ERR_GENERAL;
-    }
-
-    let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
-
-    // ── Pre-tokenise the search query ──
-    let stripped = term_str.trim_matches('"');
-    let query_lower = stripped.to_lowercase();
-    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
-    let is_phrase = query_words.len() > 1;
-
-    // Collect all matching word positions (page, bbox, matched text)
-    let mut matches: Vec<(u32, f32, f32, f32, f32, String)> = Vec::new();
-    for page_idx in 0..page_count {
-        let pdf_page = unsafe { (pdfium.FPDF_LoadPage)(doc, page_idx) };
-        if pdf_page.is_null() {
-            continue;
-        }
-
-        // ── CropBox offset ──
-        let page_num = (page_idx + 1) as u32;
-        let mut crop_rect = pdf_extractor::pdfium::FS_RECTF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
-        let crop_valid = pdfium.FPDF_GetPageBoundingBox.map_or(false, |f| unsafe { f(pdf_page, &mut crop_rect) != 0 });
-        let crop_x_offset = if crop_valid { crop_rect.left as f64 } else { 0.0 };
-        let crop_y_offset = if crop_valid { crop_rect.bottom as f64 } else { 0.0 };
-
-        let text_page = unsafe { (pdfium.FPDFText_LoadPage)(pdf_page) };
-        if text_page.is_null() {
-            unsafe { (pdfium.FPDF_ClosePage)(pdf_page) };
-            continue;
-        }
-
-        let char_count = unsafe { (pdfium.FPDFText_CountChars)(text_page) };
-
-        // Build words with bounding boxes (same logic as extract_text_and_positions)
-        let mut current_word = String::new();
-        let mut word_left = 0.0f64;
-        let mut word_right = 0.0f64;
-        let mut word_bottom = 0.0f64;
-        let mut word_top = 0.0f64;
-        let mut has_word = false;
-        // Previous character bbox for gap detection
-        let mut prev_left = 0.0f64;
-        let mut prev_right = 0.0f64;
-        let mut prev_bottom = 0.0f64;
-        let mut prev_top = 0.0f64;
-        let mut has_prev = false;
-        // Running average character metrics for relative gap thresholds
-        let mut total_height = 0.0f64;
-        let mut total_width = 0.0f64;
-        let mut char_count_in_page = 0usize;
-        // Track per-page word positions for phrase matching
-        let mut page_words: Vec<(String, f32, f32, f32, f32)> = Vec::new();
-
-        for i in 0..char_count {
-            let ch = unsafe { (pdfium.FPDFText_GetUnicode)(text_page, i) };
-
-            let mut left = 0.0f64;
-            let mut right = 0.0f64;
-            let mut bottom = 0.0f64;
-            let mut top = 0.0f64;
-            let bbox_ok = unsafe { (pdfium.FPDFText_GetCharBox)(text_page, i, &mut left, &mut right, &mut bottom, &mut top) };
-            // Shift from MediaBox space to CropBox space
-            if bbox_ok != 0 {
-                left -= crop_x_offset;
-                right -= crop_x_offset;
-                bottom -= crop_y_offset;
-                top -= crop_y_offset;
-            }
-
-            // Unavailable character → flush word
-            if ch == 0 || bbox_ok == 0 {
-                if has_word {
-                    page_words.push((clean_word_text(&current_word), word_left as f32, word_bottom as f32, word_right as f32, word_top as f32));
-                    current_word.clear();
-                    has_word = false;
-                    has_prev = false;
-                }
-                continue;
-            }
-
-            let c = match char::from_u32(ch) {
-                Some(c) => c,
-                None => {
-                    if has_word {
-                        page_words.push((clean_word_text(&current_word), word_left as f32, word_bottom as f32, word_right as f32, word_top as f32));
-                        current_word.clear();
-                        has_word = false;
-                        has_prev = false;
-                    }
-                    continue;
-                }
-            };
-
-            let is_newline = c == '\n' || c == '\r';
-
-            if c.is_whitespace() || is_newline {
-                if has_word {
-                    page_words.push((clean_word_text(&current_word), word_left as f32, word_bottom as f32, word_right as f32, word_top as f32));
-                    current_word.clear();
-                    has_word = false;
-                    has_prev = false;
-                }
-            } else {
-                // Gap detection: flush if vertical gap > 0.7×avg_h or horizontal gap magnitude > 1.5×avg_w
-                if has_word && has_prev && char_count_in_page > 0 {
-                    let avg_h = total_height / char_count_in_page as f64;
-                    let avg_w = total_width / char_count_in_page as f64;
-                    let vert_gap = (bottom - prev_bottom).abs();
-                    let horiz_gap = left - prev_right;
-                    if vert_gap > avg_h * 0.7 || horiz_gap.abs() > avg_w * 1.5 {
-                        page_words.push((clean_word_text(&current_word), word_left as f32, word_bottom as f32, word_right as f32, word_top as f32));
-                        current_word.clear();
-                        has_word = false;
-                    }
-                }
-                if has_word {
-                    word_left = word_left.min(left);
-                    word_bottom = word_bottom.min(bottom);
-                    word_right = word_right.max(right);
-                    word_top = word_top.max(top);
-                } else {
-                    word_left = left;
-                    word_bottom = bottom;
-                    word_right = right;
-                    word_top = top;
-                    has_word = true;
-                }
-                current_word.push(c);
-                total_height += (top - bottom).abs();
-                total_width += (right - left).abs();
-                char_count_in_page += 1;
-                prev_left = left;
-                prev_right = right;
-                prev_bottom = bottom;
-                prev_top = top;
-                has_prev = true;
-            }
-        }
-
-        // Flush last word
-        if has_word {
-            page_words.push((clean_word_text(&current_word), word_left as f32, word_bottom as f32, word_right as f32, word_top as f32));
-        }
-
-        // ── Match words against query ──
-        if is_phrase {
-            // Phrase: find consecutive matching words
-            for start in 0..page_words.len().saturating_sub(query_words.len() - 1) {
-                let mut all_match = true;
-                for (q_idx, q_word) in query_words.iter().enumerate() {
-                    let pw_idx = start + q_idx;
-                    if pw_idx >= page_words.len() {
-                        all_match = false;
-                        break;
-                    }
-                    let pw_lower = page_words[pw_idx].0.to_lowercase();
-                    if pw_lower != *q_word {
-                        all_match = false;
-                        break;
-                    }
-                }
-                if all_match {
-                    // All words must be on the same line (vertical overlap)
-                    // page_words stores (text, x_min, y_min, x_max, y_max)
-                    //   y_min = word_bottom = min of char bottoms (smaller PDF y = lower on page)  
-                    //   y_max = word_top   = max of char tops   (larger  PDF y = higher on page)
-                    // PDF coords: y increases upward. Word occupies [y_min, y_max].
-                    // Same line iff y-ranges overlap:
-                    //   y_max1 >= y_min2 AND y_max2 >= y_min1
-                    let on_same_line = (1..query_words.len()).all(|i| {
-                        let (_, _, y_min1, _, y_max1) = &page_words[start + i - 1];
-                        let (_, _, y_min2, _, y_max2) = &page_words[start + i];
-                        y_max1 >= y_min2 && y_max2 >= y_min1
-                    });
-                    if on_same_line {
-                        // Merge bounding boxes of phrase words (same line)
-                        let mut mx_min = f32::MAX;
-                        let mut my_min = f32::MAX;
-                        let mut mx_max = f32::MIN;
-                        let mut my_max = f32::MIN;
-                        let mut merged_text = String::new();
-                        for q_idx in 0..query_words.len() {
-                            let (txt, x_min, y_min, x_max, y_max) = &page_words[start + q_idx];
-                            mx_min = mx_min.min(*x_min);
-                            my_min = my_min.min(*y_min);
-                            mx_max = mx_max.max(*x_max);
-                            my_max = my_max.max(*y_max);
-                            if !merged_text.is_empty() {
-                                merged_text.push(' ');
-                            }
-                            merged_text.push_str(txt);
-                        }
-                        matches.push((page_num, mx_min, my_min, mx_max, my_max, merged_text));
-                    } else {
-                        // Phrase spans multiple lines → emit per-word matches with individual boxes
-                        for q_idx in 0..query_words.len() {
-                            let (txt, x_min, y_min, x_max, y_max) = &page_words[start + q_idx];
-                            matches.push((page_num, *x_min, *y_min, *x_max, *y_max, txt.clone()));
-                        }
-                    }
-                }
-            }
-        } else {
-            // Single word: find words that contain the query (case-insensitive)
-            let term = query_words[0];
-            for (word_text, x_min, y_min, x_max, y_max) in &page_words {
-                let word_lower = word_text.to_lowercase();
-                if word_lower == term {
-                    matches.push((page_num, *x_min, *y_min, *x_max, *y_max, word_text.clone()));
-                }
-            }
-        }
-
-        unsafe {
-            (pdfium.FPDFText_ClosePage)(text_page);
-            (pdfium.FPDF_ClosePage)(pdf_page);
-        }
-    }
-
-    unsafe { (pdfium.FPDF_CloseDocument)(doc) };
-
-    // Build JSON output
-    let json_entries: Vec<serde_json::Value> = matches.iter().map(|(page, x_min, y_min, x_max, y_max, word_text)| {
-        serde_json::json!({
-            "page": page,
-            "x_min": x_min,
-            "y_min": y_min,
-            "x_max": x_max,
-            "y_max": y_max,
-            "word_text": word_text,
-        })
-    }).collect();
-
-    let json_str = serde_json::to_string(&json_entries).unwrap_or_else(|_| "[]".into());
-    unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pdf_search_text_in_mem(
-    data: *const u8,
-    data_len: i32,
-    term: *const c_char,
-    out_json: *mut c_char,
-    out_len: *mut u32,
-) -> i32 {
-    let rc = (|| -> i32 {
-        let term_str = match unsafe { cstr_to_str(term) } {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
-
-        if out_len.is_null() {
-            return ERR_NULL_PTR;
-        }
-        if data.is_null() || data_len <= 0 {
-            set_error("Invalid PDF data".into());
-            return ERR_GENERAL;
-        }
-
-        let pdf_data = std::slice::from_raw_parts(data, data_len as usize);
-        unsafe { search_text_in_pdf_impl(pdf_data, term_str, out_json, out_len) }
-    })();
-    rc
-}
-
-// pdf_search_text_in_pdf (legacy — reads from disk)
-// Now delegates to the shared `search_text_in_pdf_impl` to avoid duplication.
-// ---------------------------------------------------------------------------
-
-#[no_mangle]
-pub unsafe extern "C" fn pdf_search_text_in_pdf(
-    path: *const c_char,
-    term: *const c_char,
-    out_json: *mut c_char,
-    out_len: *mut u32,
-) -> i32 {
-    let rc = (|| -> i32 {
-        let path_str = match unsafe { cstr_to_str(path) } {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
-        let term_str = match unsafe { cstr_to_str(term) } {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
-
-        if out_len.is_null() {
-            return ERR_NULL_PTR;
-        }
-
-        let pdf_data = match std::fs::read(path_str) {
-            Ok(d) => d,
-            Err(e) => {
-                set_error(format!("Failed to read PDF: {}", e));
-                return ERR_GENERAL;
-            }
-        };
-
-        unsafe { search_text_in_pdf_impl(&pdf_data, term_str, out_json, out_len) }
-    })();
-    rc
-}
 
 /// Normalize text with NFKC, returning a mapping from each normalized char
 /// back to (first_raw_idx, last_raw_idx) in the original raw string.
@@ -1821,13 +1488,9 @@ pub unsafe extern "C" fn pdf_render_page_bgra(
     let w_pts = unsafe { (pdfium.FPDF_GetPageWidthF)(page) };
     let h_pts = unsafe { (pdfium.FPDF_GetPageHeightF)(page) };
     let rotation = pdfium.FPDF_GetPageRotation.map_or(0, |f| unsafe { f(page) });
-    let mut crop_rect = pdf_extractor::pdfium::FS_RECTF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
-    let crop_valid = pdfium.FPDF_GetPageBoundingBox.map_or(false, |f| unsafe { f(page, &mut crop_rect) != 0 });
-    let crop_h = if crop_valid { (crop_rect.bottom - crop_rect.top).abs() as f64 } else { -1.0 };
+    let geom = pdf_extractor::pdfium::PageGeometry::from_page(&pdfium, page);
     let base_w = w_pts as f64;
-    let base_h = if crop_h >= 0.0 { crop_h } else { h_pts as f64 };
-    // For Y-flip: use CropBox height else MediaBox; swap width↔height when rotated 90/270
-    let eff_height = if rotation == 1 || rotation == 3 { base_w } else { base_h };
+    let base_h = geom.unrotated_height();
 
     let scale = dpi / 72.0;
     let dest_width = if rotation == 1 || rotation == 3 {
@@ -1891,10 +1554,12 @@ pub unsafe extern "C" fn pdf_render_page_bgra(
                         let x_max = h.get("x_max").and_then(|v| v.as_f64()).unwrap_or(0.0);
                         let y_max = h.get("y_max").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-                        let px1 = (x_min * scale).round() as i32;
-                        let py1 = (pdf_extractor::pdfium::flip_y(y_max, eff_height, rotation) * scale).round() as i32;
-                        let px2 = (x_max * scale).round() as i32;
-                        let py2 = (pdf_extractor::pdfium::flip_y(y_min, eff_height, rotation) * scale).round() as i32;
+                        let (r_x_min, r_y_min, r_x_max, r_y_max) =
+                            geom.bbox_stored_to_render(x_min, y_min, x_max, y_max);
+                        let px1 = (r_x_min * scale).round() as i32;
+                        let py1 = (r_y_min * scale).round() as i32;
+                        let px2 = (r_x_max * scale).round() as i32;
+                        let py2 = (r_y_max * scale).round() as i32;
 
                         let px1 = px1.clamp(0, dest_width);
                         let py1 = py1.clamp(0, dest_height);
@@ -2008,13 +1673,8 @@ pub unsafe extern "C" fn pdf_render_page_to_buffer(
     let w_pts = unsafe { (pdfium.FPDF_GetPageWidthF)(page) as f64 };
     let h_pts = unsafe { (pdfium.FPDF_GetPageHeightF)(page) as f64 };
     let rotation = pdfium.FPDF_GetPageRotation.map_or(0, |f| unsafe { f(page) });
-    let mut crop_rect = pdf_extractor::pdfium::FS_RECTF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
-    let crop_h = if pdfium.FPDF_GetPageBoundingBox.map_or(false, |f| unsafe { f(page, &mut crop_rect) != 0 }) {
-        (crop_rect.bottom - crop_rect.top).abs() as f64
-    } else {
-        -1.0
-    };
-    let eff_height = if crop_h >= 0.0 { crop_h } else { h_pts };
+    let geom = pdf_extractor::pdfium::PageGeometry::from_page(&pdfium, page);
+    let scale = dpi / 72.0;
 
     // Wrap the external buffer as a PDFium bitmap — no allocation
     let bitmap = unsafe {
@@ -2045,7 +1705,6 @@ pub unsafe extern "C" fn pdf_render_page_to_buffer(
                     let page_num = page_index as u32 + 1;
                     let total_bytes = (height as usize) * (stride as usize);
                     let buf = std::slice::from_raw_parts_mut(buffer as *mut u8, total_bytes);
-                    let scale = dpi / 72.0;
                     for h in &highlights {
                         let _ = match h.get("page").and_then(|v| v.as_u64()) {
                             Some(p) if p == page_num as u64 => (),
@@ -2056,10 +1715,12 @@ pub unsafe extern "C" fn pdf_render_page_to_buffer(
                         let x_max = h.get("x_max").and_then(|v| v.as_f64()).unwrap_or(0.0);
                         let y_max = h.get("y_max").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-                        let px1 = (x_min * scale).round() as i32;
-                        let py1 = (pdf_extractor::pdfium::flip_y(y_max, eff_height, rotation) * scale).round() as i32;
-                        let px2 = (x_max * scale).round() as i32;
-                        let py2 = (pdf_extractor::pdfium::flip_y(y_min, eff_height, rotation) * scale).round() as i32;
+                        let (r_x_min, r_y_min, r_x_max, r_y_max) =
+                            geom.bbox_stored_to_render(x_min, y_min, x_max, y_max);
+                        let px1 = (r_x_min * scale).round() as i32;
+                        let py1 = (r_y_min * scale).round() as i32;
+                        let px2 = (r_x_max * scale).round() as i32;
+                        let py2 = (r_y_max * scale).round() as i32;
 
                         let px1 = px1.clamp(0, width);
                         let py1 = py1.clamp(0, height);
@@ -2222,13 +1883,13 @@ pub unsafe extern "C" fn pdf_extract(
     let temp_dir = std::env::temp_dir().join("pdf_extractor_capi");
     let _ = std::fs::create_dir_all(&temp_dir);
     let jsonl_path = temp_dir.join("output.jsonl");
-    let writer = match JsonlWriter::new(&jsonl_path) {
+    let writer = Arc::new(match JsonlWriter::new(&jsonl_path) {
         Ok(w) => w,
         Err(e) => {
             set_error(format!("Failed to create output writer: {}", e));
             return -1;
         }
-    };
+    });
 
     let (jobs, indexer) = with_app_read(|app| {
         let jobs = app.jobs.as_ref().map(Arc::clone);
@@ -2264,7 +1925,7 @@ pub unsafe extern "C" fn pdf_extract(
 
     let result = run_pipeline(
         Arc::clone(&jobs),
-        &writer,
+        Arc::clone(&writer),
         Arc::clone(&metrics),
         &input_path,
         indexer,
@@ -2727,13 +2388,13 @@ pub unsafe extern "C" fn pdf_index_collection(
         }
     };
 
-    let writer = match JsonlWriter::new(&output_path) {
+    let writer = Arc::new(match JsonlWriter::new(&output_path) {
         Ok(w) => w,
         Err(e) => {
             set_error(format!("Failed to create output writer: {}", e));
             return -1;
         }
-    };
+    });
 
     let no_index = (flags & 2) != 0;
     let indexer = if no_index {
@@ -2811,7 +2472,7 @@ pub unsafe extern "C" fn pdf_index_collection(
 
     eprintln!("[pdf_index_collection] calling run_pipeline with canonical={:?}", canonical);
     let indexer_for_ocr = indexer.clone();
-    match run_pipeline(Arc::clone(&jobs), &writer, Arc::clone(&metrics), &canonical, indexer, &config) {
+    match run_pipeline(Arc::clone(&jobs), Arc::clone(&writer), Arc::clone(&metrics), &canonical, indexer, &config) {
         Ok(()) => {
             let processed = metrics.processed();
             eprintln!("[pdf_index_collection] run_pipeline OK, processed={}", processed);

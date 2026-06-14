@@ -171,7 +171,7 @@ public sealed class PdfiumPageRenderer : IDisposable
     /// <summary>
     /// Opens a PDF document from a byte array (already read from disk).
     /// Use this overload to avoid reading the file twice when the caller
-    /// already has the bytes in memory (e.g. from SearchTextInPdf).
+    /// already has the bytes in memory.
     /// </summary>
     public void OpenDocument(byte[] pdfData, string? debugPath = null)
     {

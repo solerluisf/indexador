@@ -339,37 +339,31 @@ public partial class SearchTab : Page, IPdfRenderingService
                 return;
             }
 
-            // Fetch term positions via PDFium text search (case-insensitive)
-            try
-            {
-                    _state.Positions = await Task.Run(() => _engine.SearchTextInPdf(pdfBytes, _lastQuery));
-                var t1 = DateTime.UtcNow;
-                Log($"SearchTextInPdf returned {_state.Positions.Count} positions (took {(t1 - t0).TotalMilliseconds:F0}ms)");
-            }
-            catch (Exception ex)
-            {
-                Log($"SearchTextInPdf warning: {ex.GetType().Name}: {ex.Message}");
-                _state.Positions = new List<WordPosition>();
-            }
-
-            // Fallback: try the indexed position store when PDFium finds nothing
-            if (_state.Positions.Count == 0 && result.CollectionId.HasValue)
+            // Fetch term positions from indexed position store (SQLite)
+            // This is much more efficient than re-extracting the PDF with PDFium
+            if (result.CollectionId.HasValue)
             {
                 try
                 {
-                    Log($"SearchTextInPdf found nothing — trying GetTermPositions from position store");
-                    _state.Positions = _engine.GetTermPositions(
+                    Log($"Fetching term positions from indexed position store");
+                    _state.Positions = await Task.Run(() => _engine.GetTermPositions(
                         (uint)result.CollectionId.Value,
                         result.Id,
                         _lastQuery
-                    );
-                    Log($"GetTermPositions returned {_state.Positions.Count} positions");
+                    ));
+                    var t1 = DateTime.UtcNow;
+                    Log($"GetTermPositions returned {_state.Positions.Count} positions (took {(t1 - t0).TotalMilliseconds:F0}ms)");
                 }
                 catch (Exception ex)
                 {
                     Log($"GetTermPositions warning: {ex.GetType().Name}: {ex.Message}");
                     _state.Positions = new List<WordPosition>();
                 }
+            }
+            else
+            {
+                Log("No collection ID available - cannot fetch indexed positions");
+                _state.Positions = new List<WordPosition>();
             }
 
             if (_state.Positions.Count > 0)
