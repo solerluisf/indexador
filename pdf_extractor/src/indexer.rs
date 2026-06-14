@@ -13,6 +13,10 @@ use tantivy::{DocSet, Postings, TERMINATED};
 
 use crate::math_tokenizer::MathAwareTokenizer;
 
+/// Canonical token pattern used by both the extractor (`clean_word_text`) and
+/// Tantivy's tokenizers. Single source of truth — guarantees lockstep alignment.
+pub(crate) const TOKEN_PATTERN: &str = r"[\p{L}\p{N}\p{S}]+";
+
 #[allow(dead_code)]
 pub struct SearchIndex {
     pub index: Index,
@@ -915,7 +919,7 @@ pub fn tokenize_with_math(text: &str) -> Vec<(usize, String)> {
     use tantivy::tokenizer::RegexTokenizer;
     thread_local! {
         static TOKENIZER: std::cell::RefCell<RegexTokenizer> = std::cell::RefCell::new(
-            RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
+            RegexTokenizer::new(TOKEN_PATTERN)
                 .expect("Hardcoded regex pattern should never fail"),
         );
     }
@@ -931,44 +935,38 @@ pub fn tokenize_with_math(text: &str) -> Vec<(usize, String)> {
     })
 }
 
-/// Align WordPosition offsets to Tantivy token positions so SQLite
-/// word_offsets match `search_term_positions` results.
+/// Walk WordPositions in document order and assign consecutive token positions.
+/// Each WP can produce multiple entries if its text contains multiple segments
+/// (e.g. "state of the art" → 4 entries, all pointing to the same WP).
 ///
-/// Iterates Tantivy tokens and matches each to the next available WordPosition
-/// whose cleaned text equals the token (case-insensitive). One-word look-ahead
-/// allows skipping extraneous WordPositions that have no corresponding token.
+/// This is O(N) lockstep alignment. The `text` parameter is kept only for a
+/// `debug_assert_eq!` sanity check that fires when Tantivy token count diverges
+/// from WP segment count.
 pub fn align_offsets_to_tantivy(
     text: &str,
     word_positions: &[crate::extractor::WordPosition],
 ) -> Vec<(usize, crate::extractor::WordPosition)> {
-    if word_positions.is_empty() {
-        return Vec::new();
+    let mut result = Vec::new();
+    let mut pos = 0usize;
+
+    for wp in word_positions {
+        for seg in wp.text.split(' ').filter(|s| !s.is_empty()) {
+            result.push((pos, wp.clone()));
+            pos += 1;
+        }
     }
 
-    // Pre-compute lowercase once per word position instead of per-comparison
-    let wp_lower: Vec<String> = word_positions
-        .iter()
-        .map(|wp| wp.text.to_lowercase())
-        .collect();
-
-    let tokens = tokenize_with_math(text);
-
-    let mut result = Vec::with_capacity(tokens.len().min(word_positions.len()));
-    let mut wp_idx = 0;
-
-    for &(pos, ref token_text) in &tokens {
-        if wp_idx >= word_positions.len() {
-            break;
-        }
-
-        if wp_lower[wp_idx] == *token_text {
-            result.push((pos, word_positions[wp_idx].clone()));
-            wp_idx += 1;
-        } else if wp_idx + 1 < word_positions.len() {
-            if wp_lower[wp_idx + 1] == *token_text {
-                result.push((pos, word_positions[wp_idx + 1].clone()));
-                wp_idx += 2;
-            }
+    // Freno de mano: log de advertencia si el conteo de segmentos de WPs no
+    // coincide con los tokens de Tantivy. Solo en debug (cero overhead en release).
+    #[cfg(debug_assertions)]
+    {
+        let tantivy_count = tokenize_with_math(text).len();
+        if tantivy_count != pos {
+            eprintln!(
+                "[LOCKSTEP] WARNING: Tantivy token count ({}) != WP segment count ({}). \
+                 Tokenizer drift detected — update TOKEN_PATTERN or clean_word_text logic.",
+                tantivy_count, pos,
+            );
         }
     }
 
@@ -2897,9 +2895,9 @@ fn test_search_fuzzy_with_path_filter() {
     }
 
     #[test]
-    fn test_align_offsets_to_tantivy_skips_unmatched_tokens() {
-        // "foo + bar" → Tantivy tokens: ["foo", "+", "bar"]
-        // WordPositions: ["foo", "bar"] (filtered out "+")
+    fn test_align_offsets_to_tantivy_all_wps_produce_entries() {
+        // Lockstep: cada WP produce exactamente sus segmentos como entries consecutivas.
+        // No hay "skipping" — todas las WPs generan entries.
         let wp = vec![
             crate::extractor::WordPosition {
                 page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
@@ -2910,44 +2908,14 @@ fn test_search_fuzzy_with_path_filter() {
                 text: "bar".to_string(),
             },
         ];
-        // Tantivy produces ["foo"@0, "+"@1, "bar"@2]
-        // Token "foo" matches wp[0] → offset 0
-        // Token "+" has no match → skipped
-        // Token "bar" matches wp[1] → offset 2
-        let aligned = align_offsets_to_tantivy("foo + bar", &wp);
+        // Con lockstep, el texto debe coincidir con las WPs para el debug_assert.
+        // "foo" y "bar" producen 2 tokens de Tantivy que corresponden a 2 segmentos de WPs.
+        let aligned = align_offsets_to_tantivy("foo bar", &wp);
         assert_eq!(aligned.len(), 2);
         assert_eq!(aligned[0].0, 0);
         assert_eq!(aligned[0].1.text, "foo");
-        assert_eq!(aligned[1].0, 2);
-        assert_eq!(aligned[1].1.text, "bar");
-    }
-
-    #[test]
-    fn test_align_offsets_to_tantivy_skips_unmatched_word_positions() {
-        // "hello world" → Tantivy tokens: ["hello"@0, "world"@1]
-        // WordPositions: ["hello", "foo", "world"] (extra "foo" has no token)
-        // "hello"@0 matches wp[0], wp[1]="foo" doesn't match "world"@1
-        // look-ahead: wp[2]="world" matches "world"@1 → skip wp[1], use wp[2]
-        let wp = vec![
-            crate::extractor::WordPosition {
-                page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
-                text: "hello".to_string(),
-            },
-            crate::extractor::WordPosition {
-                page: 1, x_min: 10.0, y_min: 0.0, x_max: 20.0, y_max: 10.0,
-                text: "foo".to_string(),
-            },
-            crate::extractor::WordPosition {
-                page: 2, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
-                text: "world".to_string(),
-            },
-        ];
-        let aligned = align_offsets_to_tantivy("hello world", &wp);
-        assert_eq!(aligned.len(), 2);
-        assert_eq!(aligned[0].0, 0);
-        assert_eq!(aligned[0].1.text, "hello");
         assert_eq!(aligned[1].0, 1);
-        assert_eq!(aligned[1].1.text, "world");
+        assert_eq!(aligned[1].1.text, "bar");
     }
 
     #[test]
@@ -2969,6 +2937,36 @@ fn test_search_fuzzy_with_path_filter() {
         assert_eq!(aligned[0].1.page, 1);
         assert_eq!(aligned[1].0, 1); // "learning" at Tantivy position 1
         assert_eq!(aligned[1].1.page, 2);
+    }
+
+    #[test]
+    fn test_align_offsets_to_tantivy_multi_segment_wp() {
+        // Una WP con texto multi-segmento (e.g. "state of the art") produce
+        // multiples entries, todas apuntando a la misma WP.
+        let wp = vec![
+            crate::extractor::WordPosition {
+                page: 1, x_min: 0.0, y_min: 0.0, x_max: 50.0, y_max: 10.0,
+                text: "state of the art".to_string(),
+            },
+            crate::extractor::WordPosition {
+                page: 1, x_min: 0.0, y_min: 10.0, x_max: 20.0, y_max: 20.0,
+                text: "foo".to_string(),
+            },
+        ];
+        let aligned = align_offsets_to_tantivy("state of the art foo", &wp);
+        assert_eq!(aligned.len(), 5);
+        // state@0, of@1, the@2, art@3 → mismas WP, diferentes posiciones
+        assert_eq!(aligned[0].0, 0);
+        assert_eq!(aligned[0].1.text, "state of the art");
+        assert_eq!(aligned[1].0, 1);
+        assert_eq!(aligned[1].1.text, "state of the art");
+        assert_eq!(aligned[2].0, 2);
+        assert_eq!(aligned[2].1.text, "state of the art");
+        assert_eq!(aligned[3].0, 3);
+        assert_eq!(aligned[3].1.text, "state of the art");
+        // foo@4 → WP independiente
+        assert_eq!(aligned[4].0, 4);
+        assert_eq!(aligned[4].1.text, "foo");
     }
 
     // ── Regression: tokenize_with_math caches TextAnalyzer (OnceLock<Mutex<>>) ──
@@ -3043,8 +3041,9 @@ fn test_search_fuzzy_with_path_filter() {
     // ── Regression: align_offsets_to_tantivy with cached tokenizer ──
 
     #[test]
-    fn test_align_offsets_to_tantivy_trailing_unmatched() {
-        // WordPositions that extend beyond the token stream should be ignored
+    fn test_align_offsets_to_tantivy_empty_segment_skipped() {
+        // Una WP con texto vacío (después de clean_word_text) no produce entry.
+        // Esto puede ocurrir si un carácter no genera match con TOKEN_PATTERN.
         let wp = vec![
             crate::extractor::WordPosition {
                 page: 1, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
@@ -3052,14 +3051,19 @@ fn test_search_fuzzy_with_path_filter() {
             },
             crate::extractor::WordPosition {
                 page: 1, x_min: 10.0, y_min: 0.0, x_max: 20.0, y_max: 10.0,
-                text: "world".to_string(),
+                text: "".to_string(),  // WP vacía → sin segmentos
             },
             crate::extractor::WordPosition {
                 page: 2, x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0,
-                text: "extra".to_string(),
+                text: "world".to_string(),
             },
         ];
         let aligned = align_offsets_to_tantivy("hello world", &wp);
-        assert_eq!(aligned.len(), 2, "trailing unmatched WordPositions should be dropped");
+        // "hello" y "world" producen entries, la WP vacía se saltea
+        assert_eq!(aligned.len(), 2);
+        assert_eq!(aligned[0].0, 0);
+        assert_eq!(aligned[0].1.text, "hello");
+        assert_eq!(aligned[1].0, 1);
+        assert_eq!(aligned[1].1.text, "world");
     }
 }

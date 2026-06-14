@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::path::Path;
 
+use crate::indexer::TOKEN_PATTERN;
 use crate::pdfium;
 use crate::pdfium::FS_RECTF;
 
@@ -9,8 +10,8 @@ use crate::pdfium::FS_RECTF;
 /// `[\p{L}\p{N}\p{S}]+` tokenizer pattern.
 pub fn clean_word_text(s: &str) -> String {
     static INIT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = INIT.get_or_init(|| Regex::new(r"[\p{L}\p{N}\p{S}]+").unwrap());
-    let cleaned: String = re.find_iter(s).map(|m| m.as_str()).collect();
+    let re = INIT.get_or_init(|| Regex::new(TOKEN_PATTERN).unwrap());
+    let cleaned: String = re.find_iter(s).map(|m| m.as_str()).collect::<Vec<_>>().join(" ");
     cleaned
 }
 
@@ -172,6 +173,7 @@ unsafe fn extract_text_and_positions(
                             });
                             current_word.clear();
                             has_word = false;
+                            text.push(' ');
                         }
                     }
                     current_word.push(c);
@@ -210,6 +212,7 @@ unsafe fn extract_text_and_positions(
                     y_max: top_max as f32,
                     text: clean_word_text(&current_word),
                 });
+                text.push(' ');
             }
 
             // Apply Y-flip to all word positions on this page (PDF bottom-left → bitmap top-left)
@@ -769,7 +772,8 @@ mod tests {
     #[test]
     fn test_clean_word_text_mixed() {
         let cleaned = clean_word_text("don't");
-        assert_eq!(cleaned, "dont", "Apostrophe is stripped by is_alphanumeric_or_symbol");
+        // clean_word_text extrae ["don", "t"] con la regex [\p{L}\p{N}\p{S}]+ y los une con espacio
+        assert_eq!(cleaned, "don t", "Apostrophe no coincide con TOKEN_PATTERN, separa en dos tokens");
     }
 
     #[test]

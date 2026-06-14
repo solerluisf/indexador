@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -66,6 +67,21 @@ const ERR_CHANNEL_CAPACITY: i32 = -104;
 const ERR_NULL_PTR: i32 = -105;
 const ERR_BUFFER_TOO_SMALL: i32 = -106;
 const ERR_COLLECTION_NOT_FOUND: i32 = -107;
+
+// ---------------------------------------------------------------------------
+// Debug logging to file (visible to user without a debugger)
+// ---------------------------------------------------------------------------
+
+fn debug_log(msg: &str) {
+    let path = std::env::temp_dir().join("pdf_debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "[DEBUG] pid={} msg={}", std::process::id(), msg);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Safe accessors — read (shared) / write (exclusive)
@@ -543,11 +559,15 @@ fn get_phrase_positions_via_tantivy(
     for &word in words {
         match search_index.search_term_positions(doc_id as u64, word) {
             Ok(offsets) if !offsets.is_empty() => word_offsets.push(offsets),
-            _ => return None,
+            _ => {
+                debug_log(&format!("search_term_positions('{}') returned empty/None for doc_id={}", word, doc_id));
+                return None;
+            }
         }
     }
 
     if word_offsets.len() < 2 {
+        debug_log(&format!("word_offsets.len() < 2 (only {})", word_offsets.len()));
         return None;
     }
 
@@ -560,26 +580,45 @@ fn get_phrase_positions_via_tantivy(
             .collect();
     }
 
+    for (i, offs) in word_offsets.iter().enumerate() {
+        debug_log(&format!("word_offsets[{}] ({:?}): {:?}", i, words.get(i), offs));
+    }
+    debug_log(&format!("phrase_starts after filter: {:?}", phrase_starts));
+
     if phrase_starts.is_empty() {
+        debug_log("no phrase starts found, returning None");
         return None;
     }
 
-    let mut result = Vec::new();
+    // Collect all needed offsets across all phrase starts
+    let all_offsets: Vec<usize> = phrase_starts.iter()
+        .flat_map(|&start| (0..word_offsets.len()).map(move |i| start + i))
+        .collect();
 
+    // Single load: one SQL query, one zstd decompress, one bincode deserialize
+    let Ok(all_positions) = position_store.get_positions(doc_id, &all_offsets) else {
+        return None;
+    };
+    if all_positions.is_empty() {
+        return None;
+    }
+
+    // Build offset→position lookup
+    let pos_map: std::collections::HashMap<usize, &pdf_extractor::positions::StoredPosition> =
+        all_positions.iter().map(|p| (p.word_offset, p)).collect();
+
+    let mut result = Vec::new();
     for &start in &phrase_starts {
-        let offsets: Vec<usize> = (0..word_offsets.len()).map(|i| start + i).collect();
-        if let Ok(positions) = position_store.get_positions(doc_id, &offsets) {
-            if positions.is_empty() {
-                continue;
-            }
-            // Group by page first, then by line (vertical overlap), creating
-            // one merged bounding box per line within the phrase.  This avoids
-            // a giant rectangle spanning from the end of one line to the
-            // beginning of the next when a phrase wraps across lines.
-            result.extend(merge_by_line(&positions, words));
+        let phrase_positions: Vec<pdf_extractor::positions::StoredPosition> =
+            (0..word_offsets.len())
+                .filter_map(|i| pos_map.get(&(start + i)).copied().cloned())
+                .collect();
+        if phrase_positions.len() == word_offsets.len() {
+            result.extend(merge_by_line(&phrase_positions, words));
         }
     }
 
+    debug_log(&format!("get_phrase_positions_via_tantivy result count = {}", result.len()));
     if result.is_empty() { None } else { Some(result) }
 }
 
@@ -590,12 +629,21 @@ fn get_phrase_positions_via_sqlite(
     words: &[&str],
     position_store: &pdf_extractor::positions::PositionStore,
 ) -> Option<Vec<pdf_extractor::positions::StoredPosition>> {
+    // Single load of all positions for the document
+    let all_positions = position_store.load_all_for_doc(doc_id).ok()?;
+
     let mut word_positions: Vec<Vec<pdf_extractor::positions::StoredPosition>> = Vec::new();
     for word in words.iter().filter(|w| !w.is_empty()) {
-        if let Ok(positions) = position_store.get_positions_by_term(doc_id, word) {
-            if !positions.is_empty() {
-                word_positions.push(positions);
-            }
+        let word_lower = word.to_lowercase();
+        let matching: Vec<pdf_extractor::positions::StoredPosition> = all_positions.iter()
+            .filter(|p| {
+                let lower = p.word_text.to_lowercase();
+                lower == word_lower || lower.split(' ').any(|seg| seg == word_lower)
+            })
+            .cloned()
+            .collect();
+        if !matching.is_empty() {
+            word_positions.push(matching);
         }
     }
 
@@ -676,8 +724,13 @@ pub unsafe extern "C" fn pdf_get_term_positions(
     let rc = (|| -> i32 {
         let term_str = match unsafe { cstr_to_str(term) } {
             Ok(s) => s,
-            Err(e) => return e,
+            Err(e) => {
+                debug_log(&format!("pdf_get_term_positions: cstr_to_str failed coll_id={} doc_id={}", coll_id, doc_id));
+                return e;
+            }
         };
+
+        debug_log(&format!("pdf_get_term_positions ENTER coll_id={} doc_id={} term=\"{}\"", coll_id, doc_id, term_str));
 
         let index_path = if coll_id == 0 {
             with_app_read(|app| app.index_path.clone()).unwrap_or(None)
@@ -686,9 +739,13 @@ pub unsafe extern "C" fn pdf_get_term_positions(
                 Ok(Ok(c)) => Some(PathBuf::from(&c.data_dir).join(".pdf_extractor").join("index")),
                 Ok(Err(_)) => {
                     set_error("Collection not found".into());
+                    debug_log("pdf_get_term_positions: collection not found");
                     return ERR_COLLECTION_NOT_FOUND;
                 }
-                Err(e) => return e,
+                Err(e) => {
+                    debug_log(&format!("pdf_get_term_positions: registry error={}", e));
+                    return e;
+                }
             }
         };
 
@@ -696,18 +753,24 @@ pub unsafe extern "C" fn pdf_get_term_positions(
             Some(p) => p,
             None => {
                 set_error("No index available (call pdf_init or create a registry)".into());
+                debug_log("pdf_get_term_positions: no index_path");
                 return -2;
             }
         };
 
+        debug_log(&format!("pdf_get_term_positions: index_path={:?}", index_path));
+
         let positions_db_path = index_path.join("positions.sqlite");
         let position_store = match pdf_extractor::positions::PositionStore::open(&positions_db_path) {
             Ok(store) => store,
-            Err(_) => {
+            Err(e) => {
+                debug_log(&format!("pdf_get_term_positions: PositionStore::open failed path={:?} err={}", positions_db_path, e));
                 let empty = b"[]";
                 return unsafe { write_to_buffer(empty, out_json, out_len) };
             }
         };
+
+        debug_log("pdf_get_term_positions: PositionStore opened OK");
 
         let stripped: String = term_str.trim_matches('"').to_string();
         let words: Vec<&str> = stripped.split_whitespace().collect();
@@ -2722,6 +2785,23 @@ fn do_search_with_index(
             entry
         })
         .collect();
+
+    // Log diagnóstico: query, cantidad de hits, primer resultado
+    if results.len() > 0 {
+        let first_id = results
+            .first()
+            .map(|(_, d)| d.get_first(search_index.id_field).and_then(|v| v.as_u64()).unwrap_or(0))
+            .unwrap_or(0);
+        eprintln!(
+            "[SEARCH] query=\"{}\" filter={:?} boolean={:?} hits={} total={} first_id={}",
+            query,
+            settings.path_filter,
+            settings.boolean_query.as_ref().map(|v| format!("{:?}", v)),
+            results.len(),
+            total_count,
+            first_id,
+        );
+    }
 
     Ok((json_entries, total_count))
 }

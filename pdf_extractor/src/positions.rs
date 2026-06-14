@@ -184,7 +184,10 @@ impl PositionStore {
         let term_lower = term.to_lowercase();
         Ok(all
             .into_iter()
-            .filter(|p| p.word_text.to_lowercase() == term_lower)
+            .filter(|p| {
+                let lower = p.word_text.to_lowercase();
+                lower == term_lower || lower.split(' ').any(|seg| seg == term_lower)
+            })
             .collect())
     }
 
@@ -225,7 +228,7 @@ impl PositionStore {
     // ------------------------------------------------------------------
 
     /// Load, decompress and deserialise the full position list for a doc.
-    fn load_all_for_doc(&self, doc_id: i64) -> Result<Vec<StoredPosition>> {
+    pub fn load_all_for_doc(&self, doc_id: i64) -> Result<Vec<StoredPosition>> {
         let blob: Vec<u8> = self
             .conn
             .query_row(

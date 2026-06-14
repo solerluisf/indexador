@@ -1,3 +1,4 @@
+use crate::indexer::TOKEN_PATTERN;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream, Tokenizer, RegexTokenizer};
 
 /// A reusable token stream backed by a Vec of Tokens.
@@ -40,7 +41,7 @@ impl Tokenizer for LanguageAwareTokenizer {
     type TokenStream<'a> = BoxTokenStream<'a>;
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
-        let mut tokenizer = RegexTokenizer::new(r"[\p{L}\p{N}\p{S}]+")
+        let mut tokenizer = RegexTokenizer::new(TOKEN_PATTERN)
             .expect("Hardcoded regex pattern should never fail");
         let mut stream = tokenizer.token_stream(text);
         let mut tokens = Vec::new();
