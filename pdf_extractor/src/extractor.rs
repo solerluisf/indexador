@@ -15,6 +15,15 @@ pub fn clean_word_text(s: &str) -> String {
     cleaned
 }
 
+/// Check if the entire string matches TOKEN_PATTERN as a single token.
+/// If so, no per-segment splitting is needed and we can use the
+/// incrementally-computed bounding box directly.
+fn is_single_token(s: &str) -> bool {
+    static INIT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = INIT.get_or_init(|| Regex::new(&format!("^{}$", crate::indexer::TOKEN_PATTERN)).unwrap());
+    re.is_match(s)
+}
+
 /// A word's bounding box on a single PDF page.
 /// Coordinates are in PDF user space (origin bottom-left, units in points, 1/72 inch).
 /// `text` is always a single token (no spaces) after extraction.
@@ -128,6 +137,11 @@ unsafe fn extract_text_and_positions(
             let mut prev_bottom = 0.0f64;
             let mut prev_top = 0.0f64;
             let mut has_prev = false;
+            // Fast-path min/max for single-token words (avoids split_word_into_segments)
+            let mut current_min_x: f32 = f32::MAX;
+            let mut current_min_y: f32 = f32::MAX;
+            let mut current_max_x: f32 = f32::MIN;
+            let mut current_max_y: f32 = f32::MIN;
             // Running average character metrics for relative gap thresholds
             let mut total_height = 0.0f64;
             let mut total_width = 0.0f64;
@@ -148,12 +162,27 @@ unsafe fn extract_text_and_positions(
                 if ch == 0 || !bbox_ok {
                     if has_word {
                         let page_num = (page_idx + 1) as u32;
-                        word_positions
-                            .extend(split_word_into_segments(&current_word, &current_char_positions, page_num));
+                        if is_single_token(&current_word) {
+                            word_positions.push(WordPosition {
+                                page: page_num,
+                                x_min: current_min_x,
+                                y_min: current_min_y,
+                                x_max: current_max_x,
+                                y_max: current_max_y,
+                                text: current_word.clone(),
+                            });
+                        } else {
+                            word_positions
+                                .extend(split_word_into_segments(&current_word, &current_char_positions, page_num));
+                        }
                         current_word.clear();
                         current_char_positions.clear();
                         has_word = false;
                         has_prev = false;
+                        current_min_x = f32::MAX;
+                        current_min_y = f32::MAX;
+                        current_max_x = f32::MIN;
+                        current_max_y = f32::MIN;
                     }
                     if !last_char_was_space {
                         text.push(' ');
@@ -172,12 +201,27 @@ unsafe fn extract_text_and_positions(
                 if c.is_whitespace() || is_newline {
                     if has_word {
                         let page_num = (page_idx + 1) as u32;
-                        word_positions
-                            .extend(split_word_into_segments(&current_word, &current_char_positions, page_num));
+                        if is_single_token(&current_word) {
+                            word_positions.push(WordPosition {
+                                page: page_num,
+                                x_min: current_min_x,
+                                y_min: current_min_y,
+                                x_max: current_max_x,
+                                y_max: current_max_y,
+                                text: current_word.clone(),
+                            });
+                        } else {
+                            word_positions
+                                .extend(split_word_into_segments(&current_word, &current_char_positions, page_num));
+                        }
                         current_word.clear();
                         current_char_positions.clear();
                         has_word = false;
                         has_prev = false;
+                        current_min_x = f32::MAX;
+                        current_min_y = f32::MAX;
+                        current_max_x = f32::MIN;
+                        current_max_y = f32::MIN;
                     }
                     if is_newline {
                         text.push('\n');
@@ -194,12 +238,27 @@ unsafe fn extract_text_and_positions(
                         let horiz_gap = left - prev_right;
                         if vert_gap > avg_h * 0.7 || horiz_gap.abs() > avg_w * 1.5 {
                             let page_num = (page_idx + 1) as u32;
-                            word_positions.extend(
-                                split_word_into_segments(&current_word, &current_char_positions, page_num),
-                            );
+                            if is_single_token(&current_word) {
+                                word_positions.push(WordPosition {
+                                    page: page_num,
+                                    x_min: current_min_x,
+                                    y_min: current_min_y,
+                                    x_max: current_max_x,
+                                    y_max: current_max_y,
+                                    text: current_word.clone(),
+                                });
+                            } else {
+                                word_positions.extend(
+                                    split_word_into_segments(&current_word, &current_char_positions, page_num),
+                                );
+                            }
                             current_word.clear();
                             current_char_positions.clear();
                             has_word = false;
+                            current_min_x = f32::MAX;
+                            current_min_y = f32::MAX;
+                            current_max_x = f32::MIN;
+                            current_max_y = f32::MIN;
                             text.push(' ');
                         }
                     }
@@ -210,6 +269,10 @@ unsafe fn extract_text_and_positions(
                         right: right as f32,
                         top: top as f32,
                     });
+                    current_min_x = current_min_x.min(left as f32);
+                    current_min_y = current_min_y.min(bottom as f32);
+                    current_max_x = current_max_x.max(right as f32);
+                    current_max_y = current_max_y.max(top as f32);
                     if !has_word {
                         has_word = true;
                     }
@@ -228,8 +291,19 @@ unsafe fn extract_text_and_positions(
 
             if has_word {
                 let page_num = (page_idx + 1) as u32;
-                word_positions
-                    .extend(split_word_into_segments(&current_word, &current_char_positions, page_num));
+                if is_single_token(&current_word) {
+                    word_positions.push(WordPosition {
+                        page: page_num,
+                        x_min: current_min_x,
+                        y_min: current_min_y,
+                        x_max: current_max_x,
+                        y_max: current_max_y,
+                        text: current_word.clone(),
+                    });
+                } else {
+                    word_positions
+                        .extend(split_word_into_segments(&current_word, &current_char_positions, page_num));
+                }
                 text.push(' ');
             }
 
