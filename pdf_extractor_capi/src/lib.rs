@@ -713,7 +713,8 @@ pub unsafe extern "C" fn pdf_get_term_positions(
         let words: Vec<&str> = stripped.split_whitespace().collect();
 
         let all_positions: Vec<pdf_extractor::positions::StoredPosition> = if words.len() > 1 {
-            // Multi-word phrase: try Tantivy term positions first, then SQLite adjacency
+            // Multi-word phrase: try Tantivy term positions first, then SQLite
+            // adjacency, then finally individual word positions (non-phrase match).
             get_phrase_positions_via_tantivy(&index_path, doc_id, &words, &position_store)
                 .or_else(|| get_phrase_positions_via_sqlite(doc_id, &words, &position_store))
                 .unwrap_or_default()
