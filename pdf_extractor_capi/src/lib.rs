@@ -10,7 +10,7 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::canonical_combining_class;
 
 use pdf_extractor::extractor::clean_word_text;
-use pdf_extractor::indexer::{Indexer, SearchIndex};
+use pdf_extractor::indexer::{Indexer, SearchIndex, parse_query_auto_phrase};
 use pdf_extractor::metrics::Metrics;
 use pdf_extractor::output::JsonlWriter;
 use pdf_extractor::ocr::{self, find_tesseract};
@@ -596,10 +596,31 @@ fn get_phrase_positions_via_tantivy(
         .collect();
 
     // Single load: one SQL query, one zstd decompress, one bincode deserialize
-    let Ok(all_positions) = position_store.get_positions(doc_id, &all_offsets) else {
-        return None;
+    debug_log(&format!(
+        "get_phrase_positions_via_tantivy: calling get_positions doc_id={} offsets_count={} first_offset={}",
+        doc_id,
+        all_offsets.len(),
+        all_offsets.first().copied().unwrap_or(0),
+    ));
+    let all_positions = match position_store.get_positions(doc_id, &all_offsets) {
+        Ok(p) => p,
+        Err(e) => {
+            debug_log(&format!(
+                "get_phrase_positions_via_tantivy: get_positions FAILED for doc_id={}: {}",
+                doc_id, e,
+            ));
+            return None;
+        }
     };
+    debug_log(&format!(
+        "get_phrase_positions_via_tantivy: got {} positions from SQLite",
+        all_positions.len(),
+    ));
     if all_positions.is_empty() {
+        debug_log(&format!(
+            "get_phrase_positions_via_tantivy: get_positions returned EMPTY for doc_id={} offsets_count={}",
+            doc_id, all_offsets.len(),
+        ));
         return None;
     }
 
@@ -2736,8 +2757,7 @@ fn do_search_with_index(
         .ok();
     let infra_searcher = infra_reader.as_ref().map(|r| r.searcher());
     let infra_query = if !query.trim().is_empty() {
-        let qp = tantivy::query::QueryParser::for_index(&search_index.index, vec![search_index.content_field]);
-        qp.parse_query(query).ok()
+        parse_query_auto_phrase(&search_index.index, query, search_index.content_field).ok()
     } else {
         None
     };
@@ -2785,23 +2805,6 @@ fn do_search_with_index(
             entry
         })
         .collect();
-
-    // Log diagnóstico: query, cantidad de hits, primer resultado
-    if results.len() > 0 {
-        let first_id = results
-            .first()
-            .map(|(_, d)| d.get_first(search_index.id_field).and_then(|v| v.as_u64()).unwrap_or(0))
-            .unwrap_or(0);
-        eprintln!(
-            "[SEARCH] query=\"{}\" filter={:?} boolean={:?} hits={} total={} first_id={}",
-            query,
-            settings.path_filter,
-            settings.boolean_query.as_ref().map(|v| format!("{:?}", v)),
-            results.len(),
-            total_count,
-            first_id,
-        );
-    }
 
     Ok((json_entries, total_count))
 }

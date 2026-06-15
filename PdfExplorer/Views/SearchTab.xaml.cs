@@ -634,11 +634,14 @@ public partial class SearchTab : Page, IPdfRenderingService
         if (index < 0 || index >= _state.MatchingPages.Count) return;
         _state.CurrentMatchIndex = index;
 
-        // With CanContentScroll=True, ScrolToVerticalOffset uses logical units (item indices).
-        // The VirtualizingStackPanel's IScrollInfo converts this to the correct pixel offset.
-        PageScroller.ScrollToVerticalOffset(index);
-
-        UpdateMatchNav();
+        // Defer scroll until after layout pass so virtualized items are realized
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            // With CanContentScroll=True, ScrollToVerticalOffset uses logical units (item indices).
+            // The VirtualizingStackPanel's IScrollInfo converts this to the correct pixel offset.
+            PageScroller.ScrollToVerticalOffset(index);
+            UpdateMatchNav();
+        }), System.Windows.Threading.DispatcherPriority.Render);
     }
 
     private void UpdateMatchNav()

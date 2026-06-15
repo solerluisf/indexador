@@ -177,15 +177,10 @@ impl SearchIndex {
             .try_into()?;
         let searcher = reader.searcher();
 
-        let mut query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
-        query_parser.set_conjunction_by_default();
-
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
         if !query_str.trim().is_empty() {
-            let boxed = query_parser
-                .parse_query(query_str)
-                .context("Failed to parse search query")?;
+            let boxed = parse_query_auto_phrase(&self.index, query_str, self.content_field)?;
             clauses.push((Occur::Must, boxed));
         }
 
@@ -299,10 +294,7 @@ impl SearchIndex {
             .try_into()?;
         let searcher = reader.searcher();
 
-        let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
-        let parsed = query_parser.parse_query(query_str)
-            .context("Failed to parse search query for count")?;
-
+        let parsed = parse_query_auto_phrase(&self.index, query_str, self.content_field)?;
         let count = searcher.search(&parsed, &Count)?;
         Ok(count as u64)
     }
@@ -441,10 +433,7 @@ impl SearchIndex {
                     clauses.push((Occur::Must, Box::new(BooleanQuery::new(fuzzy_clauses))));
                 }
             } else {
-                let query_parser = QueryParser::for_index(&self.index, vec![field]);
-                let boxed = query_parser
-                    .parse_query(query_str)
-                    .context("Failed to parse search query")?;
+                let boxed = parse_query_auto_phrase(&self.index, query_str, field)?;
                 clauses.push((Occur::Must, boxed));
             }
         }
@@ -603,8 +592,7 @@ impl SearchIndex {
         if !query_str.trim().is_empty() {
             for &(field_name, boost) in fields {
                 if let Ok(field) = self.schema.get_field(field_name) {
-                    let qp = QueryParser::for_index(&self.index, vec![field]);
-                    if let Ok(parsed) = qp.parse_query(query_str) {
+                    if let Ok(parsed) = parse_query_auto_phrase(&self.index, query_str, field) {
                         if boost != 1.0 {
                             clauses.push((Occur::Should, Box::new(BoostQuery::new(parsed, boost))));
                         } else {
@@ -747,12 +735,10 @@ impl SearchIndex {
             .try_into()?;
         let searcher = reader.searcher();
 
-        let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
-
         let mut bool_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for (term, occur) in clauses {
             if !term.trim().is_empty() {
-                if let Ok(q) = query_parser.parse_query(term) {
+                if let Ok(q) = parse_query_auto_phrase(&self.index, term, self.content_field) {
                     bool_clauses.push((*occur, q));
                 }
             }
@@ -790,6 +776,26 @@ impl SearchIndex {
 
         Ok(results)
     }
+}
+
+fn is_bare_multiword(s: &str) -> bool {
+    let t = s.trim();
+    t.contains(' ') && !t.contains('"')
+}
+
+pub fn parse_query_auto_phrase(
+    index: &Index,
+    query_str: &str,
+    field: Field,
+) -> Result<Box<dyn Query>> {
+    let mut qp = QueryParser::for_index(index, vec![field]);
+    qp.set_conjunction_by_default();
+    let adjusted = if is_bare_multiword(query_str) {
+        format!("\"{}\"", query_str.trim())
+    } else {
+        query_str.to_string()
+    };
+    qp.parse_query(&adjusted).context("Failed to parse search query")
 }
 
 #[allow(dead_code)]
