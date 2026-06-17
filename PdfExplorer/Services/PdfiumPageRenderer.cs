@@ -52,6 +52,10 @@ public sealed class PdfiumPageRenderer : IDisposable
     private static extern void pdf_free_bitmap(IntPtr pixels);
 
     [DllImport("pdf_extractor_capi.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_get_page_rotation(
+        int handle, int pageIndex, out int outRotation);
+
+    [DllImport("pdf_extractor_capi.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_close_document(int handle);
 
     [DllImport("pdf_extractor_capi.dll", CallingConvention = CallingConvention.Cdecl)]
@@ -161,6 +165,25 @@ public sealed class PdfiumPageRenderer : IDisposable
                         $"Failed to get page {pageIndex} dimensions (rc={rc})");
                 _pageDimsCache[pageIndex] = (w, h);
                 return (w, h);
+            }
+        }
+    }
+
+    public int GetPageRotation(int pageIndex)
+    {
+        lock (_lock)
+        {
+            if (_docHandle < 0)
+                throw new InvalidOperationException("No document open. Call OpenDocument first.");
+
+            lock (GlobalPdfiumLock)
+            {
+                int rc = pdf_get_page_rotation(
+                    _docHandle, pageIndex, out int rotation);
+                if (rc < 0)
+                    throw new InvalidOperationException(
+                        $"Failed to get page {pageIndex} rotation (rc={rc})");
+                return rotation;
             }
         }
     }

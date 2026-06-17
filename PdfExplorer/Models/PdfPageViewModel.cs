@@ -8,6 +8,8 @@ internal sealed class PdfPageViewModel : INotifyPropertyChanged
 {
     public int PageIndex { get; init; }
     public int MatchIndex { get; init; }
+    public int ImagePixelWidth { get; set; }
+    public int ImagePixelHeight { get; set; }
     public List<WordPosition> Positions { get; set; } = new();
 
     public string PageHeader => $"Page {PageIndex + 1}";

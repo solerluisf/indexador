@@ -1510,6 +1510,49 @@ pub unsafe extern "C" fn pdf_get_page_dimensions(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pdf_get_page_rotation(
+    handle: i32,
+    page_index: i32,
+    out_rotation: *mut i32,
+) -> i32 {
+    if out_rotation.is_null() {
+        return ERR_NULL_PTR;
+    }
+    let pdfium = match pdf_extractor::pdfium::Pdfium::global() {
+        Some(p) => p,
+        None => {
+            set_error("pdfium.dll not available".into());
+            return -1;
+        }
+    };
+    let map = OPEN_DOCS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let (doc_ptr, _) = match map.get(&handle) {
+        Some(entry) => *entry,
+        None => {
+            set_error("Invalid document handle".into());
+            return -1;
+        }
+    };
+    let doc = doc_ptr as *mut std::ffi::c_void;
+    let page_count = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+    if page_index < 0 || page_index >= page_count {
+        set_error(format!("Page {} out of range ({} pages)", page_index, page_count));
+        return -1;
+    }
+    let page = unsafe { (pdfium.FPDF_LoadPage)(doc, page_index) };
+    if page.is_null() {
+        set_error("Failed to load page".into());
+        return -1;
+    }
+    let rotation = pdfium.FPDF_GetPageRotation.map_or(0, |f| unsafe { f(page) });
+    unsafe { (pdfium.FPDF_ClosePage)(page); }
+    unsafe {
+        *out_rotation = rotation as i32;
+    }
+    0
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pdf_document_page_count(handle: i32) -> i32 {
     let map = OPEN_DOCS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     match map.get(&handle) {

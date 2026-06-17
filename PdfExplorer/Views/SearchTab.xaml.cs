@@ -7,6 +7,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using PdfExplorer.Models;
 using PdfExplorer.Services;
 using PdfExplorer.ViewModels;
@@ -33,6 +34,8 @@ public partial class SearchTab : Page, IPdfRenderingService
     private string _lastQuery = string.Empty;
     private PdfViewState _state = new();
     private uint? _selectedCollId;
+    private bool _isLoading;
+    private bool _isNavigating;
 
     private static void Log(string msg)
     {
@@ -304,6 +307,12 @@ public partial class SearchTab : Page, IPdfRenderingService
     {
         try
         {
+            if (_isLoading)
+            {
+                Log("OnResultSelected: skipped (already loading)");
+                return;
+            }
+
             if (ResultsList.SelectedItem is not SearchResultViewModel result)
             {
                 Log("OnResultSelected: no selection");
@@ -315,6 +324,10 @@ public partial class SearchTab : Page, IPdfRenderingService
             // otherwise ClearViewer would cancel the token we just created.
             _selectionCts?.Cancel();
             ClearViewer();
+
+            // Physically disable UI to prevent reentrant clicks during async load
+            _isLoading = true;
+            ResultsList.IsEnabled = false;
 
             _selectionCts = new CancellationTokenSource();
             var ct = _selectionCts.Token;
@@ -351,8 +364,21 @@ public partial class SearchTab : Page, IPdfRenderingService
                         result.Id,
                         _lastQuery
                     ));
+                    var before = _state.Positions.Count;
+                    _state.Positions = _state.Positions
+                        .OrderBy(p => p.Page)
+                        .ThenBy(p => p.YMax)
+                        .DistinctBy(p => (p.Page, p.XMin, p.YMin, p.XMax, p.YMax))
+                        .ToList();
+                    var dupes = before - _state.Positions.Count;
                     var t1 = DateTime.UtcNow;
-                    Log($"GetTermPositions returned {_state.Positions.Count} positions (took {(t1 - t0).TotalMilliseconds:F0}ms)");
+                    Log($"GetTermPositions returned {_state.Positions.Count} positions ({dupes} dupes removed, took {(t1 - t0).TotalMilliseconds:F0}ms)");
+                    // Diagnostic: dump first 20 positions with page/Y to stderr
+                    for (int di = 0; di < Math.Min(20, _state.Positions.Count); di++)
+                    {
+                        var dp = _state.Positions[di];
+                        Log($"  pos[{di}] page={dp.Page} YMin={dp.YMin:F2} YMax={dp.YMax:F2} word='{dp.WordText}'");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -466,7 +492,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         // Coalesce concurrent render requests for the same page.
         // Multiple PdfPageView controls can request the same pageIdx
-        // simultaneously during VirtualizingStackPanel recycling.
+        // simultaneously during rapid navigation.
         try
         {
             return await _pendingRenders.GetOrAdd(pageIdx, idx => RenderPageInternalAsync(idx, pagePositions, ct));
@@ -600,12 +626,13 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private async void OnPrevMatch(object sender, RoutedEventArgs e)
     {
+        if (_isLoading) return;
         try
         {
             if (_state.CurrentMatchIndex <= 0) return;
             var prevIdx = _state.CurrentMatchIndex - 1;
             _state.CurrentMatchIndex = prevIdx;
-            ScrollToMatch(prevIdx);
+            ScrollToMatch(prevIdx, scrollToTop: true);
         }
         catch (Exception ex)
         {
@@ -615,12 +642,13 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private async void OnNextMatch(object sender, RoutedEventArgs e)
     {
+        if (_isLoading) return;
         try
         {
             if (_state.CurrentMatchIndex >= _state.TotalMatchPages - 1) return;
             var nextIdx = _state.CurrentMatchIndex + 1;
             _state.CurrentMatchIndex = nextIdx;
-            ScrollToMatch(nextIdx);
+            ScrollToMatch(nextIdx, scrollToTop: true);
         }
         catch (Exception ex)
         {
@@ -628,20 +656,111 @@ public partial class SearchTab : Page, IPdfRenderingService
         }
     }
 
-    private void ScrollToMatch(int index)
+    private void ScrollToMatch(int index, bool scrollToTop = false)
     {
-        Log($"ScrollToMatch({index})");
+        Log($"ScrollToMatch({index}, scrollToTop={scrollToTop})");
         if (index < 0 || index >= _state.MatchingPages.Count) return;
         _state.CurrentMatchIndex = index;
 
-        // Defer scroll until after layout pass so virtualized items are realized
-        Dispatcher.BeginInvoke(new Action(() =>
+        int pageIdx = _state.MatchingPages[index];
+        int posIdx = _state.Positions.FindIndex(p => p.Page - 1 == pageIdx);
+        _state.CurrentPositionIndex = posIdx >= 0 ? posIdx : -1;
+        Log($"ScrollToMatch: synced CurrentPositionIndex={_state.CurrentPositionIndex} (pageIdx={pageIdx}, firstPosIdx={posIdx})");
+
+        double targetPx;
+        double viewH = PageScroller.ViewportHeight;
+
+        if (scrollToTop)
         {
-            // With CanContentScroll=True, ScrollToVerticalOffset uses logical units (item indices).
-            // The VirtualizingStackPanel's IScrollInfo converts this to the correct pixel offset.
-            PageScroller.ScrollToVerticalOffset(index);
+            PageList.UpdateLayout();
+            var container = PageList.ItemContainerGenerator.ContainerFromIndex(index) as FrameworkElement;
+            if (container is not null)
+            {
+                container.UpdateLayout();
+                Point containerOrigin = container.TransformToAncestor(PageScroller).Transform(new Point(0, 0));
+                targetPx = PageScroller.VerticalOffset + containerOrigin.Y;
+            }
+            else
+            {
+                targetPx = AccumulatePageHeightBefore(index);
+            }
+            targetPx = Math.Max(0, Math.Min(targetPx, PageScroller.ScrollableHeight));
+            PageScroller.ScrollToVerticalOffset(targetPx);
+            Log($"ScrollToMatch (page top): targetPx={targetPx:F1}");
             UpdateMatchNav();
-        }), System.Windows.Threading.DispatcherPriority.Render);
+            UpdatePositionNav();
+            return;
+        }
+
+        if (posIdx >= 0 && _state.PageViewModels is not null && index < _state.PageViewModels.Count)
+        {
+            var pos = _state.Positions[posIdx];
+            var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
+            int rotation = _renderer.GetPageRotation(pageIdx);
+            var mapper = new PdfCoordinateMapper(wPts, hPts, 0, 0);
+            double normalizedY = mapper.ToNormalizedCenterY(PdfRect.FromLtrb(pos.XMin, pos.YMin, pos.XMax, pos.YMax), rotation);
+
+            // Try to use actual WPF layout via PointToScreen
+            double wordContentY = 0;
+            bool refined = false;
+
+            PageList.UpdateLayout();
+
+            var container = PageList.ItemContainerGenerator.ContainerFromIndex(index) as FrameworkElement;
+            if (container is not null)
+            {
+                container.UpdateLayout();
+                var imgControl = FindChild<Image>(container);
+                if (imgControl is not null && imgControl.ActualHeight > 0)
+                {
+                    Rect pdfRealBounds = GetActualImageRect(imgControl);
+                if (pdfRealBounds != Rect.Empty)
+                {
+                    double wordYLocal = pdfRealBounds.Top + normalizedY * pdfRealBounds.Height;
+                    Point relativeWord = imgControl.TransformToAncestor(PageScroller).Transform(new Point(0, wordYLocal));
+                    wordContentY = PageScroller.VerticalOffset + relativeWord.Y;
+                    refined = true;
+                }
+                }
+            }
+
+            if (!refined)
+            {
+                double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
+                wordContentY = AccumulatePageHeightBefore(index);
+                wordContentY += LayoutConstants.WordOffsetWithinItem(
+                    availW,
+                    _state.PageViewModels[index].ImagePixelWidth,
+                    _state.PageViewModels[index].ImagePixelHeight,
+                    normalizedY);
+            }
+
+            targetPx = wordContentY - viewH / 2;
+        }
+        else
+        {
+            targetPx = AccumulatePageHeightBefore(index);
+        }
+
+        targetPx = Math.Max(0, Math.Min(targetPx, PageScroller.ScrollableHeight));
+        PageScroller.ScrollToVerticalOffset(targetPx);
+        Log($"ScrollToMatch: targetPx={targetPx:F1}");
+        UpdateMatchNav();
+        UpdatePositionNav();
+    }
+
+    private double AccumulatePageHeightBefore(int matchIdx)
+    {
+        if (_state.PageViewModels is null || matchIdx <= 0) return 0;
+        double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
+        double total = 0;
+        for (int i = 0; i < matchIdx; i++)
+        {
+            var vm = _state.PageViewModels[i];
+            total += LayoutConstants.TotalItemHeight(
+                availW, vm.ImagePixelWidth, vm.ImagePixelHeight);
+        }
+        return total;
     }
 
     private void UpdateMatchNav()
@@ -663,73 +782,254 @@ public partial class SearchTab : Page, IPdfRenderingService
             : "0 / 0";
         PrevPosition.IsEnabled = count > 0 && _state.CurrentPositionIndex > 0;
         NextPosition.IsEnabled = count > 0 && _state.CurrentPositionIndex < count - 1;
+        Log($"UpdatePositionNav: count={count}, idx={_state.CurrentPositionIndex}, prev={PrevPosition.IsEnabled}, next={NextPosition.IsEnabled}, label='{PositionInfo.Content}'");
     }
 
     private async void OnPrevPosition(object sender, RoutedEventArgs e)
     {
+        if (_isLoading) return;
         try
         {
-            if (_state.Positions.Count == 0 || _state.CurrentPositionIndex <= 0) return;
+            if (_isNavigating) { Log("OnPrevPosition: skipped (navigation in progress)"); return; }
+            _isNavigating = true;
+            if (_state.Positions.Count == 0 || _state.CurrentPositionIndex <= 0) { Log($"OnPrevPosition: guard blocked (count={_state.Positions.Count}, idx={_state.CurrentPositionIndex})"); return; }
             _state.CurrentPositionIndex--;
+            Log($"OnPrevPosition: decrementing to {_state.CurrentPositionIndex}");
             await NavigateToPosition(_state.CurrentPositionIndex);
         }
         catch (Exception ex)
         {
             Log($"OnPrevPosition error: {ex.GetType().Name}: {ex.Message}");
         }
+        finally
+        {
+            _isNavigating = false;
+        }
     }
 
     private async void OnNextPosition(object sender, RoutedEventArgs e)
     {
+        if (_isLoading) return;
         try
         {
-            if (_state.Positions.Count == 0 || _state.CurrentPositionIndex >= _state.Positions.Count - 1) return;
+            Log($"OnNextPosition: count={_state.Positions.Count}, idx={_state.CurrentPositionIndex}");
+            if (_isNavigating) { Log("OnNextPosition: skipped (navigation in progress)"); return; }
+            _isNavigating = true;
+            if (_state.Positions.Count == 0 || _state.CurrentPositionIndex >= _state.Positions.Count - 1)
+            {
+                Log($"OnNextPosition: guard blocked");
+                return;
+            }
             _state.CurrentPositionIndex++;
+            Log($"OnNextPosition: incrementing to {_state.CurrentPositionIndex}");
             await NavigateToPosition(_state.CurrentPositionIndex);
         }
         catch (Exception ex)
         {
             Log($"OnNextPosition error: {ex.GetType().Name}: {ex.Message}");
         }
+        finally
+        {
+            _isNavigating = false;
+        }
     }
 
     private async Task NavigateToPosition(int posIdx)
     {
+        Log($"NavigateToPosition({posIdx}) — entering");
+        if (_isLoading)
+        {
+            Log("NavigateToPosition: skipped (loading in progress)");
+            return;
+        }
         if (posIdx < 0 || posIdx >= _state.Positions.Count)
         {
             Log($"NavigateToPosition: invalid posIdx={posIdx} (count={_state.Positions.Count})");
             return;
         }
 
-        var pos = _state.Positions[posIdx];
-        var pageIdx = pos.Page - 1;
-
-        var matchIdx = _state.MatchingPages.IndexOf(pageIdx);
-        if (matchIdx < 0 || matchIdx >= _state.PageViewModels?.Count)
+        if (PageScroller.ViewportWidth <= 12)
         {
-            Log($"NavigateToPosition: matchIdx={matchIdx} out of range (pages={_state.PageViewModels?.Count})");
+            Log($"NavigateToPosition: ViewportWidth={PageScroller.ViewportWidth} too small, deferring");
+            var capturedState = _state;
+            EventHandler? handler = null;
+            handler = (_, _) =>
+            {
+                if (!ReferenceEquals(_state, capturedState))
+                {
+                    PageScroller.LayoutUpdated -= handler;
+                    return;
+                }
+                if (PageScroller.ViewportWidth > 12)
+                {
+                    PageScroller.LayoutUpdated -= handler;
+                    _ = NavigateToPosition(posIdx);
+                }
+            };
+            PageScroller.LayoutUpdated += handler;
             return;
         }
 
+        var pos = _state.Positions[posIdx];
+        var pageIdx = pos.Page - 1;
+        Log($"NavigateToPosition: page={pos.Page}, word='{pos.WordText}', YMin={pos.YMin:F2}, YMax={pos.YMax:F2}");
+
+        var matchIdx = _state.MatchingPages.IndexOf(pageIdx);
+        Log($"NavigateToPosition: matchIdx={matchIdx}, MatchingPages=[{string.Join(",", _state.MatchingPages)}], PageViewModels={(_state.PageViewModels is null ? "null" : _state.PageViewModels.Count.ToString())}");
+        if (matchIdx < 0 || _state.PageViewModels is null || matchIdx >= _state.PageViewModels.Count)
+        {
+            Log($"NavigateToPosition: matchIdx={matchIdx} out of range (pages={_state.PageViewModels?.Count}) — returning early");
+            return;
+        }
+
+        int prevMatchIdx = _state.CurrentMatchIndex;
+        string prevPageStr = prevMatchIdx >= 0 && prevMatchIdx < _state.MatchingPages.Count
+            ? (_state.MatchingPages[prevMatchIdx] + 1).ToString()
+            : "N/A";
+        Log($"NavigateToPosition: page transition {prevMatchIdx}→{matchIdx}, prevPage={prevPageStr}, newPage={pos.Page}");
         _state.CurrentMatchIndex = matchIdx;
 
-        // With CanContentScroll=True, scroll in logical units (item index)
-        PageScroller.ScrollToVerticalOffset(matchIdx);
+        // Get normalized Y position of the word within its page (0 = top, 1 = bottom)
+        var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
+        int rotation = _renderer.GetPageRotation(pageIdx);
+        var mapper = new PdfCoordinateMapper(wPts, hPts, 0, 0);
+        double normalizedY = mapper.ToNormalizedCenterY(PdfRect.FromLtrb(pos.XMin, pos.YMin, pos.XMax, pos.YMax), rotation);
+        Log($"NavigateToPosition: pagePts={wPts:F1}x{hPts:F1} rotation={rotation} normalizedY={normalizedY:F4} centerStored=({pos.XMin + (pos.XMax - pos.XMin) / 2:F1},{pos.YMin + (pos.YMax - pos.YMin) / 2:F1})");
+
+        // Ensure target page is rendered
+        double viewH = PageScroller.ViewportHeight;
+        var pagePositions = _state.PositionsByPage.TryGetValue(pageIdx, out var pp) ? pp : new List<WordPosition>();
+        await ((IPdfRenderingService)this).GetOrRenderPageAsync(pageIdx, pagePositions);
+
+        // Flush dispatcher queue at Background priority to ensure:
+        //   Normal   — PageImage setter (from PdfPageView.OnLoaded continuation)
+        //   DataBind — binding engine pushes PageImage → Image.Source
+        //   Loaded   — layout settles after binding update
+        //   Input    — any pending input is processed
+        //   Render   — any pending render ops
+        await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Background);
+        Log($"NavigateToPosition: dispatcher flushed");
+
+        // Compute scroll target: use PointToScreen for reliable screen-space coords
+        double wordContentY = 0;
+        bool refined = false;
+
+        PageList.UpdateLayout();
+
+        var targetContainer = PageList.ItemContainerGenerator.ContainerFromIndex(matchIdx) as FrameworkElement;
+        if (targetContainer is not null)
+        {
+            targetContainer.UpdateLayout();
+            var imgControl = FindChild<Image>(targetContainer);
+            bool srcOk = imgControl is not null && imgControl.Source is not null;
+            bool hOk = imgControl is not null && imgControl.ActualHeight > 0;
+            Log($"NavigateToPosition: container found, img={imgControl is not null} srcOk={srcOk} hOk={hOk} actualH={imgControl?.ActualHeight:F1}");
+            if (imgControl is not null && imgControl.Source is not null && imgControl.ActualHeight > 0)
+            {
+                Rect pdfRealBounds = GetActualImageRect(imgControl);
+                Log($"NavigateToPosition: GetActualImageRect returned empty={pdfRealBounds == Rect.Empty} bounds=({pdfRealBounds.X:F1},{pdfRealBounds.Y:F1},{pdfRealBounds.Width:F1},{pdfRealBounds.Height:F1})");
+                if (pdfRealBounds != Rect.Empty)
+                {
+                    double wordY = pdfRealBounds.Top + normalizedY * pdfRealBounds.Height;
+                    Point relativeWord = imgControl.TransformToAncestor(PageScroller).Transform(new Point(0, wordY));
+                    wordContentY = PageScroller.VerticalOffset + relativeWord.Y;
+                    refined = true;
+                    Log($"NavigateToPosition: REFINED wordY={wordY:F1} relToScroller=({relativeWord.X:F0},{relativeWord.Y:F0}) vOff={PageScroller.VerticalOffset:F1} wordContentY={wordContentY:F1}");
+                }
+            }
+            else
+            {
+                Log($"NavigateToPosition: Image not usable for refined path");
+            }
+        }
+        else
+        {
+            Log($"NavigateToPosition: container unavailable (matchIdx={matchIdx})");
+        }
+
+        if (!refined)
+        {
+            double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
+            double accBefore = AccumulatePageHeightBefore(matchIdx);
+            var fallbackVm = _state.PageViewModels![matchIdx];
+            double offsetWithin = LayoutConstants.WordOffsetWithinItem(availW, fallbackVm.ImagePixelWidth, fallbackVm.ImagePixelHeight, normalizedY);
+            wordContentY = accBefore + offsetWithin;
+            Log($"NavigateToPosition: FALLBACK availW={availW:F1} accBefore={accBefore:F1} vmSize={fallbackVm.ImagePixelWidth}x{fallbackVm.ImagePixelHeight} offsetWithin={offsetWithin:F1} wordContentY={wordContentY:F1}");
+        }
+
+        double target = wordContentY - viewH / 2;
+        target = Math.Max(0, Math.Min(target, PageScroller.ScrollableHeight));
+        Log($"NavigateToPosition: viewH={viewH:F1} target={target:F1} scrollableH={PageScroller.ScrollableHeight:F1}");
+
+        PageScroller.ScrollToVerticalOffset(target);
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            double afterOff = PageScroller.VerticalOffset;
+            double wordViewportY = wordContentY - afterOff;
+            WordMarker.Margin = new Thickness(0, wordViewportY - 8, 0, 0);
+            WordMarker.Visibility = Visibility.Visible;
+            Log($"NavigateToPosition: AFTER_SCROLL offset={afterOff:F1} wordViewportY={wordViewportY:F1} center={viewH / 2:F1} delta={Math.Abs(wordViewportY - viewH / 2):F1}");
+        }, System.Windows.Threading.DispatcherPriority.Loaded);
 
         UpdateMatchNav();
         UpdatePositionNav();
     }
 
-    // ── Build virtualized page models ─────────────────────────────
+
+    // ── Helpers ────────────────────────────────────────────────────
+
+    private static T? FindChild<T>(DependencyObject parent) where T : DependencyObject
+    {
+        for (int i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
+        {
+            var child = VisualTreeHelper.GetChild(parent, i);
+            if (child is T t) return t;
+            var found = FindChild<T>(child);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static Rect GetActualImageRect(Image imageControl)
+    {
+        var source = imageControl.Source;
+        if (source is null) return Rect.Empty;
+
+        double bitmapW = source.Width;
+        double bitmapH = source.Height;
+        double controlW = imageControl.ActualWidth;
+        double controlH = imageControl.ActualHeight;
+
+        if (bitmapW <= 0 || bitmapH <= 0 || controlW <= 0 || controlH <= 0)
+            return Rect.Empty;
+
+        double scale = Math.Min(controlW / bitmapW, controlH / bitmapH);
+        double actualPdfW = bitmapW * scale;
+        double actualPdfH = bitmapH * scale;
+        double offsetX = (controlW - actualPdfW) / 2;
+        double offsetY = (controlH - actualPdfH) / 2;
+
+        return new Rect(offsetX, offsetY, actualPdfW, actualPdfH);
+    }
+
+    // ── Build page models (no virtualization) ──────────────────────
 
     private void BuildOrDeferViewModels(CancellationToken ct)
     {
         if (PageScroller.ViewportWidth > 0)
         {
             BuildPageViewModels();
-            UpdateMatchNav();
             UpdatePositionNav();
-            ScrollToMatch(0);
+            FinishLoading();
+            _ = Dispatcher.InvokeAsync(async () =>
+            {
+                Log("BuildOrDeferViewModels: deferred NavigateToPosition(0) at Loaded");
+                if (_state.Positions.Count > 0)
+                {
+                    _state.CurrentPositionIndex = 0;
+                    await NavigateToPosition(0);
+                }
+            }, DispatcherPriority.Loaded);
             return;
         }
 
@@ -748,9 +1048,17 @@ public partial class SearchTab : Page, IPdfRenderingService
                 PageScroller.LayoutUpdated -= handler;
                 Log("BuildOrDeferViewModels: deferred build now");
                 BuildPageViewModels();
-                UpdateMatchNav();
                 UpdatePositionNav();
-                ScrollToMatch(0);
+                FinishLoading();
+                _ = Dispatcher.InvokeAsync(async () =>
+                {
+                    Log("BuildOrDeferViewModels: deferred NavigateToPosition(0) at Loaded (deferred path)");
+                    if (_state.Positions.Count > 0)
+                    {
+                        _state.CurrentPositionIndex = 0;
+                        await NavigateToPosition(0);
+                    }
+                }, DispatcherPriority.Loaded);
             }
         };
         PageScroller.LayoutUpdated += handler;
@@ -764,16 +1072,31 @@ public partial class SearchTab : Page, IPdfRenderingService
         {
             int pageIdx = _state.MatchingPages[i];
             _state.PositionsByPage.TryGetValue(pageIdx, out var pos);
+
+            // Estimate pixel dimensions from PDF page size + render DPI.
+            // These match the actual bitmap produced by RenderPageInternalAsync.
+            var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
+            int pixW = (int)(wPts * _renderer.TargetDpi / 72.0);
+            int pixH = (int)(hPts * _renderer.TargetDpi / 72.0);
+
             list.Add(new PdfPageViewModel
             {
                 PageIndex = pageIdx,
                 MatchIndex = i,
+                ImagePixelWidth = pixW,
+                ImagePixelHeight = pixH,
                 Positions = pos ?? new List<WordPosition>(),
             });
         }
 
         _state.PageViewModels = new ObservableCollection<PdfPageViewModel>(list);
         PageList.ItemsSource = _state.PageViewModels;
+    }
+
+    private void FinishLoading()
+    {
+        _isLoading = false;
+        ResultsList.IsEnabled = true;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────

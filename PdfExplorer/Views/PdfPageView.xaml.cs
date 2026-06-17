@@ -46,6 +46,8 @@ public partial class PdfPageView : UserControl
                 if (DataContext is PdfPageViewModel currentVm && currentVm.PageIndex == vm.PageIndex)
                 {
                     currentVm.PageImage = item.PageImage;
+                    currentVm.ImagePixelWidth = item.ImagePixelWidth;
+                    currentVm.ImagePixelHeight = item.ImagePixelHeight;
                     _rendered = true;
                 }
             });

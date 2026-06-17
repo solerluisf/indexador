@@ -88,30 +88,38 @@
                     </StackPanel>
                 </Border>
 
-                <!-- Scrollable page list (virtualized) -->
-                <ScrollViewer Grid.Row="1" x:Name="PageScroller" VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollBarVisibility="Disabled"
-                              CanContentScroll="True">
-                    <ItemsControl x:Name="PageList"
-                                  VirtualizingStackPanel.IsVirtualizing="True"
-                                  VirtualizingStackPanel.VirtualizationMode="Recycling">
-                        <ItemsControl.ItemsPanel>
-                            <ItemsPanelTemplate>
-                                <VirtualizingStackPanel />
-                            </ItemsPanelTemplate>
-                        </ItemsControl.ItemsPanel>
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate>
-                                <local:PdfPageView />
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                </ScrollViewer>
+                <!-- Page list with pixel-based scrolling (not virtualized) -->
+                <Grid Grid.Row="1">
+                    <ScrollViewer x:Name="PageScroller" VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled"
+                                  CanContentScroll="False">
+                        <ItemsControl x:Name="PageList"
+                                      VirtualizingStackPanel.IsVirtualizing="False">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <VirtualizingStackPanel />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <local:PdfPageView />
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+                    <Rectangle x:Name="CenterLine" Fill="Red" Height="2"
+                               HorizontalAlignment="Stretch" VerticalAlignment="Center"
+                               IsHitTestVisible="False"/>
+                    <Ellipse x:Name="WordMarker" Fill="Lime" Width="16" Height="16"
+                             HorizontalAlignment="Center" VerticalAlignment="Top"
+                             IsHitTestVisible="False"/>
+                </Grid>
 
                 <!-- Extracted words field -->
                 <TextBox Grid.Row="2" x:Name="WordsField"
                          IsReadOnly="True"
-                         Height="200"
+                         Height="0"
+                         Visibility="Collapsed"
                          Margin="0,5,10,0"
                          TextWrapping="Wrap"
                          VerticalScrollBarVisibility="Auto"
