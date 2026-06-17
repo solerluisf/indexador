@@ -113,38 +113,27 @@ public partial class SearchTab : Page, IPdfRenderingService
     private async Task RunSearch()
     {
         var query = SearchBox.Text;
-        if (string.IsNullOrWhiteSpace(query)) { Log("RunSearch: empty query"); return; }
+        if (string.IsNullOrWhiteSpace(query)) return;
         _lastQuery = query;
-        Log($"RunSearch: query='{query}', page={_currentPage}");
 
         try
         {
             var results = await Task.Run(() => _engine.Search(query, limit: 1000, offset: _currentPage * 1000, collId: _selectedCollId));
             _totalHits = results.Total;
-            Log($"RunSearch: totalHits={_totalHits}, results count={results.Results.Count}");
 
-            Log("RunSearch: creating ViewModels...");
             var viewModels = results.Results.Select(r => new SearchResultViewModel(r)).ToList();
-            Log($"RunSearch: created {viewModels.Count} ViewModels");
 
             ResultsList.ItemsSource = viewModels;
-            Log("RunSearch: ItemsSource assigned");
 
             // Start thumbnail preloading
-            Log("RunSearch: cancelling previous thumbnail CTS");
             _thumbCts?.Cancel();
             _thumbCts = new CancellationTokenSource();
             var thumbCt = _thumbCts.Token;
-            Log($"RunSearch: starting PreloadThumbnailsAsync with count={Math.Min(viewModels.Count, ThumbnailPreloadCount)}");
             _ = PreloadThumbnailsAsync(viewModels, ThumbnailPreloadCount, thumbCt)
                 .ContinueWith(t =>
                 {
                     if (t.Exception is null)
-                        _ = LoadRemainingThumbnailsAsync(viewModels, ThumbnailPreloadCount, thumbCt)
-                            .ContinueWith(t2 => Log($"LoadRemaining faulted: {t2.Exception?.InnerException?.Message}"),
-                                TaskContinuationOptions.OnlyOnFaulted);
-                    else
-                        Log($"PreloadThumbnails faulted: {t.Exception?.InnerException?.Message}");
+                        _ = LoadRemainingThumbnailsAsync(viewModels, ThumbnailPreloadCount, thumbCt);
                 }, TaskContinuationOptions.NotOnCanceled);
 
             var totalPages = _totalHits > 0 ? (int)System.Math.Ceiling(_totalHits / 1000.0) : 0;
@@ -155,40 +144,35 @@ public partial class SearchTab : Page, IPdfRenderingService
         }
         catch (Exception ex)
         {
-            Log($"RunSearch error: {ex}");
             ResultCountLabel.Text = $"Search error: {ex.Message}";
         }
     }
 
     private async Task PreloadThumbnailsAsync(List<SearchResultViewModel> items, int count, CancellationToken ct)
     {
-        Log($"PreloadThumbnailsAsync START: items={items.Count}, count={count}");
         var toLoad = items.Take(count).ToList();
 
-        // Collect raw thumbnail data from background threads first (no UI thread touch)
-        var rawResults = new List<(SearchResultViewModel vm, ThumbnailRawResult? raw)>(toLoad.Count);
-        foreach (var vm in toLoad)
+        // Collect raw thumbnail data concurrently (throttled by ThumbnailService.SemaphoreSlim(4))
+        var rawResults = (await Task.WhenAll(toLoad.Select(async vm =>
         {
-            if (ct.IsCancellationRequested) break;
+            if (ct.IsCancellationRequested) return (vm, raw: (ThumbnailRawResult?)null);
 
             try
             {
                 var raw = await _thumbService.GetThumbnailAsync(vm.Path, ct);
-                if (raw is not null && !ct.IsCancellationRequested)
-                    rawResults.Add((vm, raw));
+                return (vm, raw);
             }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex)
+            catch (OperationCanceledException) { return (vm, null); }
+            catch (Exception)
             {
-                Log($"PreloadThumbnailsAsync error for '{vm.FileName}': {ex.Message}");
+                return (vm, null);
             }
-        }
+        })))
+        .Where(r => r.raw is not null && !ct.IsCancellationRequested)
+        .ToList();
 
         if (rawResults.Count == 0 || ct.IsCancellationRequested)
-        {
-            Log("PreloadThumbnailsAsync: no thumbnails to create");
             return;
-        }
 
         // Single batch dispatch to UI thread — all BitmapSource creations in one InvokeAsync
         await Dispatcher.InvokeAsync(() =>
@@ -196,10 +180,7 @@ public partial class SearchTab : Page, IPdfRenderingService
             ct.ThrowIfCancellationRequested();
 
             if (ResultsList.ItemsSource is not System.Collections.IList list)
-            {
-                Log("PreloadThumbnailsAsync: ItemsSource is gone");
                 return;
-            }
 
             foreach (var (vm, raw) in rawResults)
             {
@@ -212,24 +193,20 @@ public partial class SearchTab : Page, IPdfRenderingService
                 vm.Thumbnail = bmp;
             }
         });
-
-        Log("PreloadThumbnailsAsync END");
     }
 
     private async Task LoadRemainingThumbnailsAsync(List<SearchResultViewModel> items, int skipCount, CancellationToken ct)
     {
         var remaining = items.Skip(skipCount).ToList();
-        Log($"LoadRemainingThumbnailsAsync START: {remaining.Count} items to load (skipped first {skipCount})");
 
-        foreach (var vm in remaining)
+        await Task.WhenAll(remaining.Select<SearchResultViewModel, Task>(async vm =>
         {
-            if (ct.IsCancellationRequested) break;
-            if (vm.Thumbnail is not null) continue;
+            if (ct.IsCancellationRequested || vm.Thumbnail is not null) return;
 
             try
             {
                 var raw = await _thumbService.GetThumbnailAsync(vm.Path, ct);
-                if (raw is null || ct.IsCancellationRequested) continue;
+                if (raw is null) return;
 
                 await Dispatcher.InvokeAsync(() =>
                 {
@@ -245,14 +222,9 @@ public partial class SearchTab : Page, IPdfRenderingService
                     vm.Thumbnail = bmp;
                 });
             }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex)
-            {
-                Log($"LoadRemainingThumbnailsAsync error for '{vm.FileName}': {ex.Message}");
-            }
-        }
-
-        Log("LoadRemainingThumbnailsAsync END");
+            catch (OperationCanceledException) { }
+            catch (Exception) { }
+        }));
     }
 
     private async void OnNextPage(object sender, RoutedEventArgs e)
@@ -686,7 +658,6 @@ public partial class SearchTab : Page, IPdfRenderingService
             }
             targetPx = Math.Max(0, Math.Min(targetPx, PageScroller.ScrollableHeight));
             PageScroller.ScrollToVerticalOffset(targetPx);
-            Log($"ScrollToMatch (page top): targetPx={targetPx:F1}");
             UpdateMatchNav();
             UpdatePositionNav();
             return;
@@ -899,7 +870,9 @@ public partial class SearchTab : Page, IPdfRenderingService
         // Ensure target page is rendered
         double viewH = PageScroller.ViewportHeight;
         var pagePositions = _state.PositionsByPage.TryGetValue(pageIdx, out var pp) ? pp : new List<WordPosition>();
+        var stateBefore = _state;
         await ((IPdfRenderingService)this).GetOrRenderPageAsync(pageIdx, pagePositions);
+        if (!ReferenceEquals(_state, stateBefore)) return;
 
         // Flush dispatcher queue at Background priority to ensure:
         //   Normal   — PageImage setter (from PdfPageView.OnLoaded continuation)
@@ -908,6 +881,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         //   Input    — any pending input is processed
         //   Render   — any pending render ops
         await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Background);
+        if (!ReferenceEquals(_state, stateBefore)) return;
         Log($"NavigateToPosition: dispatcher flushed");
 
         // Compute scroll target: use PointToScreen for reliable screen-space coords
@@ -951,7 +925,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         {
             double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
             double accBefore = AccumulatePageHeightBefore(matchIdx);
-            var fallbackVm = _state.PageViewModels![matchIdx];
+            var fallbackVm = _state.PageViewModels[matchIdx];
             double offsetWithin = LayoutConstants.WordOffsetWithinItem(availW, fallbackVm.ImagePixelWidth, fallbackVm.ImagePixelHeight, normalizedY);
             wordContentY = accBefore + offsetWithin;
             Log($"NavigateToPosition: FALLBACK availW={availW:F1} accBefore={accBefore:F1} vmSize={fallbackVm.ImagePixelWidth}x{fallbackVm.ImagePixelHeight} offsetWithin={offsetWithin:F1} wordContentY={wordContentY:F1}");
@@ -966,8 +940,6 @@ public partial class SearchTab : Page, IPdfRenderingService
         {
             double afterOff = PageScroller.VerticalOffset;
             double wordViewportY = wordContentY - afterOff;
-            WordMarker.Margin = new Thickness(0, wordViewportY - 8, 0, 0);
-            WordMarker.Visibility = Visibility.Visible;
             Log($"NavigateToPosition: AFTER_SCROLL offset={afterOff:F1} wordViewportY={wordViewportY:F1} center={viewH / 2:F1} delta={Math.Abs(wordViewportY - viewH / 2):F1}");
         }, System.Windows.Threading.DispatcherPriority.Loaded);
 

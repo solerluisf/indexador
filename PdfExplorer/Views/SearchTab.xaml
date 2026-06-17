@@ -107,12 +107,6 @@
                             </ItemsControl.ItemTemplate>
                         </ItemsControl>
                     </ScrollViewer>
-                    <Rectangle x:Name="CenterLine" Fill="Red" Height="2"
-                               HorizontalAlignment="Stretch" VerticalAlignment="Center"
-                               IsHitTestVisible="False"/>
-                    <Ellipse x:Name="WordMarker" Fill="Lime" Width="16" Height="16"
-                             HorizontalAlignment="Center" VerticalAlignment="Top"
-                             IsHitTestVisible="False"/>
                 </Grid>
 
                 <!-- Extracted words field -->
