@@ -12,7 +12,6 @@ use tantivy::{doc, Index, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDo
 use tantivy::{DocSet, Postings, TERMINATED};
 
 use crate::math_tokenizer::MathAwareTokenizer;
-use crate::search::traits::QueryBuilder;
 
 /// Canonical token pattern used by both the extractor (`clean_word_text`) and
 /// Tantivy's tokenizers. Single source of truth — guarantees lockstep alignment.
@@ -171,67 +170,33 @@ impl SearchIndex {
         path_filter: Option<&str>,
         offset: usize,
     ) -> Result<Vec<(f32, TantivyDocument)>> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()?;
-        let searcher = reader.searcher();
+        use crate::search::builders::AutoPhraseQueryBuilder;
+        use crate::search::engines::TantivyEngine;
+        use crate::search::pipeline::{SearchPipeline, default_enrichers};
 
-        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-
-        if !query_str.trim().is_empty() {
-            let builder = crate::search::builders::AutoPhraseQueryBuilder;
-            let ctx = crate::search::types::SearchContext {
-                index: self.index.clone(),
-                content_field: self.content_field,
-                path_field: self.path_field,
-                position_store: None,
-            };
-            let input = crate::search::types::SearchInput {
-                query_str: query_str.to_string(),
-                field: None,
-                limit,
-                offset,
-                path_filter: path_filter.map(|s| s.to_string()),
-                strategy: crate::search::types::SearchStrategy::AutoPhrase,
-            };
-            let boxed = builder.build(&ctx, &input)?;
-            clauses.push((Occur::Must, boxed));
-        }
-
-        if let Some(pattern) = path_filter {
-            if !pattern.is_empty() {
-                let re_query = RegexQuery::from_pattern(pattern, self.path_field)
-                    .context("Invalid path filter regex")?;
-                clauses.push((Occur::Must, Box::new(re_query)));
-            }
-        }
-
-        if clauses.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let query: Box<dyn Query> = if clauses.len() == 1 {
-            clauses.into_iter().next().unwrap().1
-        } else {
-            Box::new(BooleanQuery::new(clauses))
+        let ctx = crate::search::types::SearchContext {
+            index: self.index.clone(),
+            id_field: self.id_field,
+            content_field: self.content_field,
+            path_field: self.path_field,
+            position_store: None,
+        };
+        let input = crate::search::types::SearchInput {
+            query_str: query_str.to_string(),
+            field: None,
+            limit,
+            offset,
+            path_filter: path_filter.map(|s| s.to_string()),
+            strategy: crate::search::types::SearchStrategy::AutoPhrase,
         };
 
-        let fetch_count = limit.checked_add(offset).unwrap_or(limit);
-        let top_docs = searcher
-            .search(&*query, &TopDocs::with_limit(fetch_count))
-            .context("Search failed")?;
-
-        let mut results = Vec::new();
-        for (score, doc_addr) in top_docs.iter().skip(offset) {
-            let doc = searcher.doc::<TantivyDocument>(*doc_addr)?;
-            results.push((*score, doc));
-            if results.len() >= limit {
-                break;
-            }
-        }
-        Ok(results)
+        let pipeline = SearchPipeline::new(
+            ctx,
+            Box::new(AutoPhraseQueryBuilder),
+            Box::new(TantivyEngine),
+            default_enrichers(),
+        );
+        pipeline.execute_raw(&input).map_err(|e| anyhow::anyhow!("{}", e))
     }
 
     /// Public search entry-point — delegates to `search_parsed`.
@@ -912,6 +877,12 @@ impl Indexer {
 
     pub fn metrics(&self) -> &IndexerMetrics {
         &self.metrics
+    }
+
+    pub fn store_word_positions(&self, doc_id: i64, positions: &[(usize, crate::extractor::WordPosition)]) -> Result<()> {
+        let store = self.position_store.lock().unwrap();
+        store.store_positions(doc_id, positions)?;
+        Ok(())
     }
 }
 

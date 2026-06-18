@@ -19,9 +19,7 @@ public class AppSettings
     [JsonInclude]
     public Dictionary<uint, float> CollectionBoosts { get; set; } = new();
 
-    public string? SearchField { get; set; }
     public string? PathFilter { get; set; }
-    public string? FieldWeights { get; set; }
     public string? BooleanQuery { get; set; }
     public string? ThemeName { get; set; } = "Light";
 }

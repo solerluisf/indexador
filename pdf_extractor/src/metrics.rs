@@ -8,10 +8,14 @@ pub struct Metrics {
     result_queue_depth: AtomicU64,
     indexer_docs_indexed: AtomicU64,
     indexer_last_commit_age: AtomicU64,
+    scanner_claimed_total: AtomicU64,
+    ocr_processed: AtomicU64,
+    ocr_errored: AtomicU64,
     search_count: AtomicU64,
     search_time_ns: AtomicU64,
     indexer_failed: AtomicBool,
     start: Instant,
+    last_summary_log: AtomicU64,
 }
 
 impl Metrics {
@@ -23,10 +27,14 @@ impl Metrics {
             result_queue_depth: AtomicU64::new(0),
             indexer_docs_indexed: AtomicU64::new(0),
             indexer_last_commit_age: AtomicU64::new(0),
+            scanner_claimed_total: AtomicU64::new(0),
+            ocr_processed: AtomicU64::new(0),
+            ocr_errored: AtomicU64::new(0),
             search_count: AtomicU64::new(0),
             search_time_ns: AtomicU64::new(0),
             indexer_failed: AtomicBool::new(false),
             start: Instant::now(),
+            last_summary_log: AtomicU64::new(0),
         }
     }
 
@@ -92,6 +100,58 @@ impl Metrics {
     }
 
     pub fn log_summary(&self) {
+    }
+
+    /// Log a periodic status summary every 5 seconds.
+    pub fn log_summary_with(&self, log_cb: Option<extern "C" fn(*const u8, u32)>) {
+        let now = self.elapsed_secs() as u64;
+        let last = self.last_summary_log.load(Ordering::Relaxed);
+        if now.wrapping_sub(last) < 5 {
+            return;
+        }
+        if self.last_summary_log.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let processed = self.processed();
+        let errored = self.errored();
+        let indexed = self.indexer_docs_indexed.load(Ordering::Relaxed);
+        let idx_age = self.indexer_last_commit_age.load(Ordering::Relaxed);
+        let scanner = self.scanner_claimed_total.load(Ordering::Relaxed);
+        let tput = self.throughput();
+        if let Some(cb) = log_cb {
+            let msg = format!(
+                "[summary] {} proc, {} err, {:.1} docs/s, {} indexed, idx_age={}s, {} claimed",
+                processed, errored, tput, indexed, idx_age, scanner
+            );
+            let bytes = msg.as_bytes();
+            cb(bytes.as_ptr(), bytes.len() as u32);
+        } else {
+            eprintln!(
+                "[summary] {} proc, {} err, {:.1} docs/s, {} indexed, idx_age={}s, {} claimed",
+                processed, errored, tput, indexed, idx_age, scanner
+            );
+        }
+    }
+
+    pub fn add_scanner_claimed(&self, n: u64) {
+        self.scanner_claimed_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn scanner_claimed_total(&self) -> u64 {
+        self.scanner_claimed_total.load(Ordering::Relaxed)
+    }
+
+    pub fn add_ocr_result(&self, processed: u64, errored: u64) {
+        self.ocr_processed.fetch_add(processed, Ordering::Relaxed);
+        self.ocr_errored.fetch_add(errored, Ordering::Relaxed);
+    }
+
+    pub fn ocr_processed(&self) -> u64 {
+        self.ocr_processed.load(Ordering::Relaxed)
+    }
+
+    pub fn ocr_errored(&self) -> u64 {
+        self.ocr_errored.load(Ordering::Relaxed)
     }
 
     pub fn set_indexer_failed(&self) {

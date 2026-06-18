@@ -193,13 +193,11 @@ public sealed class E2eIndexCreationTest : IClassFixture<E2eIndexCreationFixture
         _fixture = fixture;
         // Reset mutable search config before each test
         _fixture.Engine.PathFilter = null;
-        _fixture.Engine.RecencyWeight = 0;
     }
 
     public void Dispose()
     {
         _fixture.Engine.PathFilter = null;
-        _fixture.Engine.RecencyWeight = 0;
     }
 
     // ── Helper ──────────────────────────────────────────────────────
@@ -365,11 +363,8 @@ public sealed class E2eIndexCreationTest : IClassFixture<E2eIndexCreationFixture
     [Fact]
     public void Recency_boost_does_not_crash()
     {
-        _fixture.Engine.RecencyWeight = 0.5f;
         var ex = Record.Exception(() => Search("machine"));
         Assert.Null(ex);
-
-        _fixture.Engine.RecencyWeight = 0;
     }
 
     // ══════════════════════════════════════════════════════════════════

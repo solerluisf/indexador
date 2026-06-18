@@ -43,12 +43,7 @@ public sealed class DllIntegrationTests : IClassFixture<TestPdfFixture>, IDispos
 
     private void ResetSearchConfig()
     {
-        _fixture.Engine.FuzzyDistance = 0;
-        _fixture.Engine.StemEnabled = false;
-        _fixture.Engine.SearchField = null;
         _fixture.Engine.PathFilter = null;
-        _fixture.Engine.RecencyWeight = 0;
-        _fixture.Engine.FieldWeights = null;
         _fixture.Engine.BooleanQuery = null;
     }
 
@@ -129,7 +124,6 @@ public sealed class DllIntegrationTests : IClassFixture<TestPdfFixture>, IDispos
     public void Normalized_text_search_is_case_insensitive()
     {
         // normalized_text stores the lowercased version → "PATTERN" should match
-        _fixture.Engine.SearchField = "normalized_text";
         var resp = Search("pattern");
         Assert.True(resp.Total >= 2, $"Expected ≥2 results in normalized_text, got {resp.Total}");
     }
@@ -137,7 +131,6 @@ public sealed class DllIntegrationTests : IClassFixture<TestPdfFixture>, IDispos
     [Fact]
     public void Normalized_text_matches_uppercase_query()
     {
-        _fixture.Engine.SearchField = "normalized_text";
         var resp = Search("PATTERN");
         Assert.True(resp.Total >= 2, $"Expected ≥2 results for uppercase query, got {resp.Total}");
     }
@@ -163,7 +156,6 @@ public sealed class DllIntegrationTests : IClassFixture<TestPdfFixture>, IDispos
     [Fact]
     public void Stem_enabled_running_still_finds_match()
     {
-        _fixture.Engine.StemEnabled = true;
         var resp = Search("running");
         Assert.True(resp.Total >= 1, $"Expected ≥1 result with stem, got {resp.Total}");
     }
@@ -309,7 +301,6 @@ public sealed class DllIntegrationTests : IClassFixture<TestPdfFixture>, IDispos
     [Fact]
     public void Search_in_normalized_text_is_ci()
     {
-        _fixture.Engine.SearchField = "normalized_text";
         Assert.True(Search("pattern").Total >= 2);
     }
 
@@ -1059,9 +1050,6 @@ public sealed class SettingsPersistenceTests
             using var engine = new PdfEngine(dir);
 
             // Set distinctive values via property setters (updates Settings + pushes to DLL)
-            engine.FuzzyDistance = 2;
-            engine.StemEnabled = true;
-            engine.RecencyWeight = 0.75f;
             engine.OcrLanguage = "deu";
             engine.OcrWorkers = 8;
             engine.OcrMaxDim = 6000;
@@ -1079,18 +1067,10 @@ public sealed class SettingsPersistenceTests
             var jsonPath = Path.Combine(dir, "settings.json");
             Assert.True(File.Exists(jsonPath));
 
-            // Mutate in-memory Settings to different values
-            engine.Settings.FuzzyDistance = 0;
-            engine.Settings.StemEnabled = false;
-            engine.Settings.RecencyWeight = 0;
-
             // Reload from disk
             engine.LoadSettings();
 
             // Verify restored
-            Assert.Equal(2u, engine.Settings.FuzzyDistance);
-            Assert.True(engine.Settings.StemEnabled);
-            Assert.Equal(0.75f, engine.Settings.RecencyWeight);
             Assert.Equal("deu", engine.Settings.OcrLanguage);
             Assert.Equal(8u, engine.Settings.OcrWorkers);
             Assert.Equal(6000u, engine.Settings.OcrMaxDim);
@@ -1119,9 +1099,6 @@ public sealed class SettingsPersistenceTests
         {
             using var engine = new PdfEngine(dir);
 
-            Assert.Equal(0u, engine.Settings.FuzzyDistance);
-            Assert.False(engine.Settings.StemEnabled);
-            Assert.Equal(0f, engine.Settings.RecencyWeight);
             Assert.Equal("eng", engine.Settings.OcrLanguage);
             Assert.Equal(4u, engine.Settings.OcrWorkers);
             Assert.Equal(3000u, engine.Settings.OcrMaxDim);
@@ -1168,12 +1145,9 @@ public sealed class SettingsPersistenceTests
             var jsonPath = Path.Combine(dir, "settings.json");
 
             Assert.False(File.Exists(jsonPath));
-            engine.RecencyWeight = 0.5f;
             engine.SaveSettings();
             Assert.True(File.Exists(jsonPath));
 
-            var raw = File.ReadAllText(jsonPath);
-            Assert.Contains("\"RecencyWeight\": 0.5", raw);
         }
         finally
         {

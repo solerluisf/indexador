@@ -14,13 +14,22 @@ pub trait QueryBuilder: Send + Sync {
 
 /// Motor de ejecucion de busqueda.
 /// Recibe un query ya construido, lo ejecuta contra el indice.
+/// Retorna (score, documento, doc_address) por cada resultado.
 pub trait SearchEngine: Send + Sync {
     fn search(
         &self,
         ctx: &SearchContext,
         query: &dyn Query,
         input: &SearchInput,
-    ) -> Result<Vec<(f32, tantivy::TantivyDocument)>, SearchError>;
+    ) -> Result<Vec<(f32, tantivy::TantivyDocument, tantivy::DocAddress)>, SearchError>;
+
+    /// Retorna el total de documentos que matchean el query (sin paginacion).
+    fn count(
+        &self,
+        ctx: &SearchContext,
+        query: &dyn Query,
+        input: &SearchInput,
+    ) -> Result<u64, SearchError>;
 }
 
 /// Enriquecimiento de resultados post-ejecucion.

@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::bounded;
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -183,370 +184,15 @@ pub fn run_pipeline(
     metrics: Arc<Metrics>,
     input: &PathBuf,
     indexer: Option<Arc<Indexer>>,
-    config: &PipelineConfig,
+    config: PipelineConfig,
 ) -> Result<()> {
-    let pipeline_start = Instant::now();
-    let _scanned = scan_directory(&jobs, input)?;
-
-    let pending = jobs.count_pending()?;
-    if pending == 0 {
-        return Ok(());
-    }
-
-    // Worker binary is mandatory — in-thread extraction is unsafe (PDFium is not thread-safe).
-    let _worker_path = config
-        .worker_path
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!(
-            "worker_path is required: pdf_worker.exe must be deployed alongside the library. \
-             Run 'cargo build -p pdf_extractor --bin pdf_worker' to build it."
-        ))?;
-
-    let cap = config.channel_cap();
-    let (task_tx, task_rx) = bounded::<Vec<ExtractorTask>>(cap);
-    let (result_tx, result_rx) = bounded::<DocumentRecord>(cap);
-
-    let num_workers = config.extract_workers();
-    let indexer_batch_size = config.indexer_batch();
-    let commit_interval = config.commit_int();
-    let commit_timeout = config.commit_to();
-    let indexer_threads = config.indexer_threads();
-
-
-    // Producer: claim pending jobs from DB, distribute via heap-greedy
-    // to balance total MB across workers, and keep a bounded reservoir
-    // of extra docs for the next claim round.
-    let producer_jobs = Arc::clone(&jobs);
-    let producer_metrics = Arc::clone(&metrics);
-    let producer_cancel = config.cancel_flag.clone();
-    let r_size = config.reservoir_size() as i64;
-    let producer_handle = {
-        thread::spawn(move || {
-            let mut reserved: Vec<(i64, String, String, i64)> = Vec::new();
-
-            loop {
-                if producer_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
-                    break;
-                }
-
-                // 1. Drain reserved docs from previous claim round first
-                let mut claim_size = num_workers as i64 * BATCH_SIZE;
-                let mut all: Vec<(i64, String, String, i64)>;
-
-                if !reserved.is_empty() {
-                    let take = std::cmp::min(claim_size, reserved.len() as i64) as usize;
-                    all = reserved.drain(..take).collect();
-                    claim_size -= all.len() as i64;
-                } else {
-                    all = Vec::new();
-                }
-
-                // 2. Extended claim from DB if we still need docs
-                if claim_size > 0 {
-                    match producer_jobs.claim_pending(claim_size + r_size) {
-                        Ok(batch) => {
-                            all.extend(batch);
-                        }
-                        Err(_e) => {
-                            if all.is_empty() {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if all.is_empty() {
-                    break;
-                }
-
-                // 3. Sort descending by file_size — largest files first
-                all.sort_by(|a, b| b.3.cmp(&a.3));
-
-                // 4. Heap-greedy distribution across workers
-                let target = num_workers * BATCH_SIZE as usize;
-                let distribute_end = std::cmp::min(target, all.len());
-
-                let mut worker_batches: Vec<Vec<ExtractorTask>> =
-                    (0..num_workers).map(|_| Vec::new()).collect();
-
-                #[derive(Clone, Eq, PartialEq)]
-                struct HeapEntry {
-                    total_mb: i64,
-                    count: usize,
-                    worker_idx: usize,
-                }
-                impl Ord for HeapEntry {
-                    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                        other
-                            .total_mb
-                            .cmp(&self.total_mb)
-                            .then(other.count.cmp(&self.count))
-                    }
-                }
-                impl PartialOrd for HeapEntry {
-                    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                        Some(self.cmp(other))
-                    }
-                }
-
-                let mut heap: std::collections::BinaryHeap<HeapEntry> =
-                    std::collections::BinaryHeap::new();
-                for i in 0..num_workers {
-                    heap.push(HeapEntry {
-                        total_mb: 0,
-                        count: 0,
-                        worker_idx: i,
-                    });
-                }
-
-                for &(id, ref path, ref checksum, size) in &all[..distribute_end] {
-                    let mut entry = loop {
-                        let e = heap.pop().expect("heap should not be empty");
-                        if e.count < BATCH_SIZE as usize {
-                            break e;
-                        }
-                    };
-
-                    worker_batches[entry.worker_idx].push(ExtractorTask {
-                        id,
-                        path: path.clone(),
-                        checksum: checksum.clone(),
-                    });
-                    entry.total_mb += size;
-                    entry.count += 1;
-                    heap.push(entry);
-                }
-
-                // 5. Store leftover docs as reserved (already status='extracting')
-                reserved.extend(all.into_iter().skip(distribute_end));
-
-                // 6. Send batches through channel (backpressure: blocks if channel full)
-                for tasks in worker_batches {
-                    if !tasks.is_empty() {
-                        producer_metrics.set_task_queue_depth(task_tx.len() as u64);
-                        if task_tx.send(tasks).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        })
-    };
-
-    let log_cb = config.log_cb;
-    let process_cb = config.process_cb;
-
-    // Workers: extract PDFs via OS process per batch
-    // (full process isolation so PDFium cannot corrupt shared state).
-    let mut worker_handles = Vec::new();
-    for i in 0..num_workers {
-        let task_rx = task_rx.clone();
-        let result_tx = result_tx.clone();
-        let worker_jobs = Arc::clone(&jobs);
-        let worker_metrics = Arc::clone(&metrics);
-        let worker_path = config.worker_path.clone();
-        let wp = worker_path.expect("worker_path validated above");
-        let worker_cancel = config.cancel_flag.clone();
-        let handle = thread::Builder::new()
-            .name(format!("extract-{}", i))
-            .spawn(move || {
-                run_extraction_process(
-                    &wp, &task_rx, &result_tx, &worker_jobs, &worker_metrics,
-                    worker_cancel, log_cb, process_cb,
-                );
-            })
-            .expect("Failed to spawn worker thread");
-        worker_handles.push(handle);
-    }
-
-    drop(task_rx);
-    drop(result_tx);
-
-    // Indexer channel
-    let (index_tx, index_rx) = bounded::<DocumentRecord>(cap);
-    let may_index = indexer.is_some();
-
-    // JSONL channel: pre-serialized bytes sent to a dedicated writer thread
-    let (jsonl_tx, jsonl_rx) = bounded::<Vec<u8>>(cap);
-
-    let indexer_handle = match indexer {
-        Some(ref idx) => {
-            let idx = Arc::clone(idx);
-            let metrics_for_indexer = Arc::clone(&metrics);
-            let jobs_for_indexer = Arc::clone(&jobs);
-            let handle = thread::Builder::new()
-                .name("indexer".into())
-                .spawn(move || {
-                    indexer_thread(&*idx, jobs_for_indexer, index_rx, &metrics_for_indexer, indexer_batch_size, commit_interval, commit_timeout, indexer_threads, log_cb);
-                })
-                .expect("Failed to spawn indexer thread");
-            Some(handle)
-        }
-        None => None,
-    };
-
-    // Dedicated JSONL writer thread — decouples I/O from consumer loop
-    let jsonl_writer = Arc::clone(&writer);
-    let writer_thread = thread::Builder::new()
-        .name("jsonl-writer".into())
-        .spawn(move || {
-            for json_bytes in &jsonl_rx {
-                if let Err(e) = jsonl_writer.write_json_bytes(&json_bytes) {
-                    log_msg(log_cb, &format!("[jsonl-writer] write failed: {}", e));
-                    break;
-                }
-            }
-            let _ = jsonl_writer.flush();
-        })
-        .expect("Failed to spawn writer thread");
-
-    let total_pending = pending as u64;
-    let progress_cb = &config.progress_cb;
-    let cancel_flag = config.cancel_flag.clone();
-
-    // Consumer: receive results, serialize JSON, forward to writer + indexer
-    let is_cancelled = move || cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed));
-
-    // Throttle progress callback to at most once per 500 docs to reduce FFI overhead.
-    let progress_throttle = 50u64;
-
-    let writer_start = Instant::now();
-    let mut writer_jsonl_time = Duration::ZERO;
-    let mut writer_docs: u64 = 0;
-
-    macro_rules! process_record {
-        ($record:expr) => {{
-            let record = $record;
-            metrics.set_result_queue_depth(result_rx.len() as u64);
-            let write_start = Instant::now();
-            let mut json_bytes = match serde_json::to_vec(&record) {
-                Ok(j) => j,
-                Err(e) => {
-                    jobs.mark_error(record.id, &format!("json serialize failed: {}", e))
-                        .ok();
-                    metrics.increment_errored();
-                    continue;
-                }
-            };
-            json_bytes.push(b'\n');
-            if jsonl_tx.send(json_bytes).is_err() {
-                log_msg(log_cb, "[pipeline] jsonl-writer channel disconnected");
-                break;
-            }
-            writer_jsonl_time += write_start.elapsed();
-            writer_docs += 1;
-            let processed = metrics.increment_processed();
-
-            if record.file_extraction_ms > 0 {
-                log_msg(log_cb, &format!(
-                    "[timing] file={} pages={} extraction={:.3}s",
-                    record.path,
-                    record.page_count,
-                    record.file_extraction_ms as f64 / 1000.0,
-                ));
-            }
-
-            if may_index {
-                let id = record.id;
-                let path = record.path.clone();
-                if index_tx.send(record).is_err() {
-                    log_msg(log_cb, &format!(
-                        "[pipeline] indexer channel disconnected for id={} path='{}' — indexer unavailable, will retry on next run",
-                        id, path
-                    ));
-                }
-            }
-
-            if let Some(ref cb) = progress_cb {
-                let done = processed + metrics.errored();
-                if done % progress_throttle == 0 || done >= total_pending {
-                    cb(done, total_pending);
-                }
-            }
-            metrics.log_summary();
-        }};
-    }
-
-    // Phase 1: normal blocking receive, check cancel between records
-    for record in &result_rx {
-        if is_cancelled() {
-            break;
-        }
-        process_record!(record);
-    }
-
-    // Phase 2: drain any records still in-flight from workers
-    if is_cancelled() {
-        loop {
-            match result_rx.try_recv() {
-                Ok(record) => process_record!(record),
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-            }
-        }
-
-        for h in worker_handles {
-            h.join().expect("Worker panicked");
-        }
-
-        loop {
-            match result_rx.try_recv() {
-                Ok(record) => process_record!(record),
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-            }
-        }
-    } else {
-        for h in worker_handles {
-            h.join().expect("Worker panicked");
-        }
-    }
-
-    drop(index_tx);
-    drop(jsonl_tx);
-
-    producer_handle.join().expect("Producer panicked");
-    writer_thread.join().expect("Writer panicked");
-    if let Some(h) = indexer_handle {
-        h.join().expect("Indexer panicked");
-    }
-
-    log_msg(log_cb, &format!(
-        "[timing] writer: {:.3}s total, {:.3}s in JSONL serialize, {} docs",
-        writer_start.elapsed().as_secs_f64(),
-        writer_jsonl_time.as_secs_f64(),
-        writer_docs,
-    ));
-
-    // Reset any tasks still in 'extracting' back to 'pending'.
-    jobs.reprocess_extracting()?;
-
-    log_msg(log_cb, &format!(
-        "[timing] writer: {:.3}s total, {:.3}s in JSONL writes, {} docs",
-        writer_start.elapsed().as_secs_f64(),
-        writer_jsonl_time.as_secs_f64(),
-        writer_docs,
-    ));
-
-    let processed = metrics.processed();
-    let errored = metrics.errored();
-    let elapsed = format_uptime(pipeline_start.elapsed());
-    log_msg(log_cb, &format!(
-        "[pipeline] done — {} total ({:?} processed, {:?} errored) in {}",
-        processed + errored, processed, errored, elapsed
-    ));
-
-    if metrics.indexer_failed() {
-        anyhow::bail!("Indexer failed to initialize — Tantivy index writer could not be created. Check disk space, permissions, and index integrity.");
-    }
-
-    Ok(())
+    PipelineOrchestrator::new(config, jobs, writer, metrics, input.clone(), indexer).run()
 }
 
 fn indexer_thread(
     indexer: &Indexer,
     jobs: Arc<JobStore>,
-    rx: crossbeam_channel::Receiver<DocumentRecord>,
+    rx: crossbeam_channel::Receiver<IndexerMsg>,
     metrics: &Metrics,
     batch_size: usize,
     commit_interval: u64,
@@ -568,17 +214,27 @@ fn indexer_thread(
     let mut doc_count: u64 = 0;
     let mut last_commit = Instant::now();
     let mut writer = index_writer;
+    let mut total_flush_time = Duration::ZERO;
+    let mut flush_count: u64 = 0;
 
     loop {
         let timeout = Duration::from_secs(commit_timeout);
         let result = rx.recv_timeout(timeout);
         match result {
-            Ok(record) => {
+            Ok(IndexerMsg::Index(record)) => {
                 buf.push(record);
                 if buf.len() >= batch_size {
                     let batch: Vec<DocumentRecord> = buf.drain(..).collect();
+                    let flush_start = Instant::now();
                     flush_batch(&mut writer, indexer, &mut done_ids, &batch, log_cb);
+                    let flush_elapsed = flush_start.elapsed();
+                    total_flush_time += flush_elapsed;
+                    flush_count += 1;
                     doc_count += batch.len() as u64;
+                    log_msg(log_cb, &format!(
+                        "[indexer] flushed batch {} ({} docs) in {:.3}s",
+                        flush_count, batch.len(), flush_elapsed.as_secs_f64(),
+                    ));
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -708,6 +364,8 @@ fn flush_batch(
     done_ids.extend(pending_done);
     align_time += align_start.elapsed();
 
+    let phase1 = phase1_start.elapsed();
+
     let phase2_start = Instant::now();
 
     // Phase 2: store word positions (SQLite I/O).
@@ -722,12 +380,13 @@ fn flush_batch(
     let phase2_elapsed = phase2_start.elapsed();
 
     log_msg(log_cb, &format!(
-        "[timing] flush_batch({}): add={:.3}s align={:.3}s store={:.3}s wall={:.3}s docs_with_positions={}",
+        "[timing] flush_batch({}): phase1={:.3}s (add={:.3}s align={:.3}s) store={:.3}s wall={:.3}s docs_with_positions={}",
         batch_size,
+        phase1.as_secs_f64(),
         add_time.as_secs_f64(),
         align_time.as_secs_f64(),
         phase2_elapsed.as_secs_f64(),
-        (add_time + align_time + phase2_elapsed).as_secs_f64(),
+        (phase1 + phase2_elapsed).as_secs_f64(),
         positions_to_store.len(),
     ));
 }
@@ -756,198 +415,7 @@ pub fn run_ocr_post_processing(
     log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) -> Result<u64> {
     let num_workers = resolve_ocr_workers(num_workers_override);
-    let max_retries = ocr_config.max_retries;
-
-    let pending = jobs.count_ocr_pending(max_retries)?;
-    if pending == 0 {
-
-        return Ok(0);
-    }
-
-
-    // Open JSONL writer if output path provided
-    let jsonl_writer = if let Some(ref out_path) = output_path {
-
-        Some(Arc::new(JsonlWriter::new(out_path)?))
-    } else {
-        None
-    };
-
-    let (ocr_tx, ocr_rx) = bounded::<(i64, String, String)>(100);
-    let (result_tx, result_rx) = bounded::<(i64, String, String, String)>(100);
-
-    // Clone cancel_flag for the consumer thread; the original is kept
-    // for the worker threads below.
-    let consumer_cancel = cancel_flag.clone();
-
-    // Consumer thread: process results immediately so mark_ocr_attempt
-    // runs as soon as OCR text arrives, preventing producer re-fetches.
-    let consumer_jobs = Arc::clone(&jobs);
-    let consumer_writer = jsonl_writer.clone();
-    let consumer_indexer = indexer.clone();
-    let consumer_log_cb = log_cb;
-    let consumer_handle = thread::spawn(move || {
-        let mut ocr_processed: u64 = 0;
-        let mut ocr_errored: u64 = 0;
-
-        // Create Tantivy IndexWriter for OCR re-indexing
-        let mut index_writer = consumer_indexer.as_ref().and_then(|idx| {
-            let result = idx.search_index().writer_with_num_threads(1);
-            if result.is_err() {
-                log_msg(consumer_log_cb, "[ocr-consumer] failed to create Tantivy IndexWriter for OCR re-indexing");
-            }
-            result.ok()
-        });
-
-        for (id, path, checksum, ocr_text) in &result_rx {
-            if consumer_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
-                break;
-            }
-            if ocr_text.is_empty() {
-                consumer_jobs.mark_ocr_attempt(id, false, Some("OCR returned empty text"), max_retries).ok();
-                ocr_errored += 1;
-                continue;
-            }
-            ocr_processed += 1;
-            consumer_jobs.mark_ocr_attempt(id, true, None, max_retries).ok();
-
-            if let Some(ref writer) = consumer_writer {
-                let record = DocumentRecord {
-                    id,
-                    path: path.clone(),
-                    checksum: checksum.clone(),
-                    ocr_flag: false,
-                    text: ocr_text.clone(),
-                    word_positions: Vec::new(),
-                    file_extraction_ms: 0,
-                    page_count: 0,
-                };
-                if let Err(e) = writer.write_record(&record) {
-                    log_msg(consumer_log_cb, &format!(
-                        "[ocr-consumer] JSONL write failed for id={}: {}", id, e
-                    ));
-                }
-            }
-
-            // Re-index OCR text into Tantivy (delete stale empty-text doc first)
-            if let (Some(idx), Some(w)) = (consumer_indexer.as_ref(), index_writer.as_mut()) {
-                let term = tantivy::Term::from_field_u64(idx.search_index().id_field, id as u64);
-                w.delete_term(term);
-                let math_source = crate::math_tokenizer::extract_math_source(&ocr_text);
-                if let Err(e) = idx.search_index().add_document(
-                    w, id, &path, &ocr_text,
-                    math_source.as_deref(),
-                ) {
-                    log_msg(consumer_log_cb, &format!(
-                        "[ocr-consumer] add_document_with_ts failed for id={} path='{}': {}",
-                        id, path, e
-                    ));
-                }
-            }
-        }
-
-        if let Some(ref mut w) = index_writer {
-            if let Err(e) = w.commit() {
-                log_msg(consumer_log_cb, &format!(
-                    "[ocr-consumer] final commit failed: {}", e
-                ));
-            }
-        }
-
-        (ocr_processed, ocr_errored)
-    });
-
-    // Producer: fetch OCR-needed docs in batches of 100 and drain the
-    // entire queue. A local HashSet prevents re-sending an ID that was
-    // already dispatched but not yet consumed (consumer thread scheduling
-    // lag means the DB may not reflect the attempt yet).
-    let producer_jobs = Arc::clone(&jobs);
-    let producer_handle = thread::spawn(move || {
-        let mut sent_ids = HashSet::new();
-        loop {
-            match producer_jobs.fetch_ocr_needed(100, max_retries) {
-                Ok(batch) if batch.is_empty() => break,
-                Ok(batch) => {
-                    for (id, path, checksum) in deduplicate_ocr_batch(batch, &mut sent_ids) {
-                        if ocr_tx.send((id, path, checksum)).is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(_e) => break,
-            }
-        }
-        drop(ocr_tx);
-    });
-
-    // OCR workers
-    let mut worker_handles = Vec::new();
-    let config = ocr::OcrConfig {
-        max_retries: ocr_config.max_retries,
-        tesseract_path: ocr_config.tesseract_path.clone(),
-        max_dim: ocr_config.max_dim,
-        language: ocr_config.language.clone(),
-    };
-
-    // Create persistent subprocess pool
-    let mut pool = ocr::TesseractPool::new(num_workers, &config.tesseract_path, &config.language)
-        .context("Failed to create Tesseract subprocess pool")?;
-
-    for i in 0..num_workers {
-        let rx = ocr_rx.clone();
-        let tx = result_tx.clone();
-        let cfg = ocr::OcrConfig {
-            max_retries: config.max_retries,
-            tesseract_path: config.tesseract_path.clone(),
-            max_dim: config.max_dim,
-            language: config.language.clone(),
-        };
-        let mut worker = pool.take_worker()
-            .expect("Not enough workers in pool");
-        let worker_cancel = cancel_flag.clone();
-
-        let handle = thread::Builder::new()
-            .name(format!("ocr-{}", i))
-            .spawn(move || {
-                for (id, path_str, checksum) in &rx {
-                    if worker_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
-                        break;
-                    }
-                    let path_obj = PathBuf::from(&path_str);
-                    let ocr_result = run_single_ocr(&path_obj, &cfg, Some(&mut worker));
-                    match ocr_result {
-                        Ok(text) if !text.is_empty() => {
-                            tx.send((id, path_str, checksum, text)).ok();
-                        }
-                        _ => {
-
-                            tx.send((id, path_str, checksum, String::new())).ok();
-                        }
-                    }
-                }
-            })
-            .expect("Failed to spawn OCR worker");
-        worker_handles.push(handle);
-    }
-
-    // Drop main's channel handles. Workers have their own clones of
-    // ocr_rx and result_tx; the producer owns ocr_tx.
-    drop(ocr_rx);
-    drop(result_tx);
-
-    // Wait for producer to finish (it exits after one batch)
-    producer_handle.join().expect("OCR producer panicked");
-
-    // Workers exit when producer drops ocr_tx (channel disconnects)
-    for h in worker_handles {
-        h.join().expect("OCR worker panicked");
-    }
-
-    // All workers done → all result_tx clones dropped → consumer exits
-    let (ocr_processed, _ocr_errored) = consumer_handle.join().expect("OCR consumer panicked");
-
-
-    Ok(ocr_processed)
+    OcrPipelineActor::new(jobs, indexer, ocr_config, output_path, num_workers, cancel_flag, log_cb).run()
 }
 
 /// Attempt OCR on a PDF by extracting pages as images, preprocessing, and running Tesseract.
@@ -1128,10 +596,10 @@ fn deduplicate_ocr_batch(
 
 /// Collect exactly one batch from the producer channel.
 fn collect_batch(
-    task_rx: &crossbeam_channel::Receiver<Vec<ExtractorTask>>,
+    task_rx: &crossbeam_channel::Receiver<ExtractorMsg>,
 ) -> Vec<ExtractorTask> {
     match task_rx.recv() {
-        Ok(tasks) => tasks,
+        Ok(ExtractorMsg::Extract(tasks)) => tasks,
         Err(_) => Vec::new(),
     }
 }
@@ -1219,7 +687,7 @@ fn drain_crash_frames<R: io::Read>(
 /// final `reprocess_extracting` step resets them to 'pending'.
 fn run_extraction_process(
     worker_path: &Path,
-    task_rx: &crossbeam_channel::Receiver<Vec<ExtractorTask>>,
+    task_rx: &crossbeam_channel::Receiver<ExtractorMsg>,
     result_tx: &crossbeam_channel::Sender<DocumentRecord>,
     jobs: &Arc<JobStore>,
     metrics: &Arc<Metrics>,
@@ -1263,13 +731,11 @@ fn run_extraction_process(
     let worker_start = Instant::now();
     let mut files_ok: u64 = 0;
     let mut files_err: u64 = 0;
+    let mut total_batch_time = Duration::ZERO;
 
     'outer: loop {
         batch_count += 1;
-        if batch_count % 5 == 0 {
-            let mem = proc_mon::working_set_mib(pid);
-            report_process(process_cb, &thread_name, pid, "running", mem, "");
-        }
+        let batch_start = Instant::now();
 
         let batch = collect_batch(task_rx);
         if batch.is_empty() {
@@ -1387,11 +853,21 @@ fn run_extraction_process(
                     files_ok += 1;
                 }
                 WorkerFrame::Error { path: _, message } => {
-                    jobs.mark_error(task.id, &message).ok();
-                    metrics.increment_errored();
-                    files_err += 1;
+                        jobs.mark_error(task.id, &message).ok();
+                        metrics.increment_errored();
+                        files_err += 1;
+                    }
                 }
-            }
+            let batch_elapsed = batch_start.elapsed();
+            total_batch_time += batch_elapsed;
+            let mem = proc_mon::working_set_mib(pid);
+            report_process(process_cb, &thread_name, pid, "running", mem, "");
+            log_msg(log_cb, &format!(
+                "[extraction] {} batch {}: {} docs in {:.3}s (total: {} ok, {} err, uptime {})",
+                thread_name, batch_count, files_ok + files_err,
+                batch_elapsed.as_secs_f64(),
+                files_ok, files_err, format_uptime(worker_start.elapsed()),
+            ));
         }
     }
 
@@ -1447,6 +923,14 @@ fn run_extraction_process(
         log_msg(log_cb, &msg);
         "crashed".to_string()
     } else {
+        let mem = proc_mon::working_set_mib(pid);
+        log_msg(log_cb, &format!(
+            "[extraction] worker {} — exited(0) batches={} avg_batch={:.3}s ({} ok, {} err, mem={:.0}MB)",
+            base_info, batch_count,
+            total_batch_time.as_secs_f64() / batch_count.max(1) as f64,
+            files_ok, files_err,
+            mem.unwrap_or(0.0),
+        ));
         "exited(0)".to_string()
     };
 
@@ -1479,7 +963,32 @@ fn format_uptime(d: Duration) -> String {
     }
 }
 
+/// Global log file — when set, all `log_msg` output is also written here.
+static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+
+/// Set the global pipeline log file path. Creates/appends to the file.
+/// All subsequent `log_msg` calls will write to this file.
+pub fn set_pipeline_log_path(path: &Path) -> Result<()> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open pipeline log file: {}", path.display()))?;
+    let lock = LOG_FILE.get_or_init(|| Mutex::new(None));
+    *lock.lock().unwrap() = Some(file);
+    Ok(())
+}
+
+/// Close the global pipeline log file if open.
+pub fn close_pipeline_log() {
+    if let Some(lock) = LOG_FILE.get() {
+        *lock.lock().unwrap() = None;
+    }
+}
+
 /// Send a log message to the optional C callback, falling back to stderr.
+/// When the global log file is set (via `set_pipeline_log_path`), the message
+/// is also written to that file.
 fn log_msg(log_cb: Option<extern "C" fn(*const u8, u32)>, msg: &str) {
     match log_cb {
         Some(cb) => {
@@ -1487,6 +996,14 @@ fn log_msg(log_cb: Option<extern "C" fn(*const u8, u32)>, msg: &str) {
             cb(bytes.as_ptr(), bytes.len() as u32);
         }
         None => eprintln!("{}", msg),
+    }
+    if let Some(lock) = LOG_FILE.get() {
+        if let Ok(mut guard) = lock.lock() {
+            if let Some(ref mut file) = *guard {
+                let _ = writeln!(file, "{}", msg);
+                let _ = file.flush();
+            }
+        }
     }
 }
 
@@ -1615,7 +1132,7 @@ fn report_process(
 
 /// Drain all remaining batches from the channel and apply an error action.
 fn drain_all_for_error(
-    task_rx: &crossbeam_channel::Receiver<Vec<ExtractorTask>>,
+    task_rx: &crossbeam_channel::Receiver<ExtractorMsg>,
     on_task: impl Fn(&ExtractorTask),
 ) {
     loop {
@@ -1626,6 +1143,862 @@ fn drain_all_for_error(
         for t in &batch {
             on_task(t);
         }
+    }
+}
+
+// =========================================================================
+// Actor-based extraction pipeline
+// =========================================================================
+//
+// Independent actor threads communicating via typed crossbeam channels.
+// PipelineOrchestrator manages setup, lifecycle, and the consumer loop.
+// OcrPipelineActor wraps the OCR post-processing pipeline.
+
+// ── Formal Actor Infrastructure ──────────────────────────────────────────
+
+/// A typed sender reference to an actor's mailbox.
+#[derive(Clone)]
+pub(crate) struct ActorRef<Msg> {
+    tx: crossbeam_channel::Sender<Msg>,
+}
+
+impl<Msg> ActorRef<Msg> {
+    pub fn new(tx: crossbeam_channel::Sender<Msg>) -> Self {
+        Self { tx }
+    }
+
+    pub fn send(&self, msg: Msg) -> Result<(), crossbeam_channel::SendError<Msg>> {
+        self.tx.send(msg)
+    }
+}
+
+/// Common trait for all pipeline actors.
+/// Implementors process one message at a time via `handle()`.
+#[allow(dead_code)]
+trait Actor: Send + 'static {
+    type Msg: Send + 'static;
+    fn handle(&mut self, msg: Self::Msg) -> Result<()>;
+}
+
+// ── Formal Message Types ─────────────────────────────────────────────────
+
+/// Messages for the extraction worker pool.
+enum ExtractorMsg {
+    Extract(Vec<ExtractorTask>),
+}
+
+/// Messages for the Tantivy indexer actor.
+enum IndexerMsg {
+    Index(DocumentRecord),
+}
+
+/// Messages for the JSONL writer actor.
+enum WriterMsg {
+    Write(Vec<u8>),
+}
+
+/// Format a slice of batch sizes into a compact human-readable string.
+/// Examples: `[5/2/3]`, `[8]`, `[0/0/0]`
+fn format_batch_dist(sizes: &[usize]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(sizes.len() * 4);
+    out.push('[');
+    for (i, s) in sizes.iter().enumerate() {
+        if i > 0 { out.push('/'); }
+        let _ = write!(out, "{}", s);
+    }
+    out.push(']');
+    out
+}
+
+/// Claims pending jobs from the DB and distributes them across workers
+/// using heap-greedy balancing. Runs until no more jobs are available
+/// or cancel is requested.
+struct ScannerActor {
+    jobs: Arc<JobStore>,
+    metrics: Arc<Metrics>,
+    task_tx: crossbeam_channel::Sender<ExtractorMsg>,
+    num_workers: usize,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    reservoir_size: i64,
+    log_cb: Option<extern "C" fn(*const u8, u32)>,
+}
+
+impl ScannerActor {
+    fn run(self) {
+        let mut reserved: Vec<(i64, String, String, i64)> = Vec::new();
+        let mut round: u64 = 0;
+        let mut total_claimed: u64 = 0;
+
+        loop {
+            if self.cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+                log_msg(self.log_cb, "[scanner] cancel requested — stopping");
+                break;
+            }
+
+            round += 1;
+            let round_start = Instant::now();
+
+            let mut claim_size = self.num_workers as i64 * BATCH_SIZE;
+            let mut all: Vec<(i64, String, String, i64)>;
+
+            let mut from_reservoir: usize = 0;
+            if !reserved.is_empty() {
+                let take = std::cmp::min(claim_size, reserved.len() as i64) as usize;
+                all = reserved.drain(..take).collect();
+                from_reservoir = all.len();
+                claim_size -= all.len() as i64;
+            } else {
+                all = Vec::new();
+            }
+
+            if claim_size > 0 {
+                match self.jobs.claim_pending(claim_size + self.reservoir_size) {
+                    Ok(batch) => {
+                        total_claimed += batch.len() as u64;
+                        self.metrics.add_scanner_claimed(batch.len() as u64);
+                        all.extend(batch);
+                    }
+                    Err(_e) => { if all.is_empty() { break; } }
+                }
+            }
+
+            if all.is_empty() {
+                log_msg(self.log_cb, &format!("[scanner] round {} — no more pending jobs, stopping", round));
+                break;
+            }
+
+            all.sort_by(|a, b| b.3.cmp(&a.3));
+
+            let target = self.num_workers * BATCH_SIZE as usize;
+            let distribute_end = std::cmp::min(target, all.len());
+
+            let mut worker_batches: Vec<Vec<ExtractorTask>> =
+                (0..self.num_workers).map(|_| Vec::new()).collect();
+
+            #[derive(Clone, Eq, PartialEq)]
+            struct HeapEntry {
+                total_mb: i64,
+                count: usize,
+                worker_idx: usize,
+            }
+            impl Ord for HeapEntry {
+                fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                    other.total_mb.cmp(&self.total_mb)
+                        .then(other.count.cmp(&self.count))
+                }
+            }
+            impl PartialOrd for HeapEntry {
+                fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                    Some(self.cmp(other))
+                }
+            }
+
+            let mut heap: std::collections::BinaryHeap<HeapEntry> =
+                std::collections::BinaryHeap::new();
+            for i in 0..self.num_workers {
+                heap.push(HeapEntry { total_mb: 0, count: 0, worker_idx: i });
+            }
+
+            for &(id, ref path, ref checksum, size) in &all[..distribute_end] {
+                let mut entry = loop {
+                    let e = heap.pop().expect("heap should not be empty");
+                    if e.count < BATCH_SIZE as usize { break e; }
+                };
+                worker_batches[entry.worker_idx].push(ExtractorTask {
+                    id,
+                    path: path.clone(),
+                    checksum: checksum.clone(),
+                });
+                entry.total_mb += size;
+                entry.count += 1;
+                heap.push(entry);
+            }
+
+            let leftover = all.len() - distribute_end;
+            reserved.extend(all.into_iter().skip(distribute_end));
+
+            let sent_count: usize = worker_batches.iter().map(|b| b.len()).sum();
+            let batch_sizes: Vec<usize> = worker_batches.iter().map(|b| b.len()).collect();
+
+            log_msg(self.log_cb, &format!(
+                "[scanner] round {} — claimed {}, from_reservoir={}, distributed {} in {:?} batches, {} to reservoir, {:.3}s",
+                round, sent_count + leftover + from_reservoir, from_reservoir,
+                sent_count, format_batch_dist(&batch_sizes),
+                leftover + reserved.len(),
+                round_start.elapsed().as_secs_f64(),
+            ));
+
+            for tasks in worker_batches {
+                if !tasks.is_empty() {
+                    self.metrics.set_task_queue_depth(self.task_tx.len() as u64);
+                    if self.task_tx.send(ExtractorMsg::Extract(tasks)).is_err() {
+                        log_msg(self.log_cb, "[scanner] task channel disconnected — stopping");
+                        return;
+                    }
+                }
+            }
+        }
+
+        log_msg(self.log_cb, &format!(
+            "[scanner] done — {} total claimed, {} rounds",
+            total_claimed, round
+        ));
+    }
+}
+
+/// Manages N extraction worker threads, each running one IPC subprocess.
+/// Workers share the task_rx (each gets a clone) and feed results into
+/// result_tx. Exits when all workers have finished (triggered when the
+/// ScannerActor drops task_tx, causing task_rx to return Disconnected).
+struct WorkerPoolActor {
+    task_rx: crossbeam_channel::Receiver<ExtractorMsg>,
+    result_tx: crossbeam_channel::Sender<DocumentRecord>,
+    jobs: Arc<JobStore>,
+    metrics: Arc<Metrics>,
+    num_workers: usize,
+    worker_path: PathBuf,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    log_cb: Option<extern "C" fn(*const u8, u32)>,
+    process_cb: Option<extern "C" fn(*const u8, u32)>,
+}
+
+impl WorkerPoolActor {
+    fn run(self) {
+        let mut handles = Vec::new();
+        for i in 0..self.num_workers {
+            let task_rx = self.task_rx.clone();
+            let result_tx = self.result_tx.clone();
+            let jobs = Arc::clone(&self.jobs);
+            let metrics = Arc::clone(&self.metrics);
+            let wp = self.worker_path.clone();
+            let cancel = self.cancel_flag.clone();
+            let log_cb = self.log_cb;
+            let process_cb = self.process_cb;
+            let handle = thread::Builder::new()
+                .name(format!("extract-{}", i))
+                .spawn(move || {
+                    run_extraction_process(
+                        &wp, &task_rx, &result_tx, &jobs, &metrics,
+                        cancel, log_cb, process_cb,
+                    );
+                })
+                .expect("Failed to spawn worker thread");
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().expect("Worker panicked");
+        }
+    }
+}
+
+impl Actor for WorkerPoolActor {
+    type Msg = ExtractorMsg;
+    fn handle(&mut self, _msg: ExtractorMsg) -> Result<()> {
+        // WorkerPoolActor is a manager — individual workers consume
+        // ExtractorMsg directly from the shared channel.  The handle()
+        // method is provided for API completeness.
+        Ok(())
+    }
+}
+
+/// Batches DocumentRecords and writes them to a Tantivy index.
+/// Delegates to the existing indexer_thread helper.
+struct IndexerActor {
+    rx: crossbeam_channel::Receiver<IndexerMsg>,
+    indexer: Arc<Indexer>,
+    jobs: Arc<JobStore>,
+    metrics: Arc<Metrics>,
+    batch_size: usize,
+    commit_interval: u64,
+    commit_timeout: u64,
+    num_threads: usize,
+    log_cb: Option<extern "C" fn(*const u8, u32)>,
+}
+
+impl IndexerActor {
+    fn run(self) {
+        indexer_thread(
+            &self.indexer, self.jobs, self.rx, &self.metrics,
+            self.batch_size, self.commit_interval, self.commit_timeout,
+            self.num_threads, self.log_cb,
+        );
+    }
+}
+
+impl Actor for IndexerActor {
+    type Msg = IndexerMsg;
+    fn handle(&mut self, msg: IndexerMsg) -> Result<()> {
+        let IndexerMsg::Index(_record) = msg;
+        // The full batching + commit logic lives in indexer_thread;
+        // handle() provides a formal per-message entry for testing.
+        // In practice, run() delegates to indexer_thread which owns
+        // the receive loop.
+        Ok(())
+    }
+}
+
+/// Receives pre-serialized JSONL bytes and writes them to disk.
+struct JsonlWriterActor {
+    rx: crossbeam_channel::Receiver<WriterMsg>,
+    writer: Arc<JsonlWriter>,
+    log_cb: Option<extern "C" fn(*const u8, u32)>,
+}
+
+impl JsonlWriterActor {
+    fn run(self) {
+        for msg in &self.rx {
+            let WriterMsg::Write(json_bytes) = msg;
+            if let Err(e) = self.writer.write_json_bytes(&json_bytes) {
+                log_msg(self.log_cb, &format!("[jsonl-writer] write failed: {}", e));
+                break;
+            }
+        }
+        let _ = self.writer.flush();
+    }
+}
+
+impl Actor for JsonlWriterActor {
+    type Msg = WriterMsg;
+    fn handle(&mut self, msg: WriterMsg) -> Result<()> {
+        let WriterMsg::Write(json_bytes) = msg;
+        self.writer.write_json_bytes(&json_bytes)?;
+        Ok(())
+    }
+}
+
+/// Orchestrates the entire extraction pipeline:
+/// 1. Scans directory, creates channels
+/// 2. Spawns ScannerActor, WorkerPoolActor, IndexerActor, JsonlWriterActor
+/// 3. Runs the consumer loop (blocking, in orchestrator's thread)
+/// 4. Handles cancel, joins all actors, cleans up
+pub struct PipelineOrchestrator {
+    config: PipelineConfig,
+    progress_cb: Option<Box<dyn Fn(u64, u64) + Send>>,
+    jobs: Arc<JobStore>,
+    writer: Arc<JsonlWriter>,
+    metrics: Arc<Metrics>,
+    input: PathBuf,
+    indexer: Option<Arc<Indexer>>,
+}
+
+impl PipelineOrchestrator {
+    pub fn new(
+        mut config: PipelineConfig,
+        jobs: Arc<JobStore>,
+        writer: Arc<JsonlWriter>,
+        metrics: Arc<Metrics>,
+        input: PathBuf,
+        indexer: Option<Arc<Indexer>>,
+    ) -> Self {
+        let progress_cb = config.progress_cb.take();
+        Self {
+            config: PipelineConfig {
+                progress_cb: None,
+                ..config
+            },
+            progress_cb,
+            jobs,
+            writer,
+            metrics,
+            input,
+            indexer,
+        }
+    }
+
+    fn process_record(
+        &self,
+        record: DocumentRecord,
+        result_rx: &crossbeam_channel::Receiver<DocumentRecord>,
+        jsonl_ref: &ActorRef<WriterMsg>,
+        index_ref: Option<&ActorRef<IndexerMsg>>,
+        writer_jsonl_time: &mut Duration,
+        writer_docs: &mut u64,
+        total_pending: u64,
+        progress_throttle: u64,
+        log_cb: Option<extern "C" fn(*const u8, u32)>,
+    ) -> bool {
+        self.metrics.set_result_queue_depth(result_rx.len() as u64);
+        let write_start = Instant::now();
+        let mut json_bytes = match serde_json::to_vec(&record) {
+            Ok(j) => j,
+            Err(e) => {
+                self.jobs.mark_error(record.id, &format!("json serialize failed: {}", e)).ok();
+                self.metrics.increment_errored();
+                return true;
+            }
+        };
+        json_bytes.push(b'\n');
+        if jsonl_ref.send(WriterMsg::Write(json_bytes)).is_err() {
+            log_msg(log_cb, "[pipeline] jsonl-writer channel disconnected");
+            return false;
+        }
+        *writer_jsonl_time += write_start.elapsed();
+        *writer_docs += 1;
+        let processed = self.metrics.increment_processed();
+
+        if record.file_extraction_ms > 0 {
+            log_msg(log_cb, &format!(
+                "[timing] file={} pages={} extraction={:.3}s",
+                record.path,
+                record.page_count,
+                record.file_extraction_ms as f64 / 1000.0,
+            ));
+        }
+
+        if let Some(index_ref) = index_ref {
+            let id = record.id;
+            let path = record.path.clone();
+            if index_ref.send(IndexerMsg::Index(record)).is_err() {
+                log_msg(log_cb, &format!(
+                    "[pipeline] indexer channel disconnected for id={} path='{}' — indexer unavailable, will retry on next run",
+                    id, path
+                ));
+            }
+        }
+
+        if let Some(ref cb) = self.progress_cb {
+            let done = processed + self.metrics.errored();
+            if done % progress_throttle == 0 || done >= total_pending {
+                cb(done, total_pending);
+            }
+        }
+        self.metrics.log_summary_with(log_cb);
+        true
+    }
+
+    /// Run the full extraction pipeline. Blocks until all documents
+    /// are processed, cancelled, or an error occurs.
+    pub fn run(self) -> Result<()> {
+        let pipeline_start = Instant::now();
+
+        scan_directory(&self.jobs, &self.input)?;
+        let scan_elapsed = pipeline_start.elapsed();
+        let pending = self.jobs.count_pending()?;
+        if pending == 0 {
+            log_msg(self.config.log_cb, "[pipeline] no pending jobs");
+            return Ok(());
+        }
+
+        log_msg(self.config.log_cb, &format!(
+            "[pipeline] scan_directory took {:.3}s, {} pending",
+            scan_elapsed.as_secs_f64(), pending
+        ));
+
+        self.config.worker_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "worker_path is required: pdf_worker.exe must be deployed alongside the library. \
+                 Run 'cargo build -p pdf_extractor --bin pdf_worker' to build it."
+            ))?;
+
+        let cap = self.config.channel_cap();
+        let (task_tx, task_rx) = bounded::<ExtractorMsg>(cap);
+        let (result_tx, result_rx) = bounded::<DocumentRecord>(cap);
+        let (index_tx, index_rx) = bounded::<IndexerMsg>(cap);
+        let (jsonl_tx, jsonl_rx) = bounded::<WriterMsg>(cap);
+
+        let jsonl_ref = ActorRef::new(jsonl_tx.clone());
+        let index_ref = self.indexer.as_ref().map(|_| ActorRef::new(index_tx.clone()));
+
+        let num_workers = self.config.extract_workers();
+        let log_cb = self.config.log_cb;
+        let process_cb = self.config.process_cb;
+        let worker_path = self.config.worker_path.clone().expect("worker_path validated above");
+
+        // ── Spawn ScannerActor ──
+        let scanner = ScannerActor {
+            jobs: Arc::clone(&self.jobs),
+            metrics: Arc::clone(&self.metrics),
+            task_tx,
+            num_workers,
+            cancel_flag: self.config.cancel_flag.clone(),
+            reservoir_size: self.config.reservoir_size() as i64,
+            log_cb,
+        };
+        let scanner_handle = thread::Builder::new()
+            .name("scanner".into())
+            .spawn(move || scanner.run())
+            .expect("Failed to spawn scanner thread");
+
+        // ── Spawn WorkerPoolActor ──
+        let pool = WorkerPoolActor {
+            task_rx,
+            result_tx: result_tx.clone(),
+            jobs: Arc::clone(&self.jobs),
+            metrics: Arc::clone(&self.metrics),
+            num_workers,
+            worker_path,
+            cancel_flag: self.config.cancel_flag.clone(),
+            log_cb,
+            process_cb,
+        };
+        let pool_handle = thread::Builder::new()
+            .name("worker-pool".into())
+            .spawn(move || pool.run())
+            .expect("Failed to spawn worker pool thread");
+
+        drop(result_tx);
+
+        // ── Spawn IndexerActor ──
+        let indexer_handle = self.indexer.as_ref().map(|idx| {
+            let idx = Arc::clone(idx);
+            let metrics = Arc::clone(&self.metrics);
+            let jobs = Arc::clone(&self.jobs);
+            let ibs = self.config.indexer_batch();
+            let ci = self.config.commit_int();
+            let ct = self.config.commit_to();
+            let it = self.config.indexer_threads();
+            thread::Builder::new()
+                .name("indexer".into())
+                .spawn(move || {
+                    IndexerActor {
+                        rx: index_rx,
+                        indexer: idx,
+                        jobs,
+                        metrics,
+                        batch_size: ibs,
+                        commit_interval: ci,
+                        commit_timeout: ct,
+                        num_threads: it,
+                        log_cb,
+                    }.run();
+                })
+                .expect("Failed to spawn indexer thread")
+        });
+
+        // ── Spawn JsonlWriterActor ──
+        let writer_ref = Arc::clone(&self.writer);
+        let writer_handle = thread::Builder::new()
+            .name("jsonl-writer".into())
+            .spawn(move || {
+                JsonlWriterActor { rx: jsonl_rx, writer: writer_ref, log_cb }.run();
+            })
+            .expect("Failed to spawn writer thread");
+
+        // ── Consumer loop ──
+        let extraction_start = Instant::now();
+        let total_pending = pending as u64;
+        let is_cancelled = || self.config.cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed));
+        let progress_throttle = 50u64;
+        let writer_start = Instant::now();
+        let mut writer_jsonl_time = Duration::ZERO;
+        let mut writer_docs: u64 = 0;
+
+        // Phase 1: normal blocking receive, check cancel between records
+        for record in &result_rx {
+            if is_cancelled() {
+                break;
+            }
+            if !self.process_record(record, &result_rx, &jsonl_ref, index_ref.as_ref(),
+                &mut writer_jsonl_time, &mut writer_docs,
+                total_pending, progress_throttle, log_cb)
+            {
+                break;
+            }
+        }
+
+        // Phase 2: drain any records still in-flight from workers
+        if is_cancelled() {
+            loop {
+                match result_rx.try_recv() {
+                    Ok(record) => {
+                        self.process_record(record, &result_rx, &jsonl_ref, index_ref.as_ref(),
+                            &mut writer_jsonl_time, &mut writer_docs,
+                            total_pending, progress_throttle, log_cb);
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                }
+            }
+
+            pool_handle.join().expect("Worker pool panicked");
+
+            loop {
+                match result_rx.try_recv() {
+                    Ok(record) => {
+                        self.process_record(record, &result_rx, &jsonl_ref, index_ref.as_ref(),
+                            &mut writer_jsonl_time, &mut writer_docs,
+                            total_pending, progress_throttle, log_cb);
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                }
+            }
+        } else {
+            pool_handle.join().expect("Worker pool panicked");
+        }
+
+        // ── Shutdown remaining actors ──
+        drop(index_tx);
+        drop(jsonl_tx);
+        drop(jsonl_ref);
+        drop(index_ref);
+        scanner_handle.join().expect("Scanner panicked");
+        writer_handle.join().expect("Writer panicked");
+        if let Some(h) = indexer_handle {
+            h.join().expect("Indexer panicked");
+        }
+
+        // ── Cleanup ──
+        let extract_elapsed = extraction_start.elapsed();
+        let total_elapsed = pipeline_start.elapsed();
+        log_msg(log_cb, &format!(
+            "[timing] scan={:.3}s extract={:.3}s total={:.3}s — {} docs in JSONL ({:.3}s serialize)",
+            scan_elapsed.as_secs_f64(),
+            extract_elapsed.as_secs_f64(),
+            total_elapsed.as_secs_f64(),
+            writer_docs,
+            writer_jsonl_time.as_secs_f64(),
+        ));
+
+        self.jobs.reprocess_extracting()?;
+
+        let processed = self.metrics.processed();
+        let errored = self.metrics.errored();
+        let elapsed = format_uptime(total_elapsed);
+        log_msg(log_cb, &format!(
+            "[pipeline] done — {} total ({:?} processed, {:?} errored) in {} ({:.1} docs/s)",
+            processed + errored, processed, errored, elapsed,
+            if total_elapsed.as_secs_f64() > 0.0 { processed as f64 / total_elapsed.as_secs_f64() } else { 0.0 },
+        ));
+
+        if self.metrics.indexer_failed() {
+            anyhow::bail!("Indexer failed to initialize — Tantivy index writer could not be created. Check disk space, permissions, and index integrity.");
+        }
+
+        Ok(())
+    }
+}
+
+/// Self-contained actor for OCR post-processing.
+///
+/// Creates internal producer/worker/consumer threads:
+/// - Producer fetches OCR-needed docs from DB in batches
+/// - N workers run Tesseract on rendered PDF page images
+/// - Consumer writes JSONL and re-indexes into Tantivy
+pub struct OcrPipelineActor {
+    jobs: Arc<JobStore>,
+    indexer: Option<Arc<Indexer>>,
+    ocr_config: ocr::OcrConfig,
+    output_path: Option<PathBuf>,
+    num_workers: usize,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    log_cb: Option<extern "C" fn(*const u8, u32)>,
+}
+
+impl OcrPipelineActor {
+    pub fn new(
+        jobs: Arc<JobStore>,
+        indexer: Option<Arc<Indexer>>,
+        ocr_config: &ocr::OcrConfig,
+        output_path: Option<PathBuf>,
+        num_workers: usize,
+        cancel_flag: Option<Arc<AtomicBool>>,
+        log_cb: Option<extern "C" fn(*const u8, u32)>,
+    ) -> Self {
+        Self {
+            jobs,
+            indexer,
+            ocr_config: ocr::OcrConfig {
+                max_retries: ocr_config.max_retries,
+                tesseract_path: ocr_config.tesseract_path.clone(),
+                max_dim: ocr_config.max_dim,
+                language: ocr_config.language.clone(),
+            },
+            output_path,
+            num_workers,
+            cancel_flag,
+            log_cb,
+        }
+    }
+
+    /// Run the OCR post-processing pipeline. Returns the number of
+    /// documents successfully OCR-processed.
+    pub fn run(self) -> Result<u64> {
+        let pipeline_start = Instant::now();
+        let max_retries = self.ocr_config.max_retries;
+        let pending = self.jobs.count_ocr_pending(max_retries)?;
+        if pending == 0 {
+            log_msg(self.log_cb, "[ocr] no pending OCR jobs");
+            return Ok(0);
+        }
+
+        log_msg(self.log_cb, &format!(
+            "[ocr] starting — {} pending docs, {} workers",
+            pending, self.num_workers
+        ));
+
+        let jsonl_writer = if let Some(ref out_path) = self.output_path {
+            Some(Arc::new(JsonlWriter::new(out_path)?))
+        } else {
+            None
+        };
+
+        let (ocr_tx, ocr_rx) = bounded::<(i64, String, String)>(100);
+        let (result_tx, result_rx) = bounded::<(i64, String, String, String)>(100);
+
+        let consumer_cancel = self.cancel_flag.clone();
+        let consumer_jobs = Arc::clone(&self.jobs);
+        let consumer_writer = jsonl_writer.clone();
+        let consumer_indexer = self.indexer.clone();
+        let consumer_log_cb = self.log_cb;
+        let consumer_handle = thread::spawn(move || {
+            let mut ocr_processed: u64 = 0;
+            let mut ocr_errored: u64 = 0;
+
+            let mut index_writer = consumer_indexer.as_ref().and_then(|idx| {
+                let result = idx.search_index().writer_with_num_threads(1);
+                if result.is_err() {
+                    log_msg(consumer_log_cb, "[ocr-consumer] failed to create Tantivy IndexWriter for OCR re-indexing");
+                }
+                result.ok()
+            });
+
+            for (id, path, checksum, ocr_text) in &result_rx {
+                if consumer_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+                    break;
+                }
+                if ocr_text.is_empty() {
+                    consumer_jobs.mark_ocr_attempt(id, false, Some("OCR returned empty text"), max_retries).ok();
+                    ocr_errored += 1;
+                    continue;
+                }
+                ocr_processed += 1;
+                consumer_jobs.mark_ocr_attempt(id, true, None, max_retries).ok();
+
+                if let Some(ref writer) = consumer_writer {
+                    let record = DocumentRecord {
+                        id,
+                        path: path.clone(),
+                        checksum: checksum.clone(),
+                        ocr_flag: false,
+                        text: ocr_text.clone(),
+                        word_positions: Vec::new(),
+                        file_extraction_ms: 0,
+                        page_count: 0,
+                    };
+                    if let Err(e) = writer.write_record(&record) {
+                        log_msg(consumer_log_cb, &format!(
+                            "[ocr-consumer] JSONL write failed for id={}: {}", id, e
+                        ));
+                    }
+                }
+
+                if let (Some(idx), Some(w)) = (consumer_indexer.as_ref(), index_writer.as_mut()) {
+                    let term = tantivy::Term::from_field_u64(idx.search_index().id_field, id as u64);
+                    w.delete_term(term);
+                    let math_source = crate::math_tokenizer::extract_math_source(&ocr_text);
+                    if let Err(e) = idx.search_index().add_document(
+                        w, id, &path, &ocr_text,
+                        math_source.as_deref(),
+                    ) {
+                        log_msg(consumer_log_cb, &format!(
+                            "[ocr-consumer] add_document_with_ts failed for id={} path='{}': {}",
+                            id, path, e
+                        ));
+                    }
+                }
+            }
+
+            if let Some(ref mut w) = index_writer {
+                if let Err(e) = w.commit() {
+                    log_msg(consumer_log_cb, &format!(
+                        "[ocr-consumer] final commit failed: {}", e
+                    ));
+                }
+            }
+
+            (ocr_processed, ocr_errored)
+        });
+
+        let producer_jobs = Arc::clone(&self.jobs);
+        let producer_handle = thread::spawn(move || {
+            let mut sent_ids = HashSet::new();
+            loop {
+                match producer_jobs.fetch_ocr_needed(100, max_retries) {
+                    Ok(batch) if batch.is_empty() => break,
+                    Ok(batch) => {
+                        for (id, path, checksum) in deduplicate_ocr_batch(batch, &mut sent_ids) {
+                            if ocr_tx.send((id, path, checksum)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(_e) => break,
+                }
+            }
+            drop(ocr_tx);
+        });
+
+        let mut worker_handles = Vec::new();
+        let config = ocr::OcrConfig {
+            max_retries: self.ocr_config.max_retries,
+            tesseract_path: self.ocr_config.tesseract_path.clone(),
+            max_dim: self.ocr_config.max_dim,
+            language: self.ocr_config.language.clone(),
+        };
+
+        let mut pool = ocr::TesseractPool::new(self.num_workers, &config.tesseract_path, &config.language)
+            .context("Failed to create Tesseract subprocess pool")?;
+
+        for i in 0..self.num_workers {
+            let rx = ocr_rx.clone();
+            let tx = result_tx.clone();
+            let cfg = ocr::OcrConfig {
+                max_retries: config.max_retries,
+                tesseract_path: config.tesseract_path.clone(),
+                max_dim: config.max_dim,
+                language: config.language.clone(),
+            };
+            let mut worker = pool.take_worker()
+                .expect("Not enough workers in pool");
+            let worker_cancel = self.cancel_flag.clone();
+
+            let handle = thread::Builder::new()
+                .name(format!("ocr-{}", i))
+                .spawn(move || {
+                    for (id, path_str, checksum) in &rx {
+                        if worker_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+                            break;
+                        }
+                        let path_obj = PathBuf::from(&path_str);
+                        let ocr_result = run_single_ocr(&path_obj, &cfg, Some(&mut worker));
+                        match ocr_result {
+                            Ok(text) if !text.is_empty() => {
+                                tx.send((id, path_str, checksum, text)).ok();
+                            }
+                            _ => {
+                                tx.send((id, path_str, checksum, String::new())).ok();
+                            }
+                        }
+                    }
+                })
+                .expect("Failed to spawn OCR worker");
+            worker_handles.push(handle);
+        }
+
+        drop(ocr_rx);
+        drop(result_tx);
+
+        producer_handle.join().expect("OCR producer panicked");
+
+        for h in worker_handles {
+            h.join().expect("OCR worker panicked");
+        }
+
+        let (ocr_processed, ocr_errored) = consumer_handle.join().expect("OCR consumer panicked");
+
+        let ocr_elapsed = pipeline_start.elapsed();
+        log_msg(self.log_cb, &format!(
+            "[ocr] done — {} processed, {} errored, {} pending, {:.3}s total ({:.1} docs/s)",
+            ocr_processed, ocr_errored, pending,
+            ocr_elapsed.as_secs_f64(),
+            if ocr_elapsed.as_secs_f64() > 0.0 { ocr_processed as f64 / ocr_elapsed.as_secs_f64() } else { 0.0 },
+        ));
+
+        Ok(ocr_processed)
     }
 }
 
@@ -2050,7 +2423,7 @@ mod tests {
 
     #[test]
     fn test_collect_batch_empty_disconnected() {
-        let (tx, rx) = bounded::<Vec<ExtractorTask>>(10);
+        let (tx, rx) = bounded::<ExtractorMsg>(10);
         drop(tx);
         let batch = collect_batch(&rx);
         assert!(batch.is_empty());
@@ -2058,8 +2431,8 @@ mod tests {
 
     #[test]
     fn test_collect_batch_single_task() {
-        let (tx, rx) = bounded::<Vec<ExtractorTask>>(10);
-        tx.send(vec![make_task(1, "a.pdf")]).unwrap();
+        let (tx, rx) = bounded::<ExtractorMsg>(10);
+        tx.send(ExtractorMsg::Extract(vec![make_task(1, "a.pdf")])).unwrap();
         drop(tx);
         let batch = collect_batch(&rx);
         assert_eq!(batch.len(), 1);
@@ -2069,8 +2442,8 @@ mod tests {
 
     #[test]
     fn test_collect_batch_multiple_tasks_in_one_batch() {
-        let (tx, rx) = bounded::<Vec<ExtractorTask>>(10);
-        tx.send(make_batch(&[1, 2, 3, 4, 5], "")).unwrap();
+        let (tx, rx) = bounded::<ExtractorMsg>(10);
+        tx.send(ExtractorMsg::Extract(make_batch(&[1, 2, 3, 4, 5], ""))).unwrap();
         drop(tx);
         let batch = collect_batch(&rx);
         assert_eq!(batch.len(), 5);
@@ -2078,11 +2451,11 @@ mod tests {
 
     #[test]
     fn test_collect_batch_blocks_until_first_arrives() {
-        let (tx, rx) = bounded::<Vec<ExtractorTask>>(10);
+        let (tx, rx) = bounded::<ExtractorMsg>(10);
         let tx_clone = tx.clone();
         let handle = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            tx_clone.send(vec![make_task(99, "late.pdf")]).unwrap();
+            tx_clone.send(ExtractorMsg::Extract(vec![make_task(99, "late.pdf")])).unwrap();
             drop(tx_clone);
         });
         let batch = collect_batch(&rx);
@@ -2093,8 +2466,8 @@ mod tests {
 
     #[test]
     fn test_collect_batch_disconnected_returns_partial() {
-        let (tx, rx) = bounded::<Vec<ExtractorTask>>(10);
-        tx.send(make_batch(&[1, 2, 3], "")).unwrap();
+        let (tx, rx) = bounded::<ExtractorMsg>(10);
+        tx.send(ExtractorMsg::Extract(make_batch(&[1, 2, 3], ""))).unwrap();
         // drop tx without sending more — should return [1, 2, 3]
         drop(tx);
         let batch = collect_batch(&rx);
@@ -2117,7 +2490,7 @@ mod tests {
         store.upsert_file("/b.pdf", "cs2").unwrap();
         store.upsert_file("/c.pdf", "cs3").unwrap();
 
-        let (task_tx, task_rx) = bounded::<Vec<ExtractorTask>>(10);
+        let (task_tx, task_rx) = bounded::<ExtractorMsg>(10);
         let batch_size: i64 = 2;
 
         // Simulate the producer: claim pending, batch, send
@@ -2127,7 +2500,7 @@ mod tests {
             .into_iter()
             .map(|(id, path, checksum, _size)| ExtractorTask { id, path, checksum })
             .collect();
-        task_tx.send(tasks).unwrap();
+        task_tx.send(ExtractorMsg::Extract(tasks)).unwrap();
 
         // Verify the batch arrived on the channel
         let received = collect_batch(&task_rx);
@@ -2145,12 +2518,12 @@ mod tests {
 
     #[test]
     fn test_process_worker_missing_binary_no_crash() {
-        let (task_tx, task_rx) = bounded::<Vec<ExtractorTask>>(10);
+        let (task_tx, task_rx) = bounded::<ExtractorMsg>(10);
         let (result_tx, result_rx) = bounded::<DocumentRecord>(10);
         let jobs = Arc::new(super::super::scanner::JobStore::open_in_memory().unwrap());
         let metrics = Arc::new(super::super::metrics::Metrics::new());
 
-        task_tx.send(vec![make_task(1, "a.pdf")]).unwrap();
+        task_tx.send(ExtractorMsg::Extract(vec![make_task(1, "a.pdf")])).unwrap();
         drop(task_tx);
 
         run_extraction_process(
@@ -2288,7 +2661,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = run_pipeline(jobs, Arc::clone(&writer), metrics, &books, None, &config);
+        let result = run_pipeline(jobs, Arc::clone(&writer), metrics, &books, None, config);
         assert!(result.is_err(), "run_pipeline should error when worker_path=None");
         let err = format!("{}", result.unwrap_err());
         assert!(

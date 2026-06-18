@@ -1,10 +1,12 @@
 use tantivy::Index;
 use tantivy::schema::Field;
+use serde::Serialize;
 
 /// Contexto compartido disponible para toda la pipeline.
 /// Se resuelve una vez al inicializar el pipeline (OnceLock).
 pub struct SearchContext {
     pub index: Index,
+    pub id_field: Field,
     pub content_field: Field,
     pub path_field: Field,
     pub position_store: Option<crate::positions::PositionStore>,
@@ -41,7 +43,7 @@ pub enum SearchStrategy {
 }
 
 /// Resultado crudo de la ejecucion (antes de enrichment).
-pub type RawResult = (f32, tantivy::TantivyDocument);
+pub type RawResult = (f32, tantivy::TantivyDocument, tantivy::DocAddress);
 
 /// Resultado despues de enrichment (con snippet, positions, etc).
 pub struct RichResult {
@@ -53,6 +55,7 @@ pub struct RichResult {
     pub doc_address: Option<tantivy::DocAddress>,
 }
 
+#[derive(Serialize)]
 pub struct PagePosition {
     pub page: u32,
     pub x: f32,

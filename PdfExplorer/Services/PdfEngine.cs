@@ -128,6 +128,9 @@ public sealed class PdfEngine : IDisposable
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern void pdf_free_string(IntPtr ptr);
 
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr pdf_search_v2(byte[] jsonInput);
+
     public SearchResponse Search(string query, int limit = 1000, int offset = 0, uint? collId = null)
     {
         if (string.IsNullOrWhiteSpace(query))
@@ -181,16 +184,29 @@ public sealed class PdfEngine : IDisposable
         return result;
     }
 
+    public SearchV2Response? SearchV2(SearchRequestV2 request)
+    {
+        var jsonInput = JsonSerializer.Serialize(request);
+        var ptr = pdf_search_v2(Utf8(jsonInput));
+        if (ptr == IntPtr.Zero)
+            return null;
+        try
+        {
+            var json = Marshal.PtrToStringUTF8(ptr);
+            return json is not null
+                ? JsonSerializer.Deserialize<SearchV2Response>(json)
+                : null;
+        }
+        finally
+        {
+            pdf_free_string(ptr);
+        }
+    }
+
     // ── Search config setters ──────────────────────────────────────
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-    private static extern int pdf_set_search_field(byte[]? value);
-
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_set_path_filter(byte[]? value);
-
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-    private static extern int pdf_set_field_weights(byte[]? json);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_set_collection_boost(uint collId, float weight);
@@ -198,9 +214,7 @@ public sealed class PdfEngine : IDisposable
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_set_boolean_query(byte[]? json);
 
-    public string? SearchField { set { Settings.SearchField = value; pdf_set_search_field(value is not null ? Utf8(value) : null); } }
     public string? PathFilter { set { Settings.PathFilter = value; pdf_set_path_filter(value is not null ? Utf8(value) : null); } }
-    public string? FieldWeights { set { Settings.FieldWeights = value; pdf_set_field_weights(value is not null ? Utf8(value) : null); } }
     public string? BooleanQuery { set { Settings.BooleanQuery = value; pdf_set_boolean_query(value is not null ? Utf8(value) : null); } }
     public string? ThemeName { get => Settings.ThemeName; set => Settings.ThemeName = value; }
     public void SetCollectionBoost(uint collId, float weight)
@@ -269,6 +283,29 @@ public sealed class PdfEngine : IDisposable
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_set_log_callback(IntPtr cb);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    private static extern int pdf_set_log_path(IntPtr path);
+
+    public void SetLogPath(string? path)
+    {
+        if (path is null)
+        {
+            pdf_set_log_path(IntPtr.Zero);
+            return;
+        }
+        var bytes = System.Text.Encoding.UTF8.GetBytes(path + "\0");
+        var ptr = Marshal.AllocHGlobal(bytes.Length);
+        try
+        {
+            Marshal.Copy(bytes, 0, ptr, bytes.Length);
+            pdf_set_log_path(ptr);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(ptr);
+        }
+    }
 
     private LogCallback? _logCb;
     private GCHandle? _logCbHandle;
@@ -451,9 +488,7 @@ public sealed class PdfEngine : IDisposable
             Settings.ExtractWorkers = s.ExtractWorkers;
             Settings.ChannelCapacity = s.ChannelCapacity;
             Settings.CollectionBoosts = s.CollectionBoosts ?? new();
-            Settings.SearchField = s.SearchField;
             Settings.PathFilter = s.PathFilter;
-            Settings.FieldWeights = s.FieldWeights;
             Settings.BooleanQuery = s.BooleanQuery;
             Settings.ThemeName = s.ThemeName ?? "Light";
 
@@ -472,10 +507,6 @@ public sealed class PdfEngine : IDisposable
             pdf_set_channel_capacity(Settings.ChannelCapacity);
             foreach (var (id, weight) in Settings.CollectionBoosts)
                 pdf_set_collection_boost(id, weight);
-            if (Settings.FieldWeights is not null)
-                pdf_set_field_weights(Utf8(Settings.FieldWeights));
-            if (Settings.SearchField is not null)
-                pdf_set_search_field(Utf8(Settings.SearchField));
             if (Settings.PathFilter is not null)
                 pdf_set_path_filter(Utf8(Settings.PathFilter));
             if (Settings.BooleanQuery is not null)

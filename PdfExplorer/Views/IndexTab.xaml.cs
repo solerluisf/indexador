@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using PdfExplorer.Services;
@@ -128,6 +129,11 @@ public partial class IndexTab : Page
             });
         });
 
+        // Also write all pipeline log messages to a file for external tailing
+        var logDir = Path.Combine(Path.GetTempPath(), "PdfExplorer");
+        Directory.CreateDirectory(logDir);
+        _engine.SetLogPath(Path.Combine(logDir, "pipeline.log"));
+
         // Route per‑process metrics (PROC|thread|pid|state|mem|extra)
         _engine.SetProcessCallback(raw =>
         {
@@ -219,6 +225,7 @@ public partial class IndexTab : Page
         // Detach the callbacks — they were only valid during indexing
         _engine.SetLogCallback(null);
         _engine.SetProcessCallback(null);
+        _engine.SetLogPath(null); // close pipeline log file
 
         if (errors.Count > 0)
         {

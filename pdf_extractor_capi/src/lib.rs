@@ -1,16 +1,19 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, CStr, CString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use tantivy::query::Occur;
-use tantivy::schema::Value;
+
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::canonical_combining_class;
 
-use pdf_extractor::extractor::clean_word_text;
-use pdf_extractor::indexer::{Indexer, SearchIndex, parse_query_auto_phrase};
+use pdf_extractor::indexer::{Indexer, SearchIndex};
+use pdf_extractor::search::builders::{AutoPhraseQueryBuilder, BooleanPhraseQueryBuilder};
+use pdf_extractor::search::engines::TantivyEngine;
+use pdf_extractor::search::pipeline::{SearchPipeline, default_enrichers};
+use pdf_extractor::search::types::*;
+use pdf_extractor::search::SearchResponse;
 use pdf_extractor::metrics::Metrics;
 use pdf_extractor::output::JsonlWriter;
 use pdf_extractor::ocr::{self, find_tesseract};
@@ -40,9 +43,7 @@ struct AppContext {
     commit_timeout: Option<u32>,
     extract_workers: Option<u32>,
     num_indexer_threads: Option<u32>,
-    search_field: Option<String>,
     path_filter: Option<String>,
-    field_weights: Option<Vec<(String, f32)>>,
     collection_boosts: HashMap<i64, f32>,
     boolean_query: Option<Vec<(String, String)>>,
 }
@@ -90,10 +91,11 @@ fn debug_log(msg: &str) {
 /// Acquire a **read** lock.  Multiple readers can run concurrently.
 /// Returns an error if `AppContext` has not been initialised yet.
 fn with_app_read<R>(f: impl FnOnce(&AppContext) -> R) -> Result<R, i32> {
-    let guard = APP
-        .get_or_init(|| RwLock::new(None))
-        .read()
-        .map_err(|_| ERR_POISONED)?;
+    let lock = APP.get_or_init(|| RwLock::new(None));
+    let guard = match lock.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     let app = guard.as_ref().ok_or(ERR_NOT_INIT)?;
     Ok(f(app))
 }
@@ -101,10 +103,11 @@ fn with_app_read<R>(f: impl FnOnce(&AppContext) -> R) -> Result<R, i32> {
 /// Acquire a **write** lock (exclusive).  Also initialises `AppContext`
 /// on first call (lazily).
 fn with_app_mut<R>(f: impl FnOnce(&mut AppContext) -> R) -> Result<R, i32> {
-    let mut guard = APP
-        .get_or_init(|| RwLock::new(None))
-        .write()
-        .map_err(|_| ERR_POISONED)?;
+    let lock = APP.get_or_init(|| RwLock::new(None));
+    let mut guard = match lock.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     let app = guard.get_or_insert_with(|| AppContext {
         jobs: None,
         indexer: None,
@@ -121,9 +124,7 @@ fn with_app_mut<R>(f: impl FnOnce(&mut AppContext) -> R) -> Result<R, i32> {
         commit_timeout: None,
         extract_workers: None,
         num_indexer_threads: None,
-        search_field: None,
         path_filter: None,
-        field_weights: None,
         collection_boosts: HashMap::new(),
         boolean_query: None,
     });
@@ -138,61 +139,104 @@ fn set_error(msg: String) {
     *guard = Some(msg);
 }
 
-/// Per-collection cancellation tokens so concurrent indexing operations
-/// don't interfere with each other.
-// Atomically-accessed scalar settings — no RwLock contention with readers.
-static FUZZY_DISTANCE: AtomicU32 = AtomicU32::new(0);
-static STEM_ENABLED: AtomicU32 = AtomicU32::new(0);
-static RECENCY_WEIGHT_BITS: AtomicU32 = AtomicU32::new(f32::to_bits(0.0));
-
 static CANCEL_TOKENS: OnceLock<Mutex<HashMap<u32, Arc<AtomicBool>>>> = OnceLock::new();
 fn cancel_tokens() -> &'static Mutex<HashMap<u32, Arc<AtomicBool>>> {
     CANCEL_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Lazy‑init global SearchContext — opens the global index once and reuses it.
+static GLOBAL_SEARCH_CTX: Mutex<Option<SearchContext>> = Mutex::new(None);
+
+fn get_global_search_ctx() -> Result<SearchContext, i32> {
+    let mut guard = GLOBAL_SEARCH_CTX.lock().map_err(|_| ERR_POISONED)?;
+    if let Some(ref cached) = *guard {
+        return Ok(SearchContext {
+            index: cached.index.clone(),
+            id_field: cached.id_field,
+            content_field: cached.content_field,
+            path_field: cached.path_field,
+            position_store: None,
+        });
+    }
+
+    let index_path = with_app_read(|app| app.index_path.clone())
+        .map_err(|_| ERR_POISONED)?
+        .ok_or(ERR_NOT_INIT)?;
+    let search_index = SearchIndex::new(&index_path)
+        .map_err(|e| { set_error(format!("Failed to open global index: {}", e)); ERR_GENERAL })?;
+    let ctx = SearchContext {
+        index: search_index.index.clone(),
+        id_field: search_index.id_field,
+        content_field: search_index.content_field,
+        path_field: search_index.path_field,
+        position_store: None,
+    };
+    *guard = Some(SearchContext {
+        index: search_index.index,
+        id_field: search_index.id_field,
+        content_field: search_index.content_field,
+        path_field: search_index.path_field,
+        position_store: None,
+    });
+    Ok(ctx)
+}
+
 /// Reset all global state — clears AppContext, collection registry, error,
-/// callbacks, cancellation tokens, and atomic settings.  Used by `pdf_reset_all`
+/// callbacks, cancellation tokens, and search context.  Used by `pdf_reset_all`
 /// and by `#[cfg(test)]` helpers.
 fn reset_all_globals() {
-    // AppContext
+    // AppContext — recover from poison
     if let Some(rw) = APP.get() {
-        if let Ok(mut guard) = rw.write() {
-            *guard = None;
-        }
+        let mut guard = match rw.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        *guard = None;
     }
-    // Collection registry
+    // Collection registry — recover from poison
     if let Some(lock) = COLLECTION_REGISTRY.get() {
-        if let Ok(mut guard) = lock.lock() {
-            *guard = None;
-        }
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        *guard = None;
     }
-    // Error
+    // Error — recover from poison
     if let Some(lock) = LAST_ERROR.get() {
-        if let Ok(mut guard) = lock.lock() {
-            *guard = None;
-        }
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        *guard = None;
     }
-    // Callbacks
+    // Callbacks — recover from poison
     if let Some(lock) = LOG_CALLBACK.get() {
-        if let Ok(mut guard) = lock.lock() {
-            *guard = None;
-        }
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        *guard = None;
     }
     if let Some(lock) = PROCESS_CALLBACK.get() {
-        if let Ok(mut guard) = lock.lock() {
-            *guard = None;
-        }
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        *guard = None;
     }
-    // Cancellation tokens
+    // Cancellation tokens — recover from poison
     if let Some(lock) = CANCEL_TOKENS.get() {
-        if let Ok(mut guard) = lock.lock() {
-            guard.clear();
-        }
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        guard.clear();
     }
-    // Atomic scalar settings
-    FUZZY_DISTANCE.store(0, Ordering::Relaxed);
-    STEM_ENABLED.store(0, Ordering::Relaxed);
-    RECENCY_WEIGHT_BITS.store(f32::to_bits(0.0), Ordering::Relaxed);
+    // Global search context — recover from poison
+    match GLOBAL_SEARCH_CTX.lock() {
+        Ok(mut guard) => *guard = None,
+        Err(e) => *e.into_inner() = None,
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +454,102 @@ pub unsafe extern "C" fn pdf_search(
     let json_str = serde_json::to_string(&wrapped).unwrap_or_else(|_| "{}".into());
     let rc = unsafe { write_to_buffer(json_str.as_bytes(), out_json, out_len) };
     rc
+}
+
+// ---------------------------------------------------------------------------
+// pdf_search_v2 — JSON-in / JSON-out search API
+// ---------------------------------------------------------------------------
+//
+// Input  JSON: { "query": "...", "strategy": "auto_phrase"|"boolean_phrase",
+//                 "limit": 50, "offset": 0, "path_filter": "...",
+//                 "collection_id": 1 }
+// Output JSON: SearchResponse (success, total_count, page, page_size,
+//              query, strategy, results)
+// Returns a heap-allocated C string (caller must free via pdf_free_string),
+// or null on error.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_search_v2(json_input: *const c_char) -> *mut c_char {
+    let input_str = match unsafe { cstr_to_str(json_input) } {
+        Ok(s) => s,
+        Err(e) => return std::ptr::null_mut(),
+    };
+
+    let v: serde_json::Value = match serde_json::from_str(input_str) {
+        Ok(val) => val,
+        Err(_) => { set_error("Invalid JSON input".into()); return std::ptr::null_mut(); }
+    };
+
+    let query_str = match v["query"].as_str() {
+        Some(s) => s,
+        None => { set_error("Missing 'query' field".into()); return std::ptr::null_mut(); }
+    };
+    let strategy = v["strategy"].as_str().unwrap_or("auto_phrase");
+    let limit = v["limit"].as_u64().unwrap_or(50) as usize;
+    let offset = v["offset"].as_u64().unwrap_or(0) as usize;
+    let path_filter = v["path_filter"].as_str().map(|s| s.to_string());
+    let coll_id = v["collection_id"].as_i64();
+
+    // Load search index (lazy‑init global context for non‑collection searches)
+    let ctx: SearchContext = if let Some(cid) = coll_id {
+        let collection = match with_registry(|reg| reg.get_collection(cid)) {
+            Ok(Ok(c)) => c,
+            Ok(Err(_)) => { set_error("Collection not found".into()); return std::ptr::null_mut(); }
+            Err(_) => { set_error("Registry error".into()); return std::ptr::null_mut(); }
+        };
+        let index_path = PathBuf::from(&collection.data_dir).join(".pdf_extractor").join("index");
+        let search_index = match SearchIndex::new(&index_path) {
+            Ok(idx) => idx,
+            Err(e) => { set_error(format!("Failed to open index: {}", e)); return std::ptr::null_mut(); }
+        };
+        SearchContext {
+            index: search_index.index,
+            id_field: search_index.id_field,
+            content_field: search_index.content_field,
+            path_field: search_index.path_field,
+            position_store: None,
+        }
+    } else {
+        match get_global_search_ctx() {
+            Ok(ctx) => ctx,
+            Err(e) => { set_error("Global search context unavailable".into()); return std::ptr::null_mut(); }
+        }
+    };
+
+    let builder: Box<dyn pdf_extractor::search::traits::QueryBuilder> = match strategy {
+        "boolean_phrase" => Box::new(BooleanPhraseQueryBuilder),
+        _ => Box::new(AutoPhraseQueryBuilder),
+    };
+
+    let input = SearchInput {
+        query_str: query_str.to_string(),
+        field: None,
+        limit,
+        offset,
+        path_filter,
+        strategy: SearchStrategy::AutoPhrase,
+    };
+
+    let pipeline = SearchPipeline::new(
+        ctx,
+        builder,
+        Box::new(TantivyEngine),
+        default_enrichers(),
+    );
+
+    let response: SearchResponse = match pipeline.execute_to_response(&input) {
+        Ok(r) => r,
+        Err(e) => { set_error(format!("Search failed: {}", e)); return std::ptr::null_mut(); }
+    };
+
+    let json = match serde_json::to_string(&response) {
+        Ok(s) => s,
+        Err(_) => { set_error("JSON serialization failed".into()); return std::ptr::null_mut(); }
+    };
+
+    match CString::new(json) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => { set_error("CString conversion failed".into()); std::ptr::null_mut() }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2057,7 +2197,7 @@ pub unsafe extern "C" fn pdf_extract(
         Arc::clone(&metrics),
         &input_path,
         indexer,
-        &config,
+        config,
     );
 
     let processed = metrics.processed();
@@ -2124,10 +2264,12 @@ pub unsafe extern "C" fn pdf_stats(out_json: *mut c_char, out_len: *mut u32) -> 
 static COLLECTION_REGISTRY: OnceLock<Mutex<Option<CollectionRegistry>>> = OnceLock::new();
 
 fn registry_guard() -> Result<std::sync::MutexGuard<'static, Option<CollectionRegistry>>, i32> {
-    COLLECTION_REGISTRY
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .map_err(|_| ERR_POISONED)
+    let lock = COLLECTION_REGISTRY
+        .get_or_init(|| Mutex::new(None));
+    match lock.lock() {
+        Ok(g) => Ok(g),
+        Err(e) => Ok(e.into_inner()), // recover from poison
+    }
 }
 
 fn with_registry<F, R>(f: F) -> Result<R, i32>
@@ -2215,20 +2357,8 @@ define_u32_setter!(pdf_set_commit_interval, commit_interval);
 define_u32_setter!(pdf_set_commit_timeout, commit_timeout);
 define_u32_setter!(pdf_set_extract_workers, extract_workers);
 define_u32_setter!(pdf_set_indexer_threads, num_indexer_threads);
-#[no_mangle]
-pub unsafe extern "C" fn pdf_set_fuzzy_distance(value: u32) -> i32 {
-    FUZZY_DISTANCE.store(value, Ordering::Relaxed);
-    0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pdf_set_stem(value: u32) -> i32 {
-    STEM_ENABLED.store(value, Ordering::Relaxed);
-    0
-}
 define_string_setter!(pdf_set_tesseract_path, tesseract_path);
 define_string_setter!(pdf_set_ocr_language, ocr_language);
-define_string_setter!(pdf_set_search_field, search_field);
 define_string_setter!(pdf_set_path_filter, path_filter);
 
 #[no_mangle]
@@ -2256,66 +2386,26 @@ pub unsafe extern "C" fn pdf_set_process_callback(cb: Option<extern "C" fn(*cons
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pdf_set_log_path(path: *const c_char) -> i32 {
+    if path.is_null() {
+        pdf_extractor::pipeline::close_pipeline_log();
+        return 0;
+    }
+    let path_str = match CStr::from_ptr(path).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let pb = PathBuf::from(path_str);
+    match pdf_extractor::pipeline::set_pipeline_log_path(&pb) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pdf_set_ram_buffer(value: u64) -> i32 {
     (|| -> i32 {
     match with_app_mut(|app| { app.ram_buffer = Some(value); Ok::<_, i32>(()) }) {
-        Ok(_) => 0,
-        Err(e) => e,
-    }
-    })()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pdf_set_recency_weight(value: f32) -> i32 {
-    RECENCY_WEIGHT_BITS.store(value.to_bits(), Ordering::Relaxed);
-    0
-}
-
-/// Set per-field weight boosts for ranked search.
-///
-/// `json` is a JSON object mapping Tantivy field names to float weights:
-/// e.g. `{"content": 1.0, "path": 3.0}`.
-///
-/// Pass `null` to reset to unweighted (default) search. On success the
-/// next call to any search function will use BoostQuery for each field.
-///
-/// Valid field names: content, path, math_tokens.
-#[no_mangle]
-pub unsafe extern "C" fn pdf_set_field_weights(json: *const c_char) -> i32 {
-    (|| -> i32 {
-    if json.is_null() {
-        return match with_app_mut(|app| { app.field_weights = None; Ok::<_, i32>(()) }) {
-            Ok(_) => 0,
-            Err(e) => e,
-        };
-    }
-    let s = match unsafe { cstr_to_str(json) } {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let map: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(s) {
-        Ok(m) => m,
-        Err(e) => {
-            set_error(format!("Invalid field weights JSON: {}", e));
-            return -3;
-        }
-    };
-    let mut weights = Vec::with_capacity(map.len());
-    for (field, value) in &map {
-        let w = match value.as_f64() {
-            Some(w) if w > 0.0 => w as f32,
-            _ => {
-                set_error(format!("Invalid weight for field '{}': must be a positive number", field));
-                return -3;
-            }
-        };
-        weights.push((field.clone(), w));
-    }
-    if weights.is_empty() {
-        set_error("Field weights object must have at least one entry".into());
-        return -3;
-    }
-    match with_app_mut(|app| { app.field_weights = Some(weights); Ok::<_, i32>(()) }) {
         Ok(_) => 0,
         Err(e) => e,
     }
@@ -2600,7 +2690,7 @@ pub unsafe extern "C" fn pdf_index_collection(
 
     eprintln!("[pdf_index_collection] calling run_pipeline with canonical={:?}", canonical);
     let indexer_for_ocr = indexer.clone();
-    match run_pipeline(Arc::clone(&jobs), Arc::clone(&writer), Arc::clone(&metrics), &canonical, indexer, &config) {
+    match run_pipeline(Arc::clone(&jobs), Arc::clone(&writer), Arc::clone(&metrics), &canonical, indexer, config) {
         Ok(()) => {
             let processed = metrics.processed();
             eprintln!("[pdf_index_collection] run_pipeline OK, processed={}", processed);
@@ -2715,29 +2805,16 @@ pub unsafe extern "C" fn pdf_reset_all() {
 /// Settings read from AppContext once, to avoid mutex contention in parallel search.
 #[derive(Clone, Default)]
 struct SearchSettings {
-    fuzzy: u32,
-    stem: bool,
-    field: Option<String>,
     path_filter: Option<String>,
-    recency_weight: f32,
-    field_weights: Option<Vec<(String, f32)>>,
     boolean_query: Option<Vec<(String, String)>>,
 }
 
 fn load_search_settings() -> SearchSettings {
-    let fuzzy = FUZZY_DISTANCE.load(Ordering::Relaxed);
-    let stem = STEM_ENABLED.load(Ordering::Relaxed) != 0;
-    let recency_weight = f32::from_bits(RECENCY_WEIGHT_BITS.load(Ordering::Relaxed));
     with_app_read(|app| SearchSettings {
-        fuzzy,
-        stem,
-        recency_weight,
-        field: app.search_field.clone(),
         path_filter: app.path_filter.clone(),
-        field_weights: app.field_weights.clone(),
         boolean_query: app.boolean_query.clone(),
     })
-    .unwrap_or(SearchSettings { fuzzy, stem, recency_weight, ..Default::default() })
+    .unwrap_or_default()
 }
 
 fn do_search_with_index(
@@ -2748,34 +2825,38 @@ fn do_search_with_index(
     coll_id: Option<i64>,
     settings: &SearchSettings,
 ) -> Result<(Vec<serde_json::Value>, u64), i32> {
-    let results = if let Some(ref bool_clauses) = settings.boolean_query {
-        let refs: Vec<(&str, Occur)> = bool_clauses.iter()
-            .map(|(term, occur_str)| {
-                let occur = match occur_str.as_str() {
-                    "should" => Occur::Should,
-                    "must_not" => Occur::MustNot,
-                    _ => Occur::Must,
-                };
-                (term.as_str(), occur)
-            })
-            .collect();
-        search_index.search_boolean(&refs, limit as usize, settings.path_filter.as_deref(), offset as usize, settings.stem)
-    } else if let Some(ref weights) = settings.field_weights {
-        let refs: Vec<(&str, f32)> = weights.iter().map(|(n, w)| (n.as_str(), *w)).collect();
-        search_index.search_weighted_fields(query, &refs, limit as usize, settings.path_filter.as_deref(), offset as usize)
-    } else if let Some(ref field_name) = settings.field {
-        search_index.search_in_field_fuzzy_stem(
-            query, field_name, limit as usize, settings.path_filter.as_deref(), offset as usize, settings.fuzzy as u8, settings.stem,
-        )
-    } else if settings.fuzzy > 0 {
-        search_index.search_fuzzy_stem(
-            query, limit as usize, settings.path_filter.as_deref(), offset as usize, settings.fuzzy as u8, settings.stem,
-        )
-    } else {
-        search_index.search(query, limit as usize, settings.path_filter.as_deref(), offset as usize)
+    let ctx = SearchContext {
+        index: search_index.index.clone(),
+        id_field: search_index.id_field,
+        content_field: search_index.content_field,
+        path_field: search_index.path_field,
+        position_store: None,
     };
 
-    let results = match results {
+    let builder: Box<dyn pdf_extractor::search::traits::QueryBuilder> =
+        if settings.boolean_query.is_some() {
+            Box::new(BooleanPhraseQueryBuilder)
+        } else {
+            Box::new(AutoPhraseQueryBuilder)
+        };
+
+    let input = SearchInput {
+        query_str: query.to_string(),
+        field: None,
+        limit: limit as usize,
+        offset: offset as usize,
+        path_filter: settings.path_filter.clone(),
+        strategy: SearchStrategy::AutoPhrase,
+    };
+
+    let pipeline = SearchPipeline::new(
+        ctx,
+        builder,
+        Box::new(TantivyEngine),
+        default_enrichers(),
+    );
+
+    let response: SearchResponse = match pipeline.execute_to_response(&input) {
         Ok(r) => r,
         Err(e) => {
             return Err({
@@ -2785,71 +2866,20 @@ fn do_search_with_index(
         }
     };
 
-    let results = if settings.recency_weight > 0.0 {
-        search_index.apply_recency_boost(results, settings.recency_weight, 365)
-    } else {
-        results
-    };
+    let json_entries: Vec<serde_json::Value> = response.results.iter().map(|r| {
+        let mut entry = serde_json::json!({
+            "id": r.doc_id.unwrap_or(0),
+            "score": r.score,
+            "path": r.path,
+            "snippet": r.snippet.as_deref().unwrap_or(""),
+        });
+        if let Some(cid) = coll_id {
+            entry["collection_id"] = serde_json::json!(cid);
+        }
+        entry
+    }).collect();
 
-    // Build snippet infra ONCE (reader, searcher, query, generator) —
-    // reused for all results instead of creating one per result.
-    let infra_reader = search_index.index
-        .reader_builder()
-        .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
-        .try_into()
-        .ok();
-    let infra_searcher = infra_reader.as_ref().map(|r| r.searcher());
-    let infra_query = if !query.trim().is_empty() {
-        parse_query_auto_phrase(&search_index.index, query, search_index.content_field).ok()
-    } else {
-        None
-    };
-
-    // Get total count from the same searcher + query
-    let total_count: u64 = infra_searcher.as_ref()
-        .and_then(|s| infra_query.as_ref().and_then(|q| {
-            s.search(q.as_ref(), &tantivy::collector::Count).ok()
-        }))
-        .unwrap_or(0) as u64;
-
-    // Build snippet generator once and reuse
-    let snippet_gen = infra_searcher.as_ref().and_then(|s| {
-        infra_query.as_ref().and_then(|q| {
-            tantivy::SnippetGenerator::create(s, q.as_ref(), search_index.content_field).ok()
-        })
-    });
-
-    let json_entries: Vec<serde_json::Value> = results
-        .iter()
-        .map(|(score, doc)| {
-            let id_val = doc
-                .get_first(search_index.id_field)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let path_val = doc
-                .get_first(search_index.path_field)
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let snippet = snippet_gen.as_ref()
-                .and_then(|gen| {
-                    let s = gen.snippet_from_doc(doc);
-                    Some(s.to_html())
-                })
-                .unwrap_or_default();
-            let mut entry = serde_json::json!({
-                "id": id_val,
-                "score": score,
-                "path": path_val,
-                "snippet": snippet,
-            });
-            if let Some(cid) = coll_id {
-                entry["collection_id"] = serde_json::json!(cid);
-            }
-            entry
-        })
-        .collect();
-
-    Ok((json_entries, total_count))
+    Ok((json_entries, response.total_count))
 }
 
 #[no_mangle]
@@ -3216,14 +3246,14 @@ mod tests {
     #[test]
     fn test_init_null_paths() {
         let rc = unsafe { pdf_init(std::ptr::null(), std::ptr::null()) };
-        assert_eq!(rc, -3);
+        assert_eq!(rc, ERR_NULL_PTR);
     }
 
     #[test]
     fn test_search_null_query() {
         let rc =
             unsafe { pdf_search(std::ptr::null(), 10, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-        assert_eq!(rc, -3);
+        assert_eq!(rc, ERR_NULL_PTR);
     }
 
     #[test]
@@ -3480,7 +3510,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let rc = unsafe {
             pdf_render_thumbnail(std::ptr::null(), 0, 0, std::ptr::null_mut(), std::ptr::null_mut())
         };
-        assert_eq!(rc, -3);
+        assert_eq!(rc, ERR_NULL_PTR);
     }
 
     #[test]
@@ -3506,7 +3536,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
     fn test_create_registry_null_path() {
         reset_state();
         let rc = unsafe { pdf_create_registry(std::ptr::null()) };
-        assert_eq!(rc, -3);
+        assert_eq!(rc, ERR_NULL_PTR);
     }
 
     #[test]
@@ -3569,7 +3599,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let rc = unsafe {
             pdf_search_collection(1, q.as_ptr(), 10, 0, buf.as_mut_ptr() as *mut c_char, &mut len)
         };
-        assert_eq!(rc, -7);
+        assert_eq!(rc, ERR_REG_NOT_INIT);
     }
 
     #[test]
@@ -3587,7 +3617,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let rc = unsafe {
             pdf_search_collection(999, q.as_ptr(), 10, 0, buf.as_mut_ptr() as *mut c_char, &mut len)
         };
-        assert_eq!(rc, -8);
+        assert_eq!(rc, ERR_COLLECTION_NOT_FOUND);
     }
 
     #[test]
@@ -3599,7 +3629,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let rc = unsafe {
             pdf_search_all(q.as_ptr(), 10, 0, buf.as_mut_ptr() as *mut c_char, &mut len)
         };
-        assert_eq!(rc, -7);
+        assert_eq!(rc, ERR_REG_NOT_INIT);
     }
 
     #[test]
@@ -3628,10 +3658,6 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
     fn test_setters_stored_and_used() {
         reset_state();
 
-        // Test all simple setters
-        assert_eq!(unsafe { pdf_set_fuzzy_distance(2) }, 0);
-        assert_eq!(unsafe { pdf_set_stem(1) }, 0);
-        assert_eq!(unsafe { pdf_set_recency_weight(0.5) }, 0);
         assert_eq!(unsafe { pdf_set_ram_buffer(100_000_000) }, 0);
         assert_eq!(unsafe { pdf_set_ocr_workers(3) }, 0);
         assert_eq!(unsafe { pdf_set_ocr_max_dim(2000) }, 0);
@@ -3648,62 +3674,11 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let tesseract = CString::new("C:\\tools\\tesseract.exe").unwrap();
         assert_eq!(unsafe { pdf_set_tesseract_path(tesseract.as_ptr()) }, 0);
 
-        let field = CString::new("content").unwrap();
-        assert_eq!(unsafe { pdf_set_search_field(field.as_ptr()) }, 0);
-
         let filter = CString::new("science").unwrap();
         assert_eq!(unsafe { pdf_set_path_filter(filter.as_ptr()) }, 0);
 
         // Null resets string setters
-        assert_eq!(unsafe { pdf_set_search_field(std::ptr::null()) }, 0);
         assert_eq!(unsafe { pdf_set_path_filter(std::ptr::null()) }, 0);
-    }
-
-    #[test]
-    fn test_set_field_weights_valid() {
-        reset_state();
-        let json = CString::new(r#"{"content": 1.0, "path": 3.0}"#).unwrap();
-        let rc = unsafe { pdf_set_field_weights(json.as_ptr()) };
-        assert_eq!(rc, 0);
-    }
-
-    #[test]
-    fn test_set_field_weights_null_resets() {
-        reset_state();
-        let json = CString::new(r#"{"content": 2.0}"#).unwrap();
-        assert_eq!(unsafe { pdf_set_field_weights(json.as_ptr()) }, 0);
-        assert_eq!(unsafe { pdf_set_field_weights(std::ptr::null()) }, 0);
-    }
-
-    #[test]
-    fn test_set_field_weights_invalid_json() {
-        reset_state();
-        let json = CString::new("not json").unwrap();
-        let rc = unsafe { pdf_set_field_weights(json.as_ptr()) };
-        assert_eq!(rc, -3);
-    }
-
-    #[test]
-    fn test_set_field_weights_zero_weight() {
-        reset_state();
-        let json = CString::new(r#"{"content": 0.0}"#).unwrap();
-        let rc = unsafe { pdf_set_field_weights(json.as_ptr()) };
-        assert_eq!(rc, -3);
-    }
-
-    #[test]
-    fn test_set_field_weights_empty_object() {
-        reset_state();
-        let json = CString::new("{}").unwrap();
-        let rc = unsafe { pdf_set_field_weights(json.as_ptr()) };
-        assert_eq!(rc, -3);
-    }
-
-    #[test]
-    fn test_set_field_weights_null_query() {
-        reset_state();
-        let rc = unsafe { pdf_set_field_weights(std::ptr::null()) };
-        assert_eq!(rc, 0);
     }
 
     #[test]
@@ -3969,7 +3944,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         reset_state();
         let mut count: u64 = 0;
         let rc = unsafe { pdf_search_count(std::ptr::null(), &mut count) };
-        assert_eq!(rc, -3);
+        assert_eq!(rc, ERR_NULL_PTR);
     }
 
     #[test]
@@ -4001,7 +3976,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let mut count: u64 = 0;
         let q = CString::new("test").unwrap();
         let rc = unsafe { pdf_search_count_all(q.as_ptr(), &mut count) };
-        assert_eq!(rc, -7);
+        assert_eq!(rc, ERR_REG_NOT_INIT);
     }
 
     #[test]
@@ -4015,7 +3990,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
 
         let mut count: u64 = 0;
         let rc = unsafe { pdf_search_count_all(std::ptr::null(), &mut count) };
-        assert_eq!(rc, -3);
+        assert_eq!(rc, ERR_NULL_PTR);
     }
 
     #[test]
@@ -4046,7 +4021,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let mut buf = [0u8; 4096];
         let mut len = 4096u32;
         let rc = unsafe { pdf_collection_stats(999, buf.as_mut_ptr() as *mut c_char, &mut len) };
-        assert_eq!(rc, -8);
+        assert_eq!(rc, ERR_COLLECTION_NOT_FOUND);
     }
 
     #[test]
@@ -4055,7 +4030,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let mut buf = [0u8; 4096];
         let mut len = 4096u32;
         let rc = unsafe { pdf_collection_stats(1, buf.as_mut_ptr() as *mut c_char, &mut len) };
-        assert_eq!(rc, -7);
+        assert_eq!(rc, ERR_REG_NOT_INIT);
     }
 
     #[test]
@@ -4078,7 +4053,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let rc = unsafe {
             pdf_get_term_positions(0, 1, std::ptr::null(), buf.as_mut_ptr() as *mut c_char, &mut len)
         };
-        assert_eq!(rc, -3);
+        assert_eq!(rc, ERR_NULL_PTR);
     }
 
     #[test]
@@ -4096,10 +4071,9 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
             Ok::<_, i32>(())
         }).unwrap();
 
-        // Store positions manually (normally done by pipeline's flush_batch)
-        let index_path = std::path::PathBuf::from(&idx);
-        let positions_db_path = index_path.join("positions.sqlite");
-        let store = pdf_extractor::positions::PositionStore::open(&positions_db_path).unwrap();
+        // Store positions manually via the Indexer's own position store
+        // (avoids opening a second SQLite connection to the same file, which
+        // fails on Windows with SQLITE_CANTOPEN).
         let word_positions = vec![
             (0usize, pdf_extractor::extractor::WordPosition {
                 page: 1, x_min: 10.0, y_min: 20.0, x_max: 50.0, y_max: 30.0,
@@ -4110,7 +4084,11 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
                 text: "hello".to_string(),
             }),
         ];
-        store.store_positions(1, &word_positions).unwrap();
+        with_app_mut(|app| {
+            let indexer = app.indexer.as_ref().unwrap();
+            indexer.store_word_positions(1, &word_positions).unwrap();
+            Ok::<_, i32>(())
+        }).unwrap();
 
         // Search for term positions
         let mut buf = [0u8; 4096];
@@ -4202,128 +4180,6 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let rc = unsafe { pdf_collection_stats(coll_id as u32, buf.as_mut_ptr() as *mut c_char, &mut len) };
         // Index doesn't exist yet, so may fail
         assert!(rc == 0 || rc == -1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Boolean query end-to-end (real index, real documents, real search)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_boolean_query_end_to_end() {
-        reset_state();
-        let (db, idx) = setup_temp_index();
-        let db_c = CString::new(db.clone()).unwrap();
-        let idx_c = CString::new(idx.clone()).unwrap();
-        assert_eq!(unsafe { pdf_init(db_c.as_ptr(), idx_c.as_ptr()) }, 0);
-
-        // Index 3 docs in the content field
-        let _ = with_app_mut(|app| {
-            let indexer = app.indexer.as_ref().unwrap();
-            indexer.index_document(1, "/doc1.pdf", "Introduction to algebra").unwrap();
-            indexer.index_document(2, "/doc2.pdf", "Advanced calculus topics").unwrap();
-            indexer.index_document(3, "/doc3.pdf", "Algebra and calculus together").unwrap();
-            Ok::<_, i32>(())
-        }).unwrap();
-
-        // --- Basic flow: MUST "algebra" SHOULD "calculus" ---
-        let bool_json = CString::new(
-            r#"[{"term": "algebra", "occur": "must"}, {"term": "calculus", "occur": "should"}]"#
-        ).unwrap();
-        assert_eq!(unsafe { pdf_set_boolean_query(bool_json.as_ptr()) }, 0);
-
-        let mut buf = [0u8; 8192];
-        let mut len = 8192u32;
-        let q = CString::new("").unwrap();
-        assert_eq!(unsafe { pdf_search(q.as_ptr(), 10, 0, buf.as_mut_ptr() as *mut c_char, &mut len) }, 0);
-        let v: serde_json::Value = serde_json::from_str(
-            std::str::from_utf8(&buf[..len as usize]).unwrap()
-        ).unwrap();
-        let results = v["results"].as_array().unwrap();
-        assert_eq!(results.len(), 2, "MUST algebra → 2 docs");
-        // doc3 has algebra (MUST) + calculus (SHOULD) → higher BM25 score
-        assert_eq!(results[0]["path"], "/doc3.pdf");
-        assert_eq!(results[1]["path"], "/doc1.pdf");
-
-        // --- Alternative flow: MUST "algebra" + MUST_NOT "calculus" ---
-        unsafe { pdf_set_boolean_query(std::ptr::null()) }; // reset first
-        let bool_json2 = CString::new(
-            r#"[{"term": "algebra", "occur": "must"}, {"term": "calculus", "occur": "must_not"}]"#
-        ).unwrap();
-        assert_eq!(unsafe { pdf_set_boolean_query(bool_json2.as_ptr()) }, 0);
-        let mut len2 = 8192u32;
-        assert_eq!(unsafe { pdf_search(q.as_ptr(), 10, 0, buf.as_mut_ptr() as *mut c_char, &mut len2) }, 0);
-        let v2: serde_json::Value = serde_json::from_str(
-            std::str::from_utf8(&buf[..len2 as usize]).unwrap()
-        ).unwrap();
-        let results2 = v2["results"].as_array().unwrap();
-        assert_eq!(results2.len(), 1, "MUST algebra + MUST_NOT calculus → only doc1");
-        assert_eq!(results2[0]["path"], "/doc1.pdf");
-
-        // --- Edge flow: all MUST_NOT → no matches ---
-        let bool_json3 = CString::new(
-            r#"[{"term": "algebra", "occur": "must_not"}, {"term": "calculus", "occur": "must_not"}]"#
-        ).unwrap();
-        assert_eq!(unsafe { pdf_set_boolean_query(bool_json3.as_ptr()) }, 0);
-        let mut len3 = 8192u32;
-        assert_eq!(unsafe { pdf_search(q.as_ptr(), 10, 0, buf.as_mut_ptr() as *mut c_char, &mut len3) }, 0);
-        let v3: serde_json::Value = serde_json::from_str(
-            std::str::from_utf8(&buf[..len3 as usize]).unwrap()
-        ).unwrap();
-        let results3 = v3["results"].as_array().unwrap();
-        assert_eq!(results3.len(), 0, "All MUST_NOT → no results");
-
-        // --- Reset flow: null resets to standard simple-query search ---
-        unsafe { pdf_set_boolean_query(std::ptr::null()) };
-        let q2 = CString::new("algebra").unwrap();
-        let mut len4 = 8192u32;
-        assert_eq!(unsafe { pdf_search(q2.as_ptr(), 10, 0, buf.as_mut_ptr() as *mut c_char, &mut len4) }, 0);
-        let v4: serde_json::Value = serde_json::from_str(
-            std::str::from_utf8(&buf[..len4 as usize]).unwrap()
-        ).unwrap();
-        assert_eq!(v4["results"].as_array().unwrap().len(), 2, "Standard search for algebra → 2 docs");
-    }
-
-    // -----------------------------------------------------------------------
-    // Field weights end-to-end
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_field_weights_end_to_end() {
-        reset_state();
-        let (db, idx) = setup_temp_index();
-        let db_c = CString::new(db.clone()).unwrap();
-        let idx_c = CString::new(idx.clone()).unwrap();
-        assert_eq!(unsafe { pdf_init(db_c.as_ptr(), idx_c.as_ptr()) }, 0);
-
-        let _ = with_app_mut(|app| {
-            let indexer = app.indexer.as_ref().unwrap();
-            indexer.index_document(1, "/doc1.pdf", "algebra").unwrap();
-            indexer.index_document(2, "/doc2.pdf", "calculus").unwrap();
-            Ok::<_, i32>(())
-        }).unwrap();
-
-        // --- Basic flow ---
-        let w = CString::new(r#"{"content": 2.0}"#).unwrap();
-        assert_eq!(unsafe { pdf_set_field_weights(w.as_ptr()) }, 0);
-        let mut buf = [0u8; 4096];
-        let mut len = 4096u32;
-        let q = CString::new("algebra").unwrap();
-        assert_eq!(unsafe { pdf_search(q.as_ptr(), 10, 0, buf.as_mut_ptr() as *mut c_char, &mut len) }, 0);
-        let v: serde_json::Value = serde_json::from_str(
-            std::str::from_utf8(&buf[..len as usize]).unwrap()
-        ).unwrap();
-        let results = v["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1, "Weighted search for algebra → 1 doc");
-        assert_eq!(results[0]["path"], "/doc1.pdf");
-
-        // --- Reset flow ---
-        unsafe { pdf_set_field_weights(std::ptr::null()) };
-        let mut len2 = 4096u32;
-        assert_eq!(unsafe { pdf_search(q.as_ptr(), 10, 0, buf.as_mut_ptr() as *mut c_char, &mut len2) }, 0);
-        let v2: serde_json::Value = serde_json::from_str(
-            std::str::from_utf8(&buf[..len2 as usize]).unwrap()
-        ).unwrap();
-        assert_eq!(v2["results"].as_array().unwrap().len(), 1, "Reset → standard search still works");
     }
 
     // -----------------------------------------------------------------------
@@ -4476,6 +4332,142 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         // Engine-level paths (like \\?\) often have no parent
         let result = resolve_worker_path_from(std::path::Path::new("\\\\?\\C:\\"));
         assert!(result.is_none(), "root/UNC path has no meaningful parent");
+    }
+
+    // --- pdf_search_v2 ---
+
+    fn setup_search_v2_with_docs() -> (CString, CString) {
+        reset_state();
+        let (db, idx) = setup_temp_index();
+        let idx_path = PathBuf::from(&idx);
+        // Index documents directly via SearchIndex to populate the index
+        let search_index = SearchIndex::new(&idx_path).unwrap();
+        let mut writer = search_index.writer().unwrap();
+        search_index.add_document(&mut writer, 1, "/doc1.pdf", "hello world", None).unwrap();
+        search_index.add_document(&mut writer, 2, "/doc2.pdf", "hello there", None).unwrap();
+        search_index.add_document(&mut writer, 3, "/doc3.pdf", "rust programming language", None).unwrap();
+        search_index.add_document(&mut writer, 4, "/doc4.pdf", "hello AND world boolean test", None).unwrap();
+        search_index.add_document(&mut writer, 5, "/doc5.pdf", "hello OR world", None).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(search_index);
+
+        let db_c = CString::new(db).unwrap();
+        let idx_c = CString::new(idx).unwrap();
+        assert_eq!(unsafe { pdf_init(db_c.as_ptr(), idx_c.as_ptr()) }, 0);
+        (db_c, idx_c)
+    }
+
+    fn call_search_v2(json_input: &str) -> Option<serde_json::Value> {
+        let json_c = CString::new(json_input).unwrap();
+        let ptr = unsafe { pdf_search_v2(json_c.as_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+        let result = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+        unsafe { pdf_free_string(ptr) };
+        serde_json::from_str(&result).ok()
+    }
+
+    #[test]
+    fn test_search_v2_basic() {
+        let (_db, _idx) = setup_search_v2_with_docs();
+        let json = r#"{"query": "hello", "limit": 10}"#;
+        let result = call_search_v2(json);
+        let resp = result.expect("Should get a valid response");
+        assert_eq!(resp["success"], true);
+        assert!(resp["total_count"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(resp["strategy"], "auto_phrase");
+        assert_eq!(resp["query"], "hello");
+        let results = resp["results"].as_array().unwrap();
+        assert!(results.len() > 0);
+        assert!(results[0]["score"].as_f64().unwrap_or(0.0) > 0.0);
+        assert!(results[0]["path"].as_str().unwrap_or("").len() > 0);
+    }
+
+    #[test]
+    fn test_search_v2_with_boolean_strategy() {
+        let (_db, _idx) = setup_search_v2_with_docs();
+        let json = r#"{"query": "hello AND world", "strategy": "boolean_phrase", "limit": 10}"#;
+        let result = call_search_v2(json);
+        let resp = result.expect("Should get a valid response");
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["strategy"], "boolean_phrase");
+        assert_eq!(resp["total_count"].as_u64().unwrap_or(0), 3);
+    }
+
+    #[test]
+    fn test_search_v2_with_path_filter() {
+        let (_db, _idx) = setup_search_v2_with_docs();
+        let json = r#"{"query": "hello", "path_filter": "/doc\\d+\\.pdf", "limit": 10}"#;
+        let result = call_search_v2(json);
+        let resp = result.expect("Should get a valid response");
+        assert_eq!(resp["success"], true);
+        let results = resp["results"].as_array().unwrap();
+        assert!(results.len() > 0);
+        for r in results {
+            let path = r["path"].as_str().unwrap();
+            assert!(path.starts_with("/doc"), "Path {:?} should match filter", path);
+        }
+    }
+
+    #[test]
+    fn test_search_v2_pagination() {
+        let (_db, _idx) = setup_search_v2_with_docs();
+        let json = r#"{"query": "hello", "limit": 2, "offset": 0}"#;
+        let result = call_search_v2(json);
+        let resp = result.expect("Should get a valid response");
+        assert_eq!(resp["page"], 1);
+        assert_eq!(resp["page_size"], 2);
+        assert_eq!(resp["results"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_search_v2_empty_query() {
+        let (_db, _idx) = setup_search_v2_with_docs();
+        let json = r#"{"query": "", "limit": 10}"#;
+        let result = call_search_v2(json);
+        let resp = result.expect("Should get a valid response");
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["total_count"], 0);
+        assert_eq!(resp["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_search_v2_no_results() {
+        let (_db, _idx) = setup_search_v2_with_docs();
+        let json = r#"{"query": "zzzzzzzzzzz_nonexistent", "limit": 10}"#;
+        let result = call_search_v2(json);
+        let resp = result.expect("Should get a valid response");
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["total_count"], 0);
+        assert!(resp["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_search_v2_invalid_json() {
+        let (_db, _idx) = setup_search_v2_with_docs();
+        let json_c = CString::new("not json").unwrap();
+        let ptr = unsafe { pdf_search_v2(json_c.as_ptr()) };
+        assert!(ptr.is_null(), "Invalid JSON should return null");
+    }
+
+    #[test]
+    fn test_search_v2_before_init() {
+        reset_state();
+        let json = r#"{"query": "hello", "limit": 10}"#;
+        let result = call_search_v2(json);
+        assert!(result.is_none(), "Should fail before init");
+    }
+
+    #[test]
+    fn test_search_v2_metadata_present() {
+        let (_db, _idx) = setup_search_v2_with_docs();
+        let json = r#"{"query": "hello", "limit": 10}"#;
+        let result = call_search_v2(json);
+        let resp = result.expect("Should get a valid response");
+        let meta = resp["metadata"].as_object();
+        assert!(meta.is_some(), "Response should contain metadata object");
     }
 }
 
