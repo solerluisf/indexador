@@ -12,6 +12,7 @@ use tantivy::{doc, Index, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDo
 use tantivy::{DocSet, Postings, TERMINATED};
 
 use crate::math_tokenizer::MathAwareTokenizer;
+use crate::search::traits::QueryBuilder;
 
 /// Canonical token pattern used by both the extractor (`clean_word_text`) and
 /// Tantivy's tokenizers. Single source of truth — guarantees lockstep alignment.
@@ -180,7 +181,22 @@ impl SearchIndex {
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
         if !query_str.trim().is_empty() {
-            let boxed = parse_query_auto_phrase(&self.index, query_str, self.content_field)?;
+            let builder = crate::search::builders::AutoPhraseQueryBuilder;
+            let ctx = crate::search::types::SearchContext {
+                index: self.index.clone(),
+                content_field: self.content_field,
+                path_field: self.path_field,
+                position_store: None,
+            };
+            let input = crate::search::types::SearchInput {
+                query_str: query_str.to_string(),
+                field: None,
+                limit,
+                offset,
+                path_filter: path_filter.map(|s| s.to_string()),
+                strategy: crate::search::types::SearchStrategy::AutoPhrase,
+            };
+            let boxed = builder.build(&ctx, &input)?;
             clauses.push((Occur::Must, boxed));
         }
 
@@ -778,25 +794,9 @@ impl SearchIndex {
     }
 }
 
-fn is_bare_multiword(s: &str) -> bool {
-    let t = s.trim();
-    t.contains(' ') && !t.contains('"')
-}
-
-pub fn parse_query_auto_phrase(
-    index: &Index,
-    query_str: &str,
-    field: Field,
-) -> Result<Box<dyn Query>> {
-    let mut qp = QueryParser::for_index(index, vec![field]);
-    qp.set_conjunction_by_default();
-    let adjusted = if is_bare_multiword(query_str) {
-        format!("\"{}\"", query_str.trim())
-    } else {
-        query_str.to_string()
-    };
-    qp.parse_query(&adjusted).context("Failed to parse search query")
-}
+/// Re-exported for backward compatibility (C API uses it directly).
+/// Real implementation lives in search::builders::auto_phrase.
+pub use crate::search::builders::auto_phrase::parse_query_auto_phrase;
 
 #[allow(dead_code)]
 #[derive(Debug)]

@@ -1,3 +1,4 @@
+pub mod search;
 pub mod scanner;
 pub mod extractor;
 pub mod normalizer;
