@@ -214,8 +214,12 @@ public sealed class PdfEngine : IDisposable
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_set_boolean_query(byte[]? json);
 
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_set_search_boolean_mode(int enabled);
+
     public string? PathFilter { set { Settings.PathFilter = value; pdf_set_path_filter(value is not null ? Utf8(value) : null); } }
     public string? BooleanQuery { set { Settings.BooleanQuery = value; pdf_set_boolean_query(value is not null ? Utf8(value) : null); } }
+    public bool SearchBooleanMode { set { pdf_set_search_boolean_mode(value ? 1 : 0); } }
     public string? ThemeName { get => Settings.ThemeName; set => Settings.ThemeName = value; }
     public void SetCollectionBoost(uint collId, float weight)
     {

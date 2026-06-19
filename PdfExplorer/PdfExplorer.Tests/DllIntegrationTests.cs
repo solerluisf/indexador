@@ -664,8 +664,8 @@ public sealed class DllIntegrationTests : IClassFixture<TestPdfFixture>, IDispos
     public void GetTermPositions_phrase_returns_only_phrase_pages()
     {
         // pdf_get_term_positions with a multi-word phrase must return
-        // ONE position per phrase match (not individual word positions).
-        // Each returned position must have word_text = the full phrase text.
+        // only positions where the words form consecutive offsets on the same page.
+        // Each word in the phrase is returned as a separate position.
         var doc = GetDoc("machine learning", "test_custom_phrase");
         // doc has pages 1-4: ["machine", "machine learning", "machine learning", ""]
 
@@ -678,18 +678,21 @@ public sealed class DllIntegrationTests : IClassFixture<TestPdfFixture>, IDispos
         var json = Encoding.UTF8.GetString(buf, 0, (int)len);
         var positions = JsonSerializer.Deserialize<List<WordPosition>>(json) ?? [];
 
-        // Must return exactly 2 positions (one per phrase match on pages 2 and 3),
-        // not 4+ individual word positions.
-        Assert.Equal(2, positions.Count);
-
-        // Every position must have word_text = "machine learning" (the full phrase),
-        // not "machine" or "learning" individually.
-        foreach (var pos in positions)
-            Assert.Equal("machine learning", pos.WordText);
+        // Must return 4 positions (2 consecutive phrase matches × 2 words each),
+        // not individual non-phrase word positions.
+        Assert.Equal(4, positions.Count);
 
         // Must return ONLY pages 2 and 3 (where "machine learning" appears)
         var pages = positions.Select(p => p.Page).Distinct().Order().ToArray();
         Assert.Equal([2, 3], pages);
+
+        // On page 2, must have both "machine" and "learning"
+        var pg2 = positions.Where(p => p.Page == 2).Select(p => p.WordText).Order().ToList();
+        Assert.Equal(["learning", "machine"], pg2);
+
+        // On page 3, must have both "machine" and "learning"
+        var pg3 = positions.Where(p => p.Page == 3).Select(p => p.WordText).Order().ToList();
+        Assert.Equal(["learning", "machine"], pg3);
     }
 
     [Fact]

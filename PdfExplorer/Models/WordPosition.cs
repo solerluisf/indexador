@@ -8,5 +8,6 @@ public record WordPosition(
     [property: JsonPropertyName("y_min")] float YMin,
     [property: JsonPropertyName("x_max")] float XMax,
     [property: JsonPropertyName("y_max")] float YMax,
-    [property: JsonPropertyName("word_text")] string? WordText
+    [property: JsonPropertyName("word_text")] string? WordText,
+    [property: JsonPropertyName("word_offset")] int WordOffset
 );

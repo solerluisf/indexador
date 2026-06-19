@@ -17,22 +17,9 @@ namespace PdfExplorer.Views;
 public partial class SearchTab : Page, IPdfRenderingService
 {
     private readonly PdfEngine _engine;
-    private readonly PdfiumPageRenderer _renderer = new(150);
-    private readonly Dictionary<(string, int), PageRenderItem> _globalPageCache = new();
-    private readonly Queue<(string, int)> _globalPageCacheOrder = new();
-    private readonly object _globalCacheLock = new();
-    private const int MaxGlobalCacheEntries = 50;
-    private readonly object _renderCacheLock = new();
-    private readonly ConcurrentDictionary<int, Task<PageRenderItem>> _pendingRenders = new();
-    private readonly ThumbnailService _thumbService = new();
-    private CancellationTokenSource? _thumbCts;
-    private CancellationTokenSource? _selectionCts;
-    private const int ThumbnailPreloadCount = 30;
-    private readonly SemaphoreSlim _searchLock = new(1, 1);
-    private int _currentPage;
-    private long _totalHits;
-    private string _lastQuery = string.Empty;
-    private PdfViewState _state = new();
+    private readonly IViewerMediator _viewerMediator;
+    private readonly ISearchMediator _searchMediator;
+    private readonly INavigationMediator _navigationMediator;
     private uint? _selectedCollId;
     private bool _isLoading;
     private bool _isNavigating;
@@ -48,6 +35,14 @@ public partial class SearchTab : Page, IPdfRenderingService
         Log("Constructor start");
         InitializeComponent();
         _engine = App.Engine;
+        _viewerMediator = new ViewerMediator();
+        _viewerMediator.StateChanged += OnViewerStateChanged;
+        _viewerMediator.ViewModelsBuilt += OnViewModelsBuilt;
+        _searchMediator = new SearchMediator(_engine, new ThumbnailService());
+        _searchMediator.SearchCompleted += OnSearchCompleted;
+        _searchMediator.SearchFailed += OnSearchFailed;
+        _navigationMediator = new NavigationMediator();
+        _navigationMediator.StateChanged += OnNavStateChanged;
         Loaded += OnLoaded;
         Log("Constructor end, engine=" + (_engine is not null ? "ok" : "null"));
     }
@@ -60,7 +55,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private void OnCollectionFilterChanged(object sender, SelectionChangedEventArgs e)
     {
-        _currentPage = 0;
+        _searchMediator.ResetPage();
         if (CollectionFilter.SelectedItem is CollectionInfo coll)
         {
             _selectedCollId = (uint)coll.Id;
@@ -76,6 +71,13 @@ public partial class SearchTab : Page, IPdfRenderingService
         }
     }
 
+    private void OnSearchModeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_engine is null) return;
+        var isBoolean = SearchModeCombo.SelectedIndex == 1;
+        _engine.SearchBooleanMode = isBoolean;
+    }
+
     // ── Search ──────────────────────────────────────────────────────
 
     private void OnSearchBoxKeyDown(object sender, KeyEventArgs e)
@@ -88,189 +90,66 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private async void OnSearchClick(object sender, RoutedEventArgs e)
     {
-        if (!await _searchLock.WaitAsync(0))
-        {
-            Log("OnSearchClick: skipped (search already in progress)");
-            return;
-        }
-        try
-        {
-            Log("OnSearchClick");
-            _currentPage = 0;
-            ClearViewer();
-            await RunSearch();
-        }
-        catch (Exception ex)
-        {
-            Log($"OnSearchClick error: {ex.GetType().Name}: {ex.Message}");
-        }
-        finally
-        {
-            _searchLock.Release();
-        }
+        Log("OnSearchClick");
+        ClearViewer();
+        await _searchMediator.SearchAsync(SearchBox.Text, _selectedCollId);
     }
 
-    private async Task RunSearch()
+    private void OnSearchCompleted(object? sender, SearchResultsEventArgs e)
     {
-        var query = SearchBox.Text;
-        if (string.IsNullOrWhiteSpace(query)) return;
-        _lastQuery = query;
-
-        try
+        _ = Dispatcher.InvokeAsync(() =>
         {
-            var results = await Task.Run(() => _engine.Search(query, limit: 1000, offset: _currentPage * 1000, collId: _selectedCollId));
-            _totalHits = results.Total;
-
-            var viewModels = results.Results.Select(r => new SearchResultViewModel(r)).ToList();
-
-            ResultsList.ItemsSource = viewModels;
-
-            // Start thumbnail preloading
-            _thumbCts?.Cancel();
-            _thumbCts = new CancellationTokenSource();
-            var thumbCt = _thumbCts.Token;
-            _ = PreloadThumbnailsAsync(viewModels, ThumbnailPreloadCount, thumbCt)
-                .ContinueWith(t =>
-                {
-                    if (t.Exception is null)
-                        _ = LoadRemainingThumbnailsAsync(viewModels, ThumbnailPreloadCount, thumbCt);
-                }, TaskContinuationOptions.NotOnCanceled);
-
-            var totalPages = _totalHits > 0 ? (int)System.Math.Ceiling(_totalHits / 1000.0) : 0;
-            PageInfo.Content = $"{_currentPage + 1} / {totalPages}";
-            PrevPage.IsEnabled = _currentPage > 0;
-            NextPage.IsEnabled = _currentPage + 1 < totalPages;
-            ResultCountLabel.Text = $"{_totalHits} result(s)";
-        }
-        catch (Exception ex)
-        {
-            ResultCountLabel.Text = $"Search error: {ex.Message}";
-        }
-    }
-
-    private async Task PreloadThumbnailsAsync(List<SearchResultViewModel> items, int count, CancellationToken ct)
-    {
-        var toLoad = items.Take(count).ToList();
-
-        // Collect raw thumbnail data concurrently (throttled by ThumbnailService.SemaphoreSlim(4))
-        var rawResults = (await Task.WhenAll(toLoad.Select(async vm =>
-        {
-            if (ct.IsCancellationRequested) return (vm, raw: (ThumbnailRawResult?)null);
-
             try
             {
-                var raw = await _thumbService.GetThumbnailAsync(vm.Path, ct);
-                return (vm, raw);
+                ResultsList.ItemsSource = e.Results;
+                PageInfo.Content = $"{e.CurrentPage + 1} / {e.TotalPages}";
+                PrevPage.IsEnabled = e.CurrentPage > 0;
+                NextPage.IsEnabled = e.CurrentPage + 1 < e.TotalPages;
+                ResultCountLabel.Text = $"{e.TotalHits} result(s)";
             }
-            catch (OperationCanceledException) { return (vm, null); }
-            catch (Exception)
-            {
-                return (vm, null);
-            }
-        })))
-        .Where(r => r.raw is not null && !ct.IsCancellationRequested)
-        .ToList();
-
-        if (rawResults.Count == 0 || ct.IsCancellationRequested)
-            return;
-
-        // Single batch dispatch to UI thread — all BitmapSource creations in one InvokeAsync
-        await Dispatcher.InvokeAsync(() =>
-        {
-            ct.ThrowIfCancellationRequested();
-
-            if (ResultsList.ItemsSource is not System.Collections.IList list)
-                return;
-
-            foreach (var (vm, raw) in rawResults)
-            {
-                if (!list.Contains(vm)) continue;
-
-                var bmp = BitmapSource.Create(
-                    raw.Width, raw.Height, 96, 96,
-                    PixelFormats.Bgra32, null, raw.Pixels, raw.Stride);
-                bmp.Freeze();
-                vm.Thumbnail = bmp;
-            }
+            catch (Exception ex) { Log($"OnSearchCompleted handler error: {ex.Message}"); }
         });
     }
 
-    private async Task LoadRemainingThumbnailsAsync(List<SearchResultViewModel> items, int skipCount, CancellationToken ct)
+    private void OnSearchFailed(object? sender, SearchErrorEventArgs e)
     {
-        var remaining = items.Skip(skipCount).ToList();
-
-        await Task.WhenAll(remaining.Select<SearchResultViewModel, Task>(async vm =>
+        _ = Dispatcher.InvokeAsync(() =>
         {
-            if (ct.IsCancellationRequested || vm.Thumbnail is not null) return;
+            try { ResultCountLabel.Text = $"Search error: {e.Error}"; }
+            catch (Exception ex) { Log($"OnSearchFailed handler error: {ex.Message}"); }
+        });
+    }
 
-            try
-            {
-                var raw = await _thumbService.GetThumbnailAsync(vm.Path, ct);
-                if (raw is null) return;
+    private void OnViewerStateChanged(object? sender, ViewerStateChangedEventArgs e)
+    {
+        try { WordsField.Text = _viewerMediator.PositionsDebugText; }
+        catch (Exception ex) { Log($"OnViewerStateChanged error: {ex.Message}"); }
+    }
 
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    ct.ThrowIfCancellationRequested();
-
-                    if (ResultsList.ItemsSource is not System.Collections.IList list) return;
-                    if (!list.Contains(vm)) return;
-
-                    var bmp = BitmapSource.Create(
-                        raw.Width, raw.Height, 96, 96,
-                        PixelFormats.Bgra32, null, raw.Pixels, raw.Stride);
-                    bmp.Freeze();
-                    vm.Thumbnail = bmp;
-                });
-            }
-            catch (OperationCanceledException) { }
-            catch (Exception) { }
-        }));
+    private void OnViewModelsBuilt(object? sender, EventArgs e)
+    {
+        try { PageList.ItemsSource = _viewerMediator.PageViewModels; }
+        catch (Exception ex) { Log($"OnViewModelsBuilt error: {ex.Message}"); }
     }
 
     private async void OnNextPage(object sender, RoutedEventArgs e)
     {
-        if (!await _searchLock.WaitAsync(0))
-        {
-            Log("OnNextPage: skipped (search already in progress)");
-            return;
-        }
         try
         {
-            _currentPage++;
             ClearViewer();
-            await RunSearch();
+            await _searchMediator.NextPageAsync(_selectedCollId);
         }
-        catch (Exception ex)
-        {
-            Log($"OnNextPage error: {ex.GetType().Name}: {ex.Message}");
-        }
-        finally
-        {
-            _searchLock.Release();
-        }
+        catch (Exception ex) { Log($"OnNextPage error: {ex.Message}"); }
     }
 
     private async void OnPrevPage(object sender, RoutedEventArgs e)
     {
-        if (!await _searchLock.WaitAsync(0))
-        {
-            Log("OnPrevPage: skipped (search already in progress)");
-            return;
-        }
         try
         {
-            _currentPage--;
             ClearViewer();
-            await RunSearch();
+            await _searchMediator.PrevPageAsync(_selectedCollId);
         }
-        catch (Exception ex)
-        {
-            Log($"OnPrevPage error: {ex.GetType().Name}: {ex.Message}");
-        }
-        finally
-        {
-            _searchLock.Release();
-        }
+        catch (Exception ex) { Log($"OnPrevPage error: {ex.Message}"); }
     }
 
     // ── Document selection + filtered rendering ─────────────────────
@@ -291,26 +170,17 @@ public partial class SearchTab : Page, IPdfRenderingService
                 return;
             }
 
-            // Cancel any previous selection rendering and clear state first.
-            // ClearViewer must run BEFORE creating the new _selectionCts,
-            // otherwise ClearViewer would cancel the token we just created.
-            _selectionCts?.Cancel();
             ClearViewer();
 
-            // Physically disable UI to prevent reentrant clicks during async load
             _isLoading = true;
             ResultsList.IsEnabled = false;
 
-            _selectionCts = new CancellationTokenSource();
-            var ct = _selectionCts.Token;
+            var ct = _viewerMediator.CurrentRenderToken;
 
             var t0 = DateTime.UtcNow;
-            Log($"OnResultSelected: id={result.Id}, path={result.Path}, collId={result.CollectionId}, query='{_lastQuery}'");
-
-            _state.PdfPath = result.Path;
+            Log($"OnResultSelected: id={result.Id}, path={result.Path}, collId={result.CollectionId}, query='{_searchMediator.LastQuery}'");
             StatusLabel.Text = System.IO.Path.GetFileName(result.Path);
 
-            // Read the PDF bytes once and pass to both search + render (fixes double-load)
             byte[] pdfBytes;
             try
             {
@@ -321,118 +191,40 @@ public partial class SearchTab : Page, IPdfRenderingService
             {
                 Log($"Failed to read PDF file: {ex.Message}");
                 StatusLabel.Text = $"Failed to read PDF: {ex.Message}";
+                _isLoading = false;
+                ResultsList.IsEnabled = true;
                 return;
             }
 
-            // Fetch term positions from indexed position store (SQLite)
-            // This is much more efficient than re-extracting the PDF with PDFium
+            // Fetch term positions
+            List<WordPosition> positions;
             if (result.CollectionId.HasValue)
             {
                 try
                 {
-                    Log($"Fetching term positions from indexed position store");
-                    _state.Positions = await Task.Run(() => _engine.GetTermPositions(
-                        (uint)result.CollectionId.Value,
-                        result.Id,
-                        _lastQuery
-                    ));
-                    var before = _state.Positions.Count;
-                    _state.Positions = _state.Positions
-                        .OrderBy(p => p.Page)
-                        .ThenBy(p => p.YMax)
-                        .DistinctBy(p => (p.Page, p.XMin, p.YMin, p.XMax, p.YMax))
-                        .ToList();
-                    var dupes = before - _state.Positions.Count;
-                    var t1 = DateTime.UtcNow;
-                    Log($"GetTermPositions returned {_state.Positions.Count} positions ({dupes} dupes removed, took {(t1 - t0).TotalMilliseconds:F0}ms)");
-                    // Diagnostic: dump first 20 positions with page/Y to stderr
-                    for (int di = 0; di < Math.Min(20, _state.Positions.Count); di++)
-                    {
-                        var dp = _state.Positions[di];
-                        Log($"  pos[{di}] page={dp.Page} YMin={dp.YMin:F2} YMax={dp.YMax:F2} word='{dp.WordText}'");
-                    }
+                    positions = await _viewerMediator.FetchPositionsAsync(
+                        _engine, (uint)result.CollectionId.Value, result.Id, _searchMediator.LastQuery);
                 }
                 catch (Exception ex)
                 {
                     Log($"GetTermPositions warning: {ex.GetType().Name}: {ex.Message}");
-                    _state.Positions = new List<WordPosition>();
+                    positions = new List<WordPosition>();
                 }
             }
             else
             {
                 Log("No collection ID available - cannot fetch indexed positions");
-                _state.Positions = new List<WordPosition>();
+                positions = new List<WordPosition>();
             }
 
-            if (_state.Positions.Count > 0)
-            {
-                Log($"First position: page={_state.Positions[0].Page}, x_min={_state.Positions[0].XMin}, word_text={_state.Positions[0].WordText}");
-                var lines = new List<string>(_state.Positions.Count + 1);
-                lines.Add($"Positions ({_state.Positions.Count}):");
-                foreach (var p in _state.Positions)
-                {
-                    var word = string.IsNullOrWhiteSpace(p.WordText) ? "?" : p.WordText;
-                    lines.Add($"  p{p.Page} \"{word}\" ({p.XMin:F1},{p.YMin:F1})-({p.XMax:F1},{p.YMax:F1})");
-                }
-                WordsField.Text = string.Join("\n", lines);
-            }
-            else
-            {
-                WordsField.Text = result.Snippet;
-            }
+            _viewerMediator.SetPositions(positions, _navigationMediator, _searchMediator.LastQuery, isBooleanMode: SearchModeCombo.SelectedIndex == 1);
+            _viewerMediator.OpenDocument(pdfBytes, result.Path);
 
-            var tPos = DateTime.UtcNow;
-
-            // Load PDF from the bytes we already read
-            try
-            {
-                Log($"Loading PDF: {result.Path}");
-                _renderer.OpenDocument(pdfBytes, result.Path);
-                var t2 = DateTime.UtcNow;
-                Log($"PDF loaded, page count={_renderer.GetPageCount()} (took {(t2 - tPos).TotalMilliseconds:F0}ms)");
-            }
-            catch (Exception ex)
-            {
-                Log($"LoadDocumentAsync error: {ex.GetType().Name}: {ex.Message}");
-                StatusLabel.Text = $"Failed to load PDF: {ex.Message}";
-                return;
-            }
-
-            if (_state.Positions.Count == 0)
+            if (positions.Count == 0)
             {
                 Log("No positions found — showing first page without highlights");
                 StatusLabel.Text += " — no highlights";
             }
-
-            var tPdf = DateTime.UtcNow;
-
-            // Determine which pages match (sorted, 0-based)
-            _state.MatchingPages = _state.Positions
-                .Select(p => p.Page - 1)
-                .Where(p => p >= 0)
-                .Distinct()
-                .OrderBy(p => p)
-                .ToList();
-
-            // Fallback: if no matches, show the first page of the PDF
-            if (_state.MatchingPages.Count == 0)
-            {
-                _state.MatchingPages = new List<int> { 0 };
-                Log("No matching pages — fallback to page 1");
-            }
-
-            Log($"Matching pages ({_state.MatchingPages.Count}): [{string.Join(", ", _state.MatchingPages.Select(p => p + 1))}]");
-
-            // Group positions by page
-            _state.PositionsByPage = _state.Positions
-                .GroupBy(p => p.Page - 1)
-                .ToDictionary(g => g.Key, g => g.ToList());
-
-            _state.TotalMatchPages = _state.MatchingPages.Count;
-
-            // Build virtualized page view models with pre-calculated heights
-            _state.CurrentMatchIndex = 0;
-            _state.CurrentPositionIndex = -1;
 
             if (ct.IsCancellationRequested)
             {
@@ -447,7 +239,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         }
         catch (Exception ex)
         {
-            Log($"OnResultSelected UNHANDLED ERROR: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+            Log($"OnResultSelected UNHANDLED ERROR: {ex}");
             StatusLabel.Text = $"Error: {ex.Message}";
         }
     }
@@ -456,142 +248,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     async Task<PageRenderItem> IPdfRenderingService.GetOrRenderPageAsync(int pageIdx, List<WordPosition> pagePositions)
     {
-        // Capture the cancellation token at entry — before GetOrAdd,
-        // so that if ClearViewer cancels _selectionCts during an in-flight
-        // render, any new request for the same page is cancelled immediately
-        // instead of wasting ~100ms on a stale native call.
-        var ct = _selectionCts?.Token ?? CancellationToken.None;
-
-        // Coalesce concurrent render requests for the same page.
-        // Multiple PdfPageView controls can request the same pageIdx
-        // simultaneously during rapid navigation.
-        try
-        {
-            return await _pendingRenders.GetOrAdd(pageIdx, idx => RenderPageInternalAsync(idx, pagePositions, ct));
-        }
-        finally
-        {
-            _pendingRenders.TryRemove(pageIdx, out _);
-        }
-    }
-
-    private async Task<PageRenderItem> RenderPageInternalAsync(int pageIdx, List<WordPosition> pagePositions, CancellationToken ct)
-    {
-        var capturedState = _state;
-        var cacheKey = (capturedState.PdfPath, pageIdx);
-
-        // Check global cache first (outside lock for fast path)
-        lock (_renderCacheLock)
-        {
-            if (_globalPageCache.TryGetValue(cacheKey, out var cached))
-            {
-                if (ReferenceEquals(_state, capturedState))
-                    _state.PageCache[pageIdx] = cached;
-                return cached;
-            }
-
-            if (capturedState.PageCache.TryGetValue(pageIdx, out var cachedLocal))
-                return cachedLocal;
-        }
-
-        ct.ThrowIfCancellationRequested();
-
-        Log($"Rendering page {pageIdx + 1} (0-based={pageIdx})");
-        StatusLabel.Text = $"Rendering page {pageIdx + 1}...";
-
-        try
-        {
-            // Get page dimensions first (needed to allocate the buffer)
-            var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
-            int pixW = (int)(wPts * _renderer.TargetDpi / 72.0);
-            int pixH = (int)(hPts * _renderer.TargetDpi / 72.0);
-            int stride = pixW * 4;
-
-            // Rent buffer from pool and pin it — Rust will render directly into it
-            int bufferSize = stride * pixH;
-            var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
-            try
-            {
-                var pin = GCHandle.Alloc(buffer, GCHandleType.Pinned);
-                try
-                {
-                    IntPtr ptr = pin.AddrOfPinnedObject();
-
-                    // Native render on background thread (zero-copy: writes into buffer)
-                    await Task.Run(() =>
-                    {
-                        _renderer.RenderToBuffer(pageIdx, pagePositions,
-                            ptr, pixW, pixH, stride,
-                            out var _, out var _);
-                    }, ct);
-
-                    ct.ThrowIfCancellationRequested();
-
-                    // Create the frozen WPF bitmap on the UI thread
-                    var item = await Dispatcher.InvokeAsync(() =>
-                    {
-                        ct.ThrowIfCancellationRequested();
-
-                        var bitmap = BitmapSource.Create(
-                            pixW, pixH, 96, 96,
-                            PixelFormats.Bgra32, null,
-                            buffer, stride);
-                        bitmap.Freeze();
-
-                        return new PageRenderItem
-                        {
-                            PageNumber = pageIdx + 1,
-                            PageImage = bitmap,
-                            ImagePixelWidth = pixW,
-                            ImagePixelHeight = pixH,
-                            PdfPageWidth = wPts,
-                            PdfPageHeight = hPts,
-                            Positions = pagePositions,
-                        };
-                    });
-
-                    Log($"  rendered: {pixW}x{pixH}");
-
-                    lock (_renderCacheLock)
-                    {
-                        if (ReferenceEquals(_state, capturedState))
-                            _state.PageCache[pageIdx] = item;
-                    }
-                    AddToGlobalCache(cacheKey, item);
-                    return item;
-                }
-                finally
-                {
-                    pin.Free();
-                }
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            Log($"RenderPage error: {ex.GetType().Name}: {ex.Message}");
-            var fallback = new PageRenderItem
-            {
-                PageNumber = pageIdx + 1,
-                ImagePixelWidth = 0,
-                PdfPageWidth = 0,
-                Positions = pagePositions,
-            };
-            lock (_renderCacheLock)
-            {
-                if (ReferenceEquals(_state, capturedState))
-                    _state.PageCache[pageIdx] = fallback;
-            }
-            AddToGlobalCache(cacheKey, fallback);
-            return fallback;
-        }
+        return await _viewerMediator.GetOrRenderPageAsync(pageIdx, pagePositions, _viewerMediator.CurrentRenderToken);
     }
 
     // ── Match navigation ────────────────────────────────────────────
@@ -601,10 +258,8 @@ public partial class SearchTab : Page, IPdfRenderingService
         if (_isLoading) return;
         try
         {
-            if (_state.CurrentMatchIndex <= 0) return;
-            var prevIdx = _state.CurrentMatchIndex - 1;
-            _state.CurrentMatchIndex = prevIdx;
-            ScrollToMatch(prevIdx, scrollToTop: true);
+            if (!_navigationMediator.GotoPrevMatch()) return;
+            ScrollToMatch(_navigationMediator.CurrentMatchIndex, scrollToTop: true);
         }
         catch (Exception ex)
         {
@@ -617,10 +272,8 @@ public partial class SearchTab : Page, IPdfRenderingService
         if (_isLoading) return;
         try
         {
-            if (_state.CurrentMatchIndex >= _state.TotalMatchPages - 1) return;
-            var nextIdx = _state.CurrentMatchIndex + 1;
-            _state.CurrentMatchIndex = nextIdx;
-            ScrollToMatch(nextIdx, scrollToTop: true);
+            if (!_navigationMediator.GotoNextMatch()) return;
+            ScrollToMatch(_navigationMediator.CurrentMatchIndex, scrollToTop: true);
         }
         catch (Exception ex)
         {
@@ -628,16 +281,29 @@ public partial class SearchTab : Page, IPdfRenderingService
         }
     }
 
+    private void OnNavStateChanged(object? sender, EventArgs e)
+    {
+        MatchInfo.Content = _navigationMediator.TotalMatchPages > 0
+            ? $"Match page {_navigationMediator.CurrentMatchIndex + 1} of {_navigationMediator.TotalMatchPages}"
+            : "0 matches";
+        PrevMatch.IsEnabled = _navigationMediator.CanGoPrevMatch;
+        NextMatch.IsEnabled = _navigationMediator.CanGoNextMatch;
+
+        var phraseCount = _navigationMediator.TotalPhraseCount;
+        PositionInfo.Content = phraseCount > 0
+            ? $"{_navigationMediator.CurrentPhraseIndex + 1} / {phraseCount}"
+            : "0 / 0";
+        PrevPosition.IsEnabled = _navigationMediator.CanGoPrevPosition;
+        NextPosition.IsEnabled = _navigationMediator.CanGoNextPosition;
+    }
+
     private void ScrollToMatch(int index, bool scrollToTop = false)
     {
         Log($"ScrollToMatch({index}, scrollToTop={scrollToTop})");
-        if (index < 0 || index >= _state.MatchingPages.Count) return;
-        _state.CurrentMatchIndex = index;
+        var matchingPages = _viewerMediator.MatchingPages;
+        if (index < 0 || index >= matchingPages.Count) return;
 
-        int pageIdx = _state.MatchingPages[index];
-        int posIdx = _state.Positions.FindIndex(p => p.Page - 1 == pageIdx);
-        _state.CurrentPositionIndex = posIdx >= 0 ? posIdx : -1;
-        Log($"ScrollToMatch: synced CurrentPositionIndex={_state.CurrentPositionIndex} (pageIdx={pageIdx}, firstPosIdx={posIdx})");
+        int pageIdx = matchingPages[index];
 
         double targetPx;
         double viewH = PageScroller.ViewportHeight;
@@ -658,20 +324,18 @@ public partial class SearchTab : Page, IPdfRenderingService
             }
             targetPx = Math.Max(0, Math.Min(targetPx, PageScroller.ScrollableHeight));
             PageScroller.ScrollToVerticalOffset(targetPx);
-            UpdateMatchNav();
-            UpdatePositionNav();
             return;
         }
 
-        if (posIdx >= 0 && _state.PageViewModels is not null && index < _state.PageViewModels.Count)
+        var posIdx = Enumerable.Range(0, _viewerMediator.Positions.Count).FirstOrDefault(i => _viewerMediator.Positions[i].Page - 1 == pageIdx, -1);
+        if (posIdx >= 0 && _viewerMediator.PageViewModels is not null && index < _viewerMediator.PageViewModels.Count)
         {
-            var pos = _state.Positions[posIdx];
-            var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
-            int rotation = _renderer.GetPageRotation(pageIdx);
+            var pos = _viewerMediator.Positions[posIdx];
+            var (wPts, hPts) = _viewerMediator.Renderer.GetPageDimensions(pageIdx);
+            int rotation = _viewerMediator.Renderer.GetPageRotation(pageIdx);
             var mapper = new PdfCoordinateMapper(wPts, hPts, 0, 0);
             double normalizedY = mapper.ToNormalizedCenterY(PdfRect.FromLtrb(pos.XMin, pos.YMin, pos.XMax, pos.YMax), rotation);
 
-            // Try to use actual WPF layout via PointToScreen
             double wordContentY = 0;
             bool refined = false;
 
@@ -701,8 +365,8 @@ public partial class SearchTab : Page, IPdfRenderingService
                 wordContentY = AccumulatePageHeightBefore(index);
                 wordContentY += LayoutConstants.WordOffsetWithinItem(
                     availW,
-                    _state.PageViewModels[index].ImagePixelWidth,
-                    _state.PageViewModels[index].ImagePixelHeight,
+                    _viewerMediator.PageViewModels[index].ImagePixelWidth,
+                    _viewerMediator.PageViewModels[index].ImagePixelHeight,
                     normalizedY);
             }
 
@@ -716,45 +380,23 @@ public partial class SearchTab : Page, IPdfRenderingService
         targetPx = Math.Max(0, Math.Min(targetPx, PageScroller.ScrollableHeight));
         PageScroller.ScrollToVerticalOffset(targetPx);
         Log($"ScrollToMatch: targetPx={targetPx:F1}");
-        UpdateMatchNav();
-        UpdatePositionNav();
     }
 
     private double AccumulatePageHeightBefore(int matchIdx)
     {
-        if (_state.PageViewModels is null || matchIdx <= 0) return 0;
+        if (_viewerMediator.PageViewModels is null || matchIdx <= 0) return 0;
         double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
         double total = 0;
         for (int i = 0; i < matchIdx; i++)
         {
-            var vm = _state.PageViewModels[i];
+            var vm = _viewerMediator.PageViewModels[i];
             total += LayoutConstants.TotalItemHeight(
                 availW, vm.ImagePixelWidth, vm.ImagePixelHeight);
         }
         return total;
     }
 
-    private void UpdateMatchNav()
-    {
-        MatchInfo.Content = _state.TotalMatchPages > 0
-            ? $"Match page {_state.CurrentMatchIndex + 1} of {_state.TotalMatchPages}"
-            : "0 matches";
-        PrevMatch.IsEnabled = _state.CurrentMatchIndex > 0;
-        NextMatch.IsEnabled = _state.CurrentMatchIndex < _state.TotalMatchPages - 1;
-    }
-
     // ── Position (individual match) navigation ─────────────────────
-
-    private void UpdatePositionNav()
-    {
-        var count = _state.Positions.Count;
-        PositionInfo.Content = count > 0 && _state.CurrentPositionIndex >= 0
-            ? $"{_state.CurrentPositionIndex + 1} / {count}"
-            : "0 / 0";
-        PrevPosition.IsEnabled = count > 0 && _state.CurrentPositionIndex > 0;
-        NextPosition.IsEnabled = count > 0 && _state.CurrentPositionIndex < count - 1;
-        Log($"UpdatePositionNav: count={count}, idx={_state.CurrentPositionIndex}, prev={PrevPosition.IsEnabled}, next={NextPosition.IsEnabled}, label='{PositionInfo.Content}'");
-    }
 
     private async void OnPrevPosition(object sender, RoutedEventArgs e)
     {
@@ -763,10 +405,9 @@ public partial class SearchTab : Page, IPdfRenderingService
         {
             if (_isNavigating) { Log("OnPrevPosition: skipped (navigation in progress)"); return; }
             _isNavigating = true;
-            if (_state.Positions.Count == 0 || _state.CurrentPositionIndex <= 0) { Log($"OnPrevPosition: guard blocked (count={_state.Positions.Count}, idx={_state.CurrentPositionIndex})"); return; }
-            _state.CurrentPositionIndex--;
-            Log($"OnPrevPosition: decrementing to {_state.CurrentPositionIndex}");
-            await NavigateToPosition(_state.CurrentPositionIndex);
+            if (!_navigationMediator.GotoPrevPosition()) return;
+            Log($"OnPrevPosition: to index {_navigationMediator.CurrentPositionIndex}");
+            await ScrollToPosition(_navigationMediator.CurrentPositionIndex);
         }
         catch (Exception ex)
         {
@@ -783,17 +424,12 @@ public partial class SearchTab : Page, IPdfRenderingService
         if (_isLoading) return;
         try
         {
-            Log($"OnNextPosition: count={_state.Positions.Count}, idx={_state.CurrentPositionIndex}");
+            Log($"OnNextPosition: index={_navigationMediator.CurrentPositionIndex}");
             if (_isNavigating) { Log("OnNextPosition: skipped (navigation in progress)"); return; }
             _isNavigating = true;
-            if (_state.Positions.Count == 0 || _state.CurrentPositionIndex >= _state.Positions.Count - 1)
-            {
-                Log($"OnNextPosition: guard blocked");
-                return;
-            }
-            _state.CurrentPositionIndex++;
-            Log($"OnNextPosition: incrementing to {_state.CurrentPositionIndex}");
-            await NavigateToPosition(_state.CurrentPositionIndex);
+            if (!_navigationMediator.GotoNextPosition()) return;
+            Log($"OnNextPosition: to index {_navigationMediator.CurrentPositionIndex}");
+            await ScrollToPosition(_navigationMediator.CurrentPositionIndex);
         }
         catch (Exception ex)
         {
@@ -805,28 +441,28 @@ public partial class SearchTab : Page, IPdfRenderingService
         }
     }
 
-    private async Task NavigateToPosition(int posIdx)
+    private async Task ScrollToPosition(int posIdx)
     {
-        Log($"NavigateToPosition({posIdx}) — entering");
+        Log($"ScrollToPosition({posIdx}) — entering");
         if (_isLoading)
         {
-            Log("NavigateToPosition: skipped (loading in progress)");
+            Log("ScrollToPosition: skipped (loading in progress)");
             return;
         }
-        if (posIdx < 0 || posIdx >= _state.Positions.Count)
+        if (posIdx < 0 || posIdx >= _viewerMediator.Positions.Count)
         {
-            Log($"NavigateToPosition: invalid posIdx={posIdx} (count={_state.Positions.Count})");
+            Log($"ScrollToPosition: invalid posIdx={posIdx} (count={_viewerMediator.Positions.Count})");
             return;
         }
 
         if (PageScroller.ViewportWidth <= 12)
         {
-            Log($"NavigateToPosition: ViewportWidth={PageScroller.ViewportWidth} too small, deferring");
-            var capturedState = _state;
+            Log($"ScrollToPosition: ViewportWidth={PageScroller.ViewportWidth} too small, deferring");
+            var capturedPath = _viewerMediator.PdfPath;
             EventHandler? handler = null;
             handler = (_, _) =>
             {
-                if (!ReferenceEquals(_state, capturedState))
+                if (_viewerMediator.PdfPath != capturedPath)
                 {
                     PageScroller.LayoutUpdated -= handler;
                     return;
@@ -834,57 +470,42 @@ public partial class SearchTab : Page, IPdfRenderingService
                 if (PageScroller.ViewportWidth > 12)
                 {
                     PageScroller.LayoutUpdated -= handler;
-                    _ = NavigateToPosition(posIdx);
+                    _ = ScrollToPosition(posIdx);
                 }
             };
             PageScroller.LayoutUpdated += handler;
             return;
         }
 
-        var pos = _state.Positions[posIdx];
+        var pos = _viewerMediator.Positions[posIdx];
         var pageIdx = pos.Page - 1;
-        Log($"NavigateToPosition: page={pos.Page}, word='{pos.WordText}', YMin={pos.YMin:F2}, YMax={pos.YMax:F2}");
-
-        var matchIdx = _state.MatchingPages.IndexOf(pageIdx);
-        Log($"NavigateToPosition: matchIdx={matchIdx}, MatchingPages=[{string.Join(",", _state.MatchingPages)}], PageViewModels={(_state.PageViewModels is null ? "null" : _state.PageViewModels.Count.ToString())}");
-        if (matchIdx < 0 || _state.PageViewModels is null || matchIdx >= _state.PageViewModels.Count)
+        var matchIdx = _navigationMediator.FindMatchForPage(pageIdx);
+        if (matchIdx < 0)
         {
-            Log($"NavigateToPosition: matchIdx={matchIdx} out of range (pages={_state.PageViewModels?.Count}) — returning early");
+            Log($"ScrollToPosition: matchIdx={matchIdx} out of range — returning early");
             return;
         }
 
-        int prevMatchIdx = _state.CurrentMatchIndex;
-        string prevPageStr = prevMatchIdx >= 0 && prevMatchIdx < _state.MatchingPages.Count
-            ? (_state.MatchingPages[prevMatchIdx] + 1).ToString()
-            : "N/A";
-        Log($"NavigateToPosition: page transition {prevMatchIdx}→{matchIdx}, prevPage={prevPageStr}, newPage={pos.Page}");
-        _state.CurrentMatchIndex = matchIdx;
-
         // Get normalized Y position of the word within its page (0 = top, 1 = bottom)
-        var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
-        int rotation = _renderer.GetPageRotation(pageIdx);
+        var (wPts, hPts) = _viewerMediator.Renderer.GetPageDimensions(pageIdx);
+        int rotation = _viewerMediator.Renderer.GetPageRotation(pageIdx);
         var mapper = new PdfCoordinateMapper(wPts, hPts, 0, 0);
         double normalizedY = mapper.ToNormalizedCenterY(PdfRect.FromLtrb(pos.XMin, pos.YMin, pos.XMax, pos.YMax), rotation);
-        Log($"NavigateToPosition: pagePts={wPts:F1}x{hPts:F1} rotation={rotation} normalizedY={normalizedY:F4} centerStored=({pos.XMin + (pos.XMax - pos.XMin) / 2:F1},{pos.YMin + (pos.YMax - pos.YMin) / 2:F1})");
+        Log($"ScrollToPosition: pagePts={wPts:F1}x{hPts:F1} rotation={rotation} normalizedY={normalizedY:F4}");
 
         // Ensure target page is rendered
         double viewH = PageScroller.ViewportHeight;
-        var pagePositions = _state.PositionsByPage.TryGetValue(pageIdx, out var pp) ? pp : new List<WordPosition>();
-        var stateBefore = _state;
+        var pagePositions = _viewerMediator.PositionsByPage.TryGetValue(pageIdx, out var pp) ? pp : new List<WordPosition>();
+        var pathBefore = _viewerMediator.PdfPath;
         await ((IPdfRenderingService)this).GetOrRenderPageAsync(pageIdx, pagePositions);
-        if (!ReferenceEquals(_state, stateBefore)) return;
+        if (_viewerMediator.PdfPath != pathBefore) return;
 
-        // Flush dispatcher queue at Background priority to ensure:
-        //   Normal   — PageImage setter (from PdfPageView.OnLoaded continuation)
-        //   DataBind — binding engine pushes PageImage → Image.Source
-        //   Loaded   — layout settles after binding update
-        //   Input    — any pending input is processed
-        //   Render   — any pending render ops
+        // Flush dispatcher queue
         await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Background);
-        if (!ReferenceEquals(_state, stateBefore)) return;
-        Log($"NavigateToPosition: dispatcher flushed");
+        if (_viewerMediator.PdfPath != pathBefore) return;
+        Log($"ScrollToPosition: dispatcher flushed");
 
-        // Compute scroll target: use PointToScreen for reliable screen-space coords
+        // Compute scroll target
         double wordContentY = 0;
         bool refined = false;
 
@@ -895,56 +516,33 @@ public partial class SearchTab : Page, IPdfRenderingService
         {
             targetContainer.UpdateLayout();
             var imgControl = FindChild<Image>(targetContainer);
-            bool srcOk = imgControl is not null && imgControl.Source is not null;
-            bool hOk = imgControl is not null && imgControl.ActualHeight > 0;
-            Log($"NavigateToPosition: container found, img={imgControl is not null} srcOk={srcOk} hOk={hOk} actualH={imgControl?.ActualHeight:F1}");
             if (imgControl is not null && imgControl.Source is not null && imgControl.ActualHeight > 0)
             {
                 Rect pdfRealBounds = GetActualImageRect(imgControl);
-                Log($"NavigateToPosition: GetActualImageRect returned empty={pdfRealBounds == Rect.Empty} bounds=({pdfRealBounds.X:F1},{pdfRealBounds.Y:F1},{pdfRealBounds.Width:F1},{pdfRealBounds.Height:F1})");
                 if (pdfRealBounds != Rect.Empty)
                 {
                     double wordY = pdfRealBounds.Top + normalizedY * pdfRealBounds.Height;
                     Point relativeWord = imgControl.TransformToAncestor(PageScroller).Transform(new Point(0, wordY));
                     wordContentY = PageScroller.VerticalOffset + relativeWord.Y;
                     refined = true;
-                    Log($"NavigateToPosition: REFINED wordY={wordY:F1} relToScroller=({relativeWord.X:F0},{relativeWord.Y:F0}) vOff={PageScroller.VerticalOffset:F1} wordContentY={wordContentY:F1}");
                 }
             }
-            else
-            {
-                Log($"NavigateToPosition: Image not usable for refined path");
-            }
-        }
-        else
-        {
-            Log($"NavigateToPosition: container unavailable (matchIdx={matchIdx})");
         }
 
         if (!refined)
         {
             double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
             double accBefore = AccumulatePageHeightBefore(matchIdx);
-            var fallbackVm = _state.PageViewModels[matchIdx];
+            var fallbackVm = _viewerMediator.PageViewModels?[matchIdx];
+            if (fallbackVm is null) return;
             double offsetWithin = LayoutConstants.WordOffsetWithinItem(availW, fallbackVm.ImagePixelWidth, fallbackVm.ImagePixelHeight, normalizedY);
             wordContentY = accBefore + offsetWithin;
-            Log($"NavigateToPosition: FALLBACK availW={availW:F1} accBefore={accBefore:F1} vmSize={fallbackVm.ImagePixelWidth}x{fallbackVm.ImagePixelHeight} offsetWithin={offsetWithin:F1} wordContentY={wordContentY:F1}");
         }
 
         double target = wordContentY - viewH / 2;
         target = Math.Max(0, Math.Min(target, PageScroller.ScrollableHeight));
-        Log($"NavigateToPosition: viewH={viewH:F1} target={target:F1} scrollableH={PageScroller.ScrollableHeight:F1}");
-
         PageScroller.ScrollToVerticalOffset(target);
-        _ = Dispatcher.InvokeAsync(() =>
-        {
-            double afterOff = PageScroller.VerticalOffset;
-            double wordViewportY = wordContentY - afterOff;
-            Log($"NavigateToPosition: AFTER_SCROLL offset={afterOff:F1} wordViewportY={wordViewportY:F1} center={viewH / 2:F1} delta={Math.Abs(wordViewportY - viewH / 2):F1}");
-        }, System.Windows.Threading.DispatcherPriority.Loaded);
-
-        UpdateMatchNav();
-        UpdatePositionNav();
+        Log($"ScrollToPosition: targetPx={target:F1}");
     }
 
 
@@ -988,81 +586,64 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private void BuildOrDeferViewModels(CancellationToken ct)
     {
-        if (PageScroller.ViewportWidth > 0)
+        try
         {
-            BuildPageViewModels();
-            UpdatePositionNav();
-            FinishLoading();
-            _ = Dispatcher.InvokeAsync(async () =>
+            if (PageScroller.ViewportWidth > 0)
             {
-                Log("BuildOrDeferViewModels: deferred NavigateToPosition(0) at Loaded");
-                if (_state.Positions.Count > 0)
-                {
-                    _state.CurrentPositionIndex = 0;
-                    await NavigateToPosition(0);
-                }
-            }, DispatcherPriority.Loaded);
-            return;
-        }
-
-        Log("BuildOrDeferViewModels: viewport not yet laid out — deferring");
-        EventHandler? handler = null;
-        handler = (_, _) =>
-        {
-            if (ct.IsCancellationRequested)
-            {
-                PageScroller.LayoutUpdated -= handler;
-                return;
-            }
-
-            if (PageScroller.ViewportWidth > 35)
-            {
-                PageScroller.LayoutUpdated -= handler;
-                Log("BuildOrDeferViewModels: deferred build now");
-                BuildPageViewModels();
-                UpdatePositionNav();
+                _viewerMediator.BuildPageViewModels();
+                PageList.ItemsSource = _viewerMediator.PageViewModels;
+                _navigationMediator.GotoInitialPosition();
                 FinishLoading();
                 _ = Dispatcher.InvokeAsync(async () =>
                 {
-                    Log("BuildOrDeferViewModels: deferred NavigateToPosition(0) at Loaded (deferred path)");
-                    if (_state.Positions.Count > 0)
+                    try
                     {
-                        _state.CurrentPositionIndex = 0;
-                        await NavigateToPosition(0);
+                        Log("BuildOrDeferViewModels: deferred ScrollToPosition(0) at Loaded");
+                        if (_viewerMediator.Positions.Count > 0)
+                            await ScrollToPosition(0);
                     }
+                    catch (Exception ex) { Log($"BuildOrDeferViewModels scroll error: {ex.Message}"); }
                 }, DispatcherPriority.Loaded);
+                return;
             }
-        };
-        PageScroller.LayoutUpdated += handler;
-    }
 
-    private void BuildPageViewModels()
-    {
-        var list = new List<PdfPageViewModel>(_state.MatchingPages.Count);
-
-        for (int i = 0; i < _state.MatchingPages.Count; i++)
-        {
-            int pageIdx = _state.MatchingPages[i];
-            _state.PositionsByPage.TryGetValue(pageIdx, out var pos);
-
-            // Estimate pixel dimensions from PDF page size + render DPI.
-            // These match the actual bitmap produced by RenderPageInternalAsync.
-            var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
-            int pixW = (int)(wPts * _renderer.TargetDpi / 72.0);
-            int pixH = (int)(hPts * _renderer.TargetDpi / 72.0);
-
-            list.Add(new PdfPageViewModel
+            Log("BuildOrDeferViewModels: viewport not yet laid out — deferring");
+            EventHandler? handler = null;
+            handler = (_, _) =>
             {
-                PageIndex = pageIdx,
-                MatchIndex = i,
-                ImagePixelWidth = pixW,
-                ImagePixelHeight = pixH,
-                Positions = pos ?? new List<WordPosition>(),
-            });
-        }
+                if (ct.IsCancellationRequested)
+                {
+                    PageScroller.LayoutUpdated -= handler;
+                    return;
+                }
 
-        _state.PageViewModels = new ObservableCollection<PdfPageViewModel>(list);
-        PageList.ItemsSource = _state.PageViewModels;
+                if (PageScroller.ViewportWidth > 35)
+                {
+                    PageScroller.LayoutUpdated -= handler;
+                    Log("BuildOrDeferViewModels: deferred build now");
+                    try
+                    {
+                        _viewerMediator.BuildPageViewModels();
+                        PageList.ItemsSource = _viewerMediator.PageViewModels;
+                        _navigationMediator.GotoInitialPosition();
+                        FinishLoading();
+                        _ = Dispatcher.InvokeAsync(async () =>
+                        {
+                            try
+                            {
+                                Log("BuildOrDeferViewModels: deferred ScrollToPosition(0) at Loaded (deferred path)");
+                                if (_viewerMediator.Positions.Count > 0)
+                                    await ScrollToPosition(0);
+                            }
+                            catch (Exception ex) { Log($"BuildOrDeferViewModels deferred scroll error: {ex.Message}"); }
+                        }, DispatcherPriority.Loaded);
+                    }
+                    catch (Exception ex) { Log($"BuildOrDeferViewModels deferred build error: {ex.Message}"); }
+                }
+            };
+            PageScroller.LayoutUpdated += handler;
+        }
+        catch (Exception ex) { Log($"BuildOrDeferViewModels error: {ex.Message}"); }
     }
 
     private void FinishLoading()
@@ -1071,62 +652,14 @@ public partial class SearchTab : Page, IPdfRenderingService
         ResultsList.IsEnabled = true;
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────
-
-    private void AddToGlobalCache((string, int) key, PageRenderItem item)
-    {
-        lock (_globalCacheLock)
-        {
-            if (!_globalPageCache.ContainsKey(key))
-            {
-                _globalPageCacheOrder.Enqueue(key);
-                while (_globalPageCacheOrder.Count > MaxGlobalCacheEntries)
-                {
-                    var oldest = _globalPageCacheOrder.Dequeue();
-                    _globalPageCache.Remove(oldest);
-                }
-            }
-            _globalPageCache[key] = item;
-        }
-    }
-
     private void ClearViewer()
     {
-        // Cancel any in-flight renders and thumbnail preloads
-        _thumbCts?.Cancel();
-        _selectionCts?.Cancel();
-        _selectionCts = null;
+        _searchMediator.CancelThumbnails();
+        _viewerMediator.Clear();
+        _navigationMediator.Reset();
 
-        _pendingRenders.Clear();
         PageList.ItemsSource = null;
-        _state = new PdfViewState();
-        _state.CurrentPositionIndex = -1;
-
-        // Clear global cache too (fixes stale entries from previous documents)
-        lock (_globalCacheLock)
-        {
-            _globalPageCache.Clear();
-            _globalPageCacheOrder.Clear();
-        }
-
         PageScroller.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
-        MatchInfo.Content = "0 matches";
-        PrevMatch.IsEnabled = false;
-        NextMatch.IsEnabled = false;
-        PositionInfo.Content = "0 / 0";
-        PrevPosition.IsEnabled = false;
-        NextPosition.IsEnabled = false;
         WordsField.Text = "";
-
-        // Close the native PDF handle to avoid use-after-free when switching documents
-        try
-        {
-            _renderer.CloseDocument();
-            Log("ClearViewer: renderer document closed");
-        }
-        catch (Exception ex)
-        {
-            Log($"ClearViewer: error closing renderer document: {ex.Message}");
-        }
     }
 }

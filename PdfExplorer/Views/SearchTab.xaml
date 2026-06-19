@@ -131,8 +131,9 @@
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="200"/>
                 <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="200"/>
-                <ColumnDefinition Width="100"/>
+                <ColumnDefinition Width="170"/>
+                <ColumnDefinition Width="120"/>
+                <ColumnDefinition Width="80"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
@@ -145,10 +146,15 @@
             <Label Grid.Column="2" Content="Search:" VerticalAlignment="Center" Margin="10,0,0,0"/>
             <TextBox Grid.Column="3" x:Name="SearchBox" Height="28" IsEnabled="False"
                      KeyDown="OnSearchBoxKeyDown"/>
-            <Button Grid.Column="4" x:Name="SearchButton" Content="Search" Height="28" Margin="5,0,0,0"
+            <ComboBox Grid.Column="4" x:Name="SearchModeCombo" Height="28" SelectedIndex="0"
+                      SelectionChanged="OnSearchModeChanged">
+                <ComboBoxItem Content="Auto phrase"/>
+                <ComboBoxItem Content="Boolean phrase"/>
+            </ComboBox>
+            <Button Grid.Column="5" x:Name="SearchButton" Content="Search" Height="28" Margin="5,0,0,0"
                     Click="OnSearchClick" IsEnabled="False"/>
 
-            <StackPanel Grid.Column="5" Orientation="Horizontal" Margin="20,0,0,0">
+            <StackPanel Grid.Column="6" Orientation="Horizontal" Margin="10,0,0,0">
                 <Button x:Name="PrevPage" Content="◀◀" Width="30" Height="28"
                         Click="OnPrevPage" IsEnabled="False" ToolTip="Previous page of results"/>
                 <Label x:Name="PageInfo" Content="0 / 0" VerticalAlignment="Center" Margin="5,0"/>
@@ -162,7 +168,7 @@
                         Click="OnNextPosition" IsEnabled="False" ToolTip="Next match"/>
             </StackPanel>
 
-            <StatusBar Grid.Column="6" Margin="10,0,0,0">
+            <StatusBar Grid.Column="7" Margin="10,0,0,0">
                 <StatusBarItem x:Name="StatusItem">
                     <TextBlock x:Name="ResultCountLabel" Text="Ready"/>
                 </StatusBarItem>

@@ -64,21 +64,25 @@ public partial class App : Application
 
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
-        LogHelper.Log("App", $"DispatcherUnhandledException: {e.Exception}");
-        MessageBox.Show($"Unhandled UI error:\n{e.Exception.Message}", "PdfExplorer", MessageBoxButton.OK, MessageBoxImage.Error);
-        e.Handled = true; // prevent process termination
+        var ex = e.Exception;
+        var inner = ex.InnerException;
+        var msg = inner is not null
+            ? $"{ex.Message}\n\nInner: {inner.GetType().Name}: {inner.Message}\n{inner.StackTrace}"
+            : ex.ToString();
+        LogHelper.Log("App", $"DispatcherUnhandledException: {msg}");
+        MessageBox.Show($"Unhandled UI error:\n{msg}", "PdfExplorer", MessageBoxButton.OK, MessageBoxImage.Error);
+        e.Handled = true;
     }
 
     private void OnAppDomainUnhandledException(object sender, UnhandledExceptionEventArgs e)
     {
         var ex = e.ExceptionObject as Exception;
-        LogHelper.Log("App", $"AppDomainUnhandledException (terminating={e.IsTerminating}): {ex}");
-        // Cannot prevent termination if IsTerminating == true, but we logged it.
+        LogHelper.Log("App", $"AppDomainUnhandledException (terminating={e.IsTerminating}): {ex?.ToString()}");
     }
 
     private void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
     {
-        LogHelper.Log("App", $"UnobservedTaskException: {e.Exception}");
-        e.SetObserved(); // prevent process termination
+        LogHelper.Log("App", $"UnobservedTaskException: {e.Exception?.ToString()}");
+        e.SetObserved();
     }
 }

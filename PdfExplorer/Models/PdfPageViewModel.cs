@@ -4,7 +4,7 @@ using System.Windows.Media.Imaging;
 
 namespace PdfExplorer.Models;
 
-internal sealed class PdfPageViewModel : INotifyPropertyChanged
+public sealed class PdfPageViewModel : INotifyPropertyChanged
 {
     public int PageIndex { get; init; }
     public int MatchIndex { get; init; }

@@ -235,8 +235,8 @@ public sealed class SearchTabViewerTests
         var state = new PdfViewState();
         var pos = new List<WordPosition>
         {
-            new(1, 10, 20, 30, 40, "hello"),
-            new(1, 50, 60, 70, 80, "world"),
+            new(1, 10, 20, 30, 40, "hello", 0),
+            new(1, 50, 60, 70, 80, "world", 0),
         };
 
         state.Positions = pos;
@@ -253,9 +253,9 @@ public sealed class SearchTabViewerTests
     {
         var positions = new List<WordPosition>
         {
-            new(1, 0, 0, 10, 10, "a"),
-            new(3, 0, 0, 10, 10, "b"),
-            new(1, 10, 10, 20, 20, "c"),
+            new(1, 0, 0, 10, 10, "a", 0),
+            new(3, 0, 0, 10, 10, "b", 0),
+            new(1, 10, 10, 20, 20, "c", 0),
         };
 
         var matchingPages = positions
@@ -321,9 +321,9 @@ public sealed class SearchTabViewerTests
     {
         var positions = new List<WordPosition>
         {
-            new(1, 0, 0, 10, 10, "a"),
-            new(2, 0, 0, 10, 10, "b"),
-            new(1, 10, 10, 20, 20, "c"),
+            new(1, 0, 0, 10, 10, "a", 0),
+            new(2, 0, 0, 10, 10, "b", 0),
+            new(1, 10, 10, 20, 20, "c", 0),
         };
 
         var matchingPages = positions
@@ -361,9 +361,9 @@ public sealed class SearchTabViewerTests
     {
         var positions = new List<WordPosition>
         {
-            new(1, 0, 0, 10, 10, "a"),
-            new(1, 10, 10, 20, 20, "b"),
-            new(3, 0, 0, 10, 10, "c"),
+            new(1, 0, 0, 10, 10, "a", 0),
+            new(1, 10, 10, 20, 20, "b", 0),
+            new(3, 0, 0, 10, 10, "c", 0),
         };
 
         var byPage = positions
@@ -428,9 +428,9 @@ public sealed class SearchTabViewerTests
     {
         var positions = new List<WordPosition>
         {
-            new(1, 0, 0, 10, 10, "a"),
-            new(1, 10, 10, 20, 20, "b"),
-            new(2, 0, 0, 10, 10, "c"),
+            new(1, 0, 0, 10, 10, "a", 0),
+            new(1, 10, 10, 20, 20, "b", 0),
+            new(2, 0, 0, 10, 10, "c", 0),
         };
 
         Assert.True(positions.Count > 0);

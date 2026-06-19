@@ -124,7 +124,7 @@ public class PdfCoordinateMapperTests
             PdfPageWidth = 612,
             PdfPageHeight = 792,
         };
-        var positions = new List<WordPosition> { new(1, 10, 20, 50, 60, null) };
+        var positions = new List<WordPosition> { new(1, 10, 20, 50, 60, null, 0) };
         var expected = item.GetHighlightRects(positions);
 
         var pdfRect = PdfRect.FromLtrb(10, 20, 50, 60);

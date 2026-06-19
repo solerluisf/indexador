@@ -112,7 +112,7 @@ public class OverlayHelperTests
             PdfPageHeight = 500,
             Positions = new List<WordPosition>
             {
-                new(1, 10, 20, 50, 60, WordText: null),
+                new(1, 10, 20, 50, 60, WordText: null, WordOffset: 0),
             },
         };
 
@@ -142,7 +142,7 @@ public class OverlayHelperTests
             PdfPageHeight = 500,
             Positions = new List<WordPosition>
             {
-                new(1, 10, 20, 50, 60, WordText: null),
+                new(1, 10, 20, 50, 60, WordText: null, WordOffset: 0),
             },
         };
 
@@ -177,7 +177,7 @@ public class OverlayHelperTests
             PdfPageHeight = 500,
             Positions = new List<WordPosition>
             {
-                new(1, 10, 20, 10.5f, 20.5f, WordText: null),
+                new(1, 10, 20, 10.5f, 20.5f, WordText: null, WordOffset: 0),
             },
         };
 
@@ -201,7 +201,7 @@ public class OverlayHelperTests
             PdfPageHeight = 200,
             Positions = new List<WordPosition>
             {
-                new(1, 0, 0, 10, 10, WordText: null),
+                new(1, 0, 0, 10, 10, WordText: null, WordOffset: 0),
             },
         };
 

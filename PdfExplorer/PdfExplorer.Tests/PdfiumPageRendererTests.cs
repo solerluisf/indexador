@@ -87,7 +87,7 @@ public sealed class PdfiumPageRendererTests
         r.OpenDocument(GetPath("test_repeat.pdf"));
         var positions = new List<WordPosition>
         {
-            new(1, 100, 700, 160, 720, WordText: "pattern"),
+            new(1, 100, 700, 160, 720, WordText: "pattern", WordOffset: 0),
         };
         var item = r.RenderPage(0, positions);
         Assert.NotNull(item.PageImage);

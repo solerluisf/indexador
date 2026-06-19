@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pdf_extractor = { path = "../pdf_extractor" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tantivy = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
