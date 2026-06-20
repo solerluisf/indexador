@@ -89,7 +89,8 @@
                 </Border>
 
                 <!-- Page list with pixel-based scrolling (not virtualized) -->
-                <Grid Grid.Row="1">
+                <Grid Grid.Row="1" Focusable="True"
+                      PreviewKeyDown="OnViewerKeyDown">
                     <ScrollViewer x:Name="PageScroller" VerticalScrollBarVisibility="Auto"
                                   HorizontalScrollBarVisibility="Disabled"
                                   CanContentScroll="False">

@@ -23,6 +23,16 @@ public partial class SearchTab : Page, IPdfRenderingService
     private uint? _selectedCollId;
     private bool _isLoading;
     private bool _isNavigating;
+    private const double LineScrollPx = 24.0;
+    private const double ViewportScrollFactor = 0.9;
+
+    private static readonly Dictionary<Key, Func<double, double, double, double>> ScrollStrategies = new()
+    {
+        [Key.Down] = (offset, _, maxH) => Math.Min(offset + LineScrollPx, maxH),
+        [Key.Up] = (offset, _, _) => Math.Max(offset - LineScrollPx, 0),
+        [Key.PageDown] = (offset, viewH, maxH) => Math.Min(offset + viewH * ViewportScrollFactor, maxH),
+        [Key.PageUp] = (offset, viewH, _) => Math.Max(offset - viewH * ViewportScrollFactor, 0),
+    };
 
     private static void Log(string msg)
     {
@@ -85,6 +95,22 @@ public partial class SearchTab : Page, IPdfRenderingService
         if (e.Key == Key.Enter)
         {
             OnSearchClick(sender, e);
+        }
+    }
+
+    private void OnViewerKeyDown(object sender, KeyEventArgs e)
+    {
+        if (_isLoading || _viewerMediator.PageViewModels is null)
+            return;
+
+        if (ScrollStrategies.TryGetValue(e.Key, out var strategy))
+        {
+            double offset = PageScroller.VerticalOffset;
+            double viewH = PageScroller.ViewportHeight;
+            double maxH = PageScroller.ScrollableHeight;
+
+            PageScroller.ScrollToVerticalOffset(strategy(offset, viewH, maxH));
+            e.Handled = true;
         }
     }
 
