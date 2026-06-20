@@ -345,15 +345,12 @@ public sealed class SearchTabViewerTests
     }
 
     [Fact]
-    public void Empty_positions_fallback_to_page_0()
+    public void Empty_positions_results_in_no_matching_pages()
     {
         var matchingPages = new List<int>();
 
-        if (matchingPages.Count == 0)
-            matchingPages = new List<int> { 0 };
-
-        Assert.Single(matchingPages);
-        Assert.Equal(0, matchingPages[0]);
+        Assert.Empty(matchingPages);
+        // All pages are still shown via BuildPageViewModels using GetPageCount()
     }
 
     [Fact]

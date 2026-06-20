@@ -222,7 +222,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
             if (positions.Count == 0)
             {
-                Log("No positions found — showing first page without highlights");
+                Log("No positions found — showing all pages without highlights");
                 StatusLabel.Text += " — no highlights";
             }
 
@@ -311,7 +311,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         if (scrollToTop)
         {
             PageList.UpdateLayout();
-            var container = PageList.ItemContainerGenerator.ContainerFromIndex(index) as FrameworkElement;
+            var container = PageList.ItemContainerGenerator.ContainerFromIndex(pageIdx) as FrameworkElement;
             if (container is not null)
             {
                 container.UpdateLayout();
@@ -320,7 +320,7 @@ public partial class SearchTab : Page, IPdfRenderingService
             }
             else
             {
-                targetPx = AccumulatePageHeightBefore(index);
+                targetPx = AccumulatePageHeightBefore(pageIdx);
             }
             targetPx = Math.Max(0, Math.Min(targetPx, PageScroller.ScrollableHeight));
             PageScroller.ScrollToVerticalOffset(targetPx);
@@ -328,7 +328,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         }
 
         var posIdx = Enumerable.Range(0, _viewerMediator.Positions.Count).FirstOrDefault(i => _viewerMediator.Positions[i].Page - 1 == pageIdx, -1);
-        if (posIdx >= 0 && _viewerMediator.PageViewModels is not null && index < _viewerMediator.PageViewModels.Count)
+        if (posIdx >= 0 && _viewerMediator.PageViewModels is not null && pageIdx < _viewerMediator.PageViewModels.Count)
         {
             var pos = _viewerMediator.Positions[posIdx];
             var (wPts, hPts) = _viewerMediator.Renderer.GetPageDimensions(pageIdx);
@@ -341,7 +341,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
             PageList.UpdateLayout();
 
-            var container = PageList.ItemContainerGenerator.ContainerFromIndex(index) as FrameworkElement;
+            var container = PageList.ItemContainerGenerator.ContainerFromIndex(pageIdx) as FrameworkElement;
             if (container is not null)
             {
                 container.UpdateLayout();
@@ -362,11 +362,11 @@ public partial class SearchTab : Page, IPdfRenderingService
             if (!refined)
             {
                 double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
-                wordContentY = AccumulatePageHeightBefore(index);
+                wordContentY = AccumulatePageHeightBefore(pageIdx);
                 wordContentY += LayoutConstants.WordOffsetWithinItem(
                     availW,
-                    _viewerMediator.PageViewModels[index].ImagePixelWidth,
-                    _viewerMediator.PageViewModels[index].ImagePixelHeight,
+                    _viewerMediator.PageViewModels[pageIdx].ImagePixelWidth,
+                    _viewerMediator.PageViewModels[pageIdx].ImagePixelHeight,
                     normalizedY);
             }
 
@@ -374,7 +374,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         }
         else
         {
-            targetPx = AccumulatePageHeightBefore(index);
+            targetPx = AccumulatePageHeightBefore(pageIdx);
         }
 
         targetPx = Math.Max(0, Math.Min(targetPx, PageScroller.ScrollableHeight));
@@ -382,12 +382,12 @@ public partial class SearchTab : Page, IPdfRenderingService
         Log($"ScrollToMatch: targetPx={targetPx:F1}");
     }
 
-    private double AccumulatePageHeightBefore(int matchIdx)
+    private double AccumulatePageHeightBefore(int pageIdx)
     {
-        if (_viewerMediator.PageViewModels is null || matchIdx <= 0) return 0;
+        if (_viewerMediator.PageViewModels is null || pageIdx <= 0) return 0;
         double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
         double total = 0;
-        for (int i = 0; i < matchIdx; i++)
+        for (int i = 0; i < pageIdx; i++)
         {
             var vm = _viewerMediator.PageViewModels[i];
             total += LayoutConstants.TotalItemHeight(
@@ -511,7 +511,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         PageList.UpdateLayout();
 
-        var targetContainer = PageList.ItemContainerGenerator.ContainerFromIndex(matchIdx) as FrameworkElement;
+        var targetContainer = PageList.ItemContainerGenerator.ContainerFromIndex(pageIdx) as FrameworkElement;
         if (targetContainer is not null)
         {
             targetContainer.UpdateLayout();
@@ -532,8 +532,8 @@ public partial class SearchTab : Page, IPdfRenderingService
         if (!refined)
         {
             double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
-            double accBefore = AccumulatePageHeightBefore(matchIdx);
-            var fallbackVm = _viewerMediator.PageViewModels?[matchIdx];
+            double accBefore = AccumulatePageHeightBefore(pageIdx);
+            var fallbackVm = _viewerMediator.PageViewModels?[pageIdx];
             if (fallbackVm is null) return;
             double offsetWithin = LayoutConstants.WordOffsetWithinItem(availW, fallbackVm.ImagePixelWidth, fallbackVm.ImagePixelHeight, normalizedY);
             wordContentY = accBefore + offsetWithin;

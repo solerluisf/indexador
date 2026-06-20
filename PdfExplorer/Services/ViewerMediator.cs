@@ -87,9 +87,6 @@ public sealed class ViewerMediator : IViewerMediator
             .OrderBy(p => p)
             .ToList();
 
-        if (_matchingPages.Count == 0)
-            _matchingPages = new List<int> { 0 };
-
         _positionsByPage = _positions
             .GroupBy(p => p.Page - 1)
             .ToDictionary(g => g.Key, g => g.ToList());
@@ -125,11 +122,11 @@ public sealed class ViewerMediator : IViewerMediator
 
     public void BuildPageViewModels()
     {
-        var list = new List<PdfPageViewModel>(_matchingPages.Count);
+        int totalPages = _renderer.GetPageCount();
+        var list = new List<PdfPageViewModel>(totalPages);
 
-        for (int i = 0; i < _matchingPages.Count; i++)
+        for (int pageIdx = 0; pageIdx < totalPages; pageIdx++)
         {
-            int pageIdx = _matchingPages[i];
             _positionsByPage.TryGetValue(pageIdx, out var pos);
 
             var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
@@ -139,7 +136,7 @@ public sealed class ViewerMediator : IViewerMediator
             list.Add(new PdfPageViewModel
             {
                 PageIndex = pageIdx,
-                MatchIndex = i,
+                MatchIndex = pageIdx,
                 ImagePixelWidth = pixW,
                 ImagePixelHeight = pixH,
                 Positions = pos ?? new List<WordPosition>(),
