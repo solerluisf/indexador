@@ -10,7 +10,6 @@ public sealed class NavigationMediator : INavigationMediator
     private IReadOnlyList<int> _matchingPages = Array.Empty<int>();
     private List<int> _matchingPagesList = new();
     private List<int> _phraseStarts = new();
-    private bool _isPhraseSearch;
     private int _currentMatchIndex;
     private int _currentPositionIndex = -1;
     private int _totalMatchPages;
@@ -47,8 +46,10 @@ public sealed class NavigationMediator : INavigationMediator
         _matchingPages = matchingPages ?? Array.Empty<int>();
         _matchingPagesList = matchingPages is List<int> list ? list : matchingPages?.ToList() ?? new List<int>();
         _totalMatchPages = _matchingPages.Count;
-        _isPhraseSearch = !isBooleanMode && IsPhraseQuery(query);
-        _phraseStarts = _isPhraseSearch ? BuildPhraseStarts(_positions) : BuildPositionsAsPhrases(_positions);
+
+        bool hasQuotedPhrases = query != null && query.IndexOf('"') >= 0;
+        bool shouldGroupByPhrase = (!isBooleanMode && IsPhraseQuery(query)) || hasQuotedPhrases;
+        _phraseStarts = shouldGroupByPhrase ? BuildPhraseStarts(_positions) : BuildPositionsAsPhrases(_positions);
     }
 
     public bool GotoNextMatch()

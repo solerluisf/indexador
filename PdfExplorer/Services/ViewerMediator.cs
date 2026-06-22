@@ -65,7 +65,7 @@ public sealed class ViewerMediator : IViewerMediator
         var before = positions.Count;
         positions = positions
             .OrderBy(p => p.Page)
-            .ThenBy(p => p.YMax)
+            .ThenBy(p => p.WordOffset)
             .DistinctBy(p => (p.Page, p.XMin, p.YMin, p.XMax, p.YMax))
             .ToList();
         var dupes = before - positions.Count;

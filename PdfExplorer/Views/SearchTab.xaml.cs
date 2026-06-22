@@ -4,7 +4,6 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Shapes;
 using System.Windows.Threading;
 using PdfExplorer.Models;
 using PdfExplorer.Services;
@@ -31,7 +30,6 @@ public partial class SearchTab : Page, IPdfRenderingService
     {
         public required StackPanel Panel { get; init; }
         public required Image Image { get; init; }
-        public required Canvas HighlightOverlay { get; init; }
     }
 
     private readonly Dictionary<int, PageElement> _pageElements = new();
@@ -314,8 +312,6 @@ public partial class SearchTab : Page, IPdfRenderingService
             elem.Image.Width = displayW;
             Canvas.SetTop(elem.Panel, GetPageY(pageIdx));
 
-            elem.HighlightOverlay.Width = displayW;
-            elem.HighlightOverlay.Height = displayH;
         }
     }
 
@@ -396,21 +392,12 @@ public partial class SearchTab : Page, IPdfRenderingService
                 HorizontalAlignment = HorizontalAlignment.Center,
             };
 
-            var highlightOverlay = new Canvas
-            {
-                Width = displayW,
-                Height = displayH,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                IsHitTestVisible = false,
-            };
-
             var panel = new StackPanel
             {
                 Width = viewW,
             };
             panel.Children.Add(header);
             panel.Children.Add(image);
-            panel.Children.Add(highlightOverlay);
 
             Canvas.SetTop(panel, pageY);
             Canvas.SetLeft(panel, 0);
@@ -419,64 +406,10 @@ public partial class SearchTab : Page, IPdfRenderingService
             {
                 Panel = panel,
                 Image = image,
-                HighlightOverlay = highlightOverlay,
             };
             _pageElements[pageIdx] = elem;
             PageCanvas.Children.Add(panel);
-
-            UpdatePageHighlights(pageIdx);
         });
-    }
-
-    private void UpdatePageHighlights(int pageIdx)
-    {
-        if (!_pageElements.TryGetValue(pageIdx, out var elem))
-            return;
-
-        elem.HighlightOverlay.Children.Clear();
-
-        int currentPos = _navigationMediator.CurrentPositionIndex;
-        if (currentPos < 0 || currentPos >= _viewerMediator.Positions.Count)
-            return;
-
-        var pos = _viewerMediator.Positions[currentPos];
-        if (pos.Page - 1 != pageIdx)
-            return;
-
-        var (wPts, hPts) = _pageDimensions[pageIdx];
-        double renderH = GetRenderedHeight(pageIdx);
-        double viewW = PageScroller.ViewportWidth;
-        double dispW = Math.Min(wPts * _currentRenderDpi / 72.0, viewW);
-        double scaleX = dispW / (wPts * _currentRenderDpi / 72.0);
-        double scaleY = renderH > 0 ? (dispW / (wPts * _currentRenderDpi / 72.0)) : 1;
-
-        double overlayW = dispW;
-        double overlayH = renderH * scaleY;
-        elem.HighlightOverlay.Width = overlayW;
-        elem.HighlightOverlay.Height = overlayH;
-
-        int rotation = _viewerMediator.Renderer.GetPageRotation(pageIdx);
-        var mapper = new PdfCoordinateMapper(wPts, hPts, overlayW, overlayH);
-        var pdfRect = PdfRect.FromLtrb(pos.XMin, pos.YMin, pos.XMax, pos.YMax);
-        var renderRect = mapper.ToRenderRect(pdfRect);
-
-        var rect = new Rectangle
-        {
-            Fill = new SolidColorBrush(Color.FromArgb(20, 255, 255, 0)),
-            Stroke = Brushes.Gold,
-            StrokeThickness = 2,
-            Width = renderRect.Width,
-            Height = renderRect.Height,
-        };
-        Canvas.SetLeft(rect, renderRect.Left);
-        Canvas.SetTop(rect, renderRect.Top);
-        elem.HighlightOverlay.Children.Add(rect);
-    }
-
-    private void UpdateAllHighlights()
-    {
-        foreach (var pageIdx in _pageElements.Keys.ToList())
-            UpdatePageHighlights(pageIdx);
     }
 
     private void LayoutCanvas()
@@ -727,7 +660,6 @@ public partial class SearchTab : Page, IPdfRenderingService
         PrevPosition.IsEnabled = _navigationMediator.CanGoPrevPosition;
         NextPosition.IsEnabled = _navigationMediator.CanGoNextPosition;
 
-        Dispatcher.InvokeAsync(() => UpdateAllHighlights());
     }
 
     private void ScrollToMatch(int index, bool scrollToTop = false)
@@ -863,8 +795,6 @@ public partial class SearchTab : Page, IPdfRenderingService
         target = Math.Max(0, Math.Min(target, PageScroller.ScrollableHeight));
         PageScroller.ScrollToVerticalOffset(target);
         Log($"ScrollToPosition: targetPx={target:F1}");
-
-        UpdateAllHighlights();
     }
 
     // ── Build page data ─────────────────────────────────────────────
