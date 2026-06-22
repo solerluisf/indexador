@@ -34,6 +34,8 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private readonly Dictionary<int, PageElement> _pageElements = new();
     private (double WidthPts, double HeightPts)[] _pageDimensions = [];
+    private double[] _pageYOffsets = [];
+    private double _totalContentHeight;
     private int _totalPages;
     private double _renderDpi = 150;
     private double _currentRenderDpi = 150;
@@ -149,6 +151,7 @@ public partial class SearchTab : Page, IPdfRenderingService
     private void ComputeRenderDpi()
     {
         if (_totalPages == 0) return;
+        RecomputePageYOffsets();
 
         double viewW = PageScroller.ViewportWidth;
         double baseDpi = _viewerMediator.Renderer.TargetDpi;
@@ -209,10 +212,9 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private double GetPageY(int pageIdx)
     {
-        double y = 0;
-        for (int i = 0; i < pageIdx && i < _totalPages; i++)
-            y += GetPageDisplayHeight(i) + PageGap + PageHeaderHeight;
-        return y;
+        if (pageIdx < 0 || pageIdx >= _pageYOffsets.Length)
+            return 0;
+        return _pageYOffsets[pageIdx];
     }
 
     private double GetPageBottom(int pageIdx)
@@ -220,9 +222,21 @@ public partial class SearchTab : Page, IPdfRenderingService
         return GetPageY(pageIdx) + GetPageDisplayHeight(pageIdx) + PageGap + PageHeaderHeight;
     }
 
+    private void RecomputePageYOffsets()
+    {
+        _pageYOffsets = new double[_totalPages];
+        double y = 0;
+        for (int i = 0; i < _totalPages; i++)
+        {
+            _pageYOffsets[i] = y;
+            y += GetPageDisplayHeight(i) + PageGap + PageHeaderHeight;
+        }
+        _totalContentHeight = y;
+    }
+
     private double GetTotalContentHeight()
     {
-        return GetPageY(_totalPages);
+        return _totalContentHeight;
     }
 
     // ── Canvas page management ──────────────────────────────────────
@@ -300,6 +314,7 @@ public partial class SearchTab : Page, IPdfRenderingService
     {
         double viewW = PageScroller.ViewportWidth;
         if (viewW <= 0) return;
+        RecomputePageYOffsets();
 
         foreach (var (pageIdx, elem) in _pageElements.ToList())
         {
@@ -788,7 +803,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         Log($"ScrollToPosition: pagePts={wPts:F1}x{hPts:F1} rotation={rotation} normalizedY={normalizedY:F4}");
 
         double pageY = GetPageY(pageIdx);
-        double renderH = GetRenderedHeight(pageIdx);
+        double renderH = GetPageDisplayHeight(pageIdx);
         double wordOffset = normalizedY * renderH;
         double target = pageY + PageHeaderHeight + wordOffset - PageScroller.ViewportHeight / 2;
 
@@ -867,6 +882,8 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         RemoveAllPageElements();
         _pageDimensions = [];
+        _pageYOffsets = [];
+        _totalContentHeight = 0;
         _totalPages = 0;
         PageScroller.ScrollToVerticalOffset(0);
         WordsField.Text = "";
