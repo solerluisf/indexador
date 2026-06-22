@@ -280,6 +280,18 @@ pub unsafe extern "C" fn pdf_get_page_dimensions(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pdf_get_all_page_dimensions(
+    handle: i32,
+    out_json: *mut c_char,
+    out_len: *mut u32,
+) -> i32 {
+    ffi_try_with(
+        || with_engine(|eng| eng.get_all_page_dimensions(handle)),
+        |s| unsafe { write_to_buffer(s.as_bytes(), out_json, out_len) },
+    )
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pdf_get_page_rotation(
     handle: i32,
     page_index: i32,

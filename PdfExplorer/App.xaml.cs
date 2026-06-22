@@ -7,6 +7,16 @@ namespace PdfExplorer;
 public partial class App : Application
 {
     public static PdfEngine Engine { get; private set; } = null!;
+    public static int RenderDpi
+    {
+        get => Engine?.RenderDpi ?? 150;
+        set
+        {
+            if (Engine is not null) Engine.RenderDpi = value;
+            RenderDpiChanged?.Invoke();
+        }
+    }
+    public static event Action? RenderDpiChanged;
 
     protected override void OnStartup(StartupEventArgs e)
     {

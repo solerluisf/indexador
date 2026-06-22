@@ -1,13 +1,12 @@
 using System.Buffers;
 using System.Collections.Concurrent;
-using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using PdfExplorer.Models;
-using PdfExplorer.ViewModels;
 
 namespace PdfExplorer.Services;
 
@@ -27,7 +26,6 @@ public sealed class ViewerMediator : IViewerMediator
     private List<int> _matchingPages = new();
     private Dictionary<int, List<WordPosition>> _positionsByPage = new();
     private Dictionary<int, PageRenderItem> _pageCache = new();
-    private ObservableCollection<PdfPageViewModel>? _pageViewModels;
     private string _positionsDebugText = string.Empty;
 
     public event EventHandler<ViewerStateChangedEventArgs>? StateChanged;
@@ -40,7 +38,6 @@ public sealed class ViewerMediator : IViewerMediator
     public IReadOnlyList<WordPosition> Positions => _positions;
     public IReadOnlyList<int> MatchingPages => _matchingPages;
     public IReadOnlyDictionary<int, List<WordPosition>> PositionsByPage => _positionsByPage;
-    public ObservableCollection<PdfPageViewModel>? PageViewModels => _pageViewModels;
     public string PositionsDebugText => _positionsDebugText;
 
     // ── Document ──────────────────────────────────────────────────
@@ -122,28 +119,9 @@ public sealed class ViewerMediator : IViewerMediator
 
     public void BuildPageViewModels()
     {
+        var sw = Stopwatch.StartNew();
         int totalPages = _renderer.GetPageCount();
-        var list = new List<PdfPageViewModel>(totalPages);
-
-        for (int pageIdx = 0; pageIdx < totalPages; pageIdx++)
-        {
-            _positionsByPage.TryGetValue(pageIdx, out var pos);
-
-            var (wPts, hPts) = _renderer.GetPageDimensions(pageIdx);
-            int pixW = (int)(wPts * _renderer.TargetDpi / 72.0);
-            int pixH = (int)(hPts * _renderer.TargetDpi / 72.0);
-
-            list.Add(new PdfPageViewModel
-            {
-                PageIndex = pageIdx,
-                MatchIndex = pageIdx,
-                ImagePixelWidth = pixW,
-                ImagePixelHeight = pixH,
-                Positions = pos ?? new List<WordPosition>(),
-            });
-        }
-
-        _pageViewModels = new ObservableCollection<PdfPageViewModel>(list);
+        Log($"BuildPageViewModels: {sw.Elapsed.TotalMilliseconds:F0}ms for {totalPages} pages");
         ViewModelsBuilt?.Invoke(this, EventArgs.Empty);
     }
 
@@ -151,15 +129,16 @@ public sealed class ViewerMediator : IViewerMediator
 
     public Task<PageRenderItem> GetOrRenderPageAsync(int pageIdx, List<WordPosition> pagePositions, CancellationToken ct)
     {
-        ct = _selectionCts?.Token ?? CancellationToken.None;
-        try
+        if (ct == CancellationToken.None)
+            ct = _selectionCts?.Token ?? CancellationToken.None;
+
+        return _pendingRenders.GetOrAdd(pageIdx, idx =>
         {
-            return _pendingRenders.GetOrAdd(pageIdx, idx => RenderPageInternalAsync(idx, pagePositions, ct));
-        }
-        finally
-        {
-            _pendingRenders.TryRemove(pageIdx, out _);
-        }
+            var task = RenderPageInternalAsync(idx, pagePositions, ct);
+            task.ContinueWith(_ => _pendingRenders.TryRemove(idx, out _),
+                TaskContinuationOptions.ExecuteSynchronously);
+            return task;
+        });
     }
 
     private async Task<PageRenderItem> RenderPageInternalAsync(int pageIdx, List<WordPosition> pagePositions, CancellationToken ct)
@@ -181,6 +160,7 @@ public sealed class ViewerMediator : IViewerMediator
 
         ct.ThrowIfCancellationRequested();
 
+        var renderSw = Stopwatch.StartNew();
         Log($"Rendering page {pageIdx + 1}");
 
         try
@@ -224,6 +204,8 @@ public sealed class ViewerMediator : IViewerMediator
                         PdfPageHeight = hPts,
                         Positions = pagePositions,
                     };
+
+                    Log($"Render page {pageIdx + 1}: {renderSw.Elapsed.TotalMilliseconds:F0}ms");
 
                     lock (_renderCacheLock)
                     {
@@ -272,6 +254,11 @@ public sealed class ViewerMediator : IViewerMediator
         {
             _pageCache.Clear();
         }
+        lock (_globalCacheLock)
+        {
+            _globalPageCache.Clear();
+            _globalPageCacheOrder.Clear();
+        }
     }
 
     private void AddToGlobalCache((string, int) key, PageRenderItem item)
@@ -296,7 +283,8 @@ public sealed class ViewerMediator : IViewerMediator
     public void Clear()
     {
         _selectionCts?.Cancel();
-        _selectionCts = null;
+        _selectionCts?.Dispose();
+        _selectionCts = new CancellationTokenSource();
 
         _pendingRenders.Clear();
 
@@ -304,7 +292,6 @@ public sealed class ViewerMediator : IViewerMediator
         _positions = new List<WordPosition>();
         _matchingPages = new List<int>();
         _positionsByPage = new Dictionary<int, List<WordPosition>>();
-        _pageViewModels = null;
         _pageCache = new Dictionary<int, PageRenderItem>();
         _positionsDebugText = string.Empty;
 

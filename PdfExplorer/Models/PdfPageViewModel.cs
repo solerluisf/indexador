@@ -1,35 +1,10 @@
-using System.ComponentModel;
-using System.Runtime.CompilerServices;
-using System.Windows.Media.Imaging;
-
 namespace PdfExplorer.Models;
 
-public sealed class PdfPageViewModel : INotifyPropertyChanged
+public sealed class PdfPageViewModel
 {
     public int PageIndex { get; init; }
     public int MatchIndex { get; init; }
-    public int ImagePixelWidth { get; set; }
-    public int ImagePixelHeight { get; set; }
+    public double WidthPts { get; init; }
+    public double HeightPts { get; init; }
     public List<WordPosition> Positions { get; set; } = new();
-
-    public string PageHeader => $"Page {PageIndex + 1}";
-
-    private BitmapSource? _pageImage;
-    public BitmapSource? PageImage
-    {
-        get => _pageImage;
-        set { _pageImage = value; OnPropertyChanged(); }
-    }
-
-    private bool _isLoading;
-    public bool IsLoading
-    {
-        get => _isLoading;
-        set { _isLoading = value; OnPropertyChanged(); }
-    }
-
-    public event PropertyChangedEventHandler? PropertyChanged;
-
-    private void OnPropertyChanged([CallerMemberName] string? name = null) =>
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }

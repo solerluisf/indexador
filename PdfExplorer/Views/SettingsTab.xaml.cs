@@ -39,6 +39,12 @@ public partial class SettingsTab : Page
             BoostsPanel.Children.Add(row);
         }
 
+        var dpiValues = new[] { 72, 96, 150, 200, 300, 400, 600 };
+        int currentDpi = App.RenderDpi;
+        int dpiIdx = Array.IndexOf(dpiValues, currentDpi);
+        if (dpiIdx >= 0)
+            DpiSelector.SelectedIndex = dpiIdx;
+
         if (_wired) return;
         _wired = true;
         WireEvents();
@@ -77,6 +83,15 @@ public partial class SettingsTab : Page
             _ => "Light"
         };
         App.ApplyTheme(name);
+    }
+
+    private void OnDpiChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (DpiSelector.SelectedItem is ComboBoxItem item
+            && int.TryParse(item.Content?.ToString(), out int dpi) && dpi > 0)
+        {
+            App.RenderDpi = dpi;
+        }
     }
 
     private void ApplyDefaults()

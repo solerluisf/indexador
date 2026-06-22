@@ -36,10 +36,10 @@ public sealed class NavigationMediator : INavigationMediator
         }
     }
 
-    public bool CanGoNextMatch => _currentMatchIndex < _totalMatchPages - 1;
-    public bool CanGoPrevMatch => _currentMatchIndex > 0;
-    public bool CanGoNextPosition => _phraseStarts.Count > 0 && CurrentPhraseIndex < _phraseStarts.Count - 1;
-    public bool CanGoPrevPosition => _phraseStarts.Count > 0 && CurrentPhraseIndex > 0;
+    public bool CanGoNextMatch => _totalMatchPages > 0 && (_currentMatchIndex < _totalMatchPages - 1 || _totalMatchPages == 1);
+    public bool CanGoPrevMatch => _totalMatchPages > 0 && (_currentMatchIndex > 0 || _totalMatchPages == 1);
+    public bool CanGoNextPosition => _phraseStarts.Count > 0 && (CurrentPhraseIndex < _phraseStarts.Count - 1 || _phraseStarts.Count == 1);
+    public bool CanGoPrevPosition => _phraseStarts.Count > 0 && (CurrentPhraseIndex > 0 || _phraseStarts.Count == 1);
 
     public void SetContext(IReadOnlyList<WordPosition> positions, IReadOnlyList<int> matchingPages, string? query = null, bool isBooleanMode = false)
     {
@@ -53,6 +53,15 @@ public sealed class NavigationMediator : INavigationMediator
 
     public bool GotoNextMatch()
     {
+        if (_totalMatchPages == 0)
+            return false;
+        if (_totalMatchPages == 1)
+        {
+            _currentMatchIndex = 0;
+            SyncPositionFromMatch();
+            FireStateChanged();
+            return true;
+        }
         if (_currentMatchIndex >= _totalMatchPages - 1)
             return false;
         _currentMatchIndex++;
@@ -63,6 +72,15 @@ public sealed class NavigationMediator : INavigationMediator
 
     public bool GotoPrevMatch()
     {
+        if (_totalMatchPages == 0)
+            return false;
+        if (_totalMatchPages == 1)
+        {
+            _currentMatchIndex = 0;
+            SyncPositionFromMatch();
+            FireStateChanged();
+            return true;
+        }
         if (_currentMatchIndex <= 0)
             return false;
         _currentMatchIndex--;
@@ -73,8 +91,17 @@ public sealed class NavigationMediator : INavigationMediator
 
     public bool GotoNextPosition()
     {
+        if (_phraseStarts.Count == 0)
+            return false;
+        if (_phraseStarts.Count == 1)
+        {
+            _currentPositionIndex = _phraseStarts[0];
+            SyncMatchFromPosition();
+            FireStateChanged();
+            return true;
+        }
         int phraseIdx = CurrentPhraseIndex;
-        if (_phraseStarts.Count == 0 || phraseIdx >= _phraseStarts.Count - 1)
+        if (phraseIdx >= _phraseStarts.Count - 1)
             return false;
         _currentPositionIndex = _phraseStarts[phraseIdx + 1];
         SyncMatchFromPosition();
@@ -84,8 +111,17 @@ public sealed class NavigationMediator : INavigationMediator
 
     public bool GotoPrevPosition()
     {
+        if (_phraseStarts.Count == 0)
+            return false;
+        if (_phraseStarts.Count == 1)
+        {
+            _currentPositionIndex = _phraseStarts[0];
+            SyncMatchFromPosition();
+            FireStateChanged();
+            return true;
+        }
         int phraseIdx = CurrentPhraseIndex;
-        if (_phraseStarts.Count == 0 || phraseIdx <= 0)
+        if (phraseIdx <= 0)
             return false;
         _currentPositionIndex = _phraseStarts[phraseIdx - 1];
         SyncMatchFromPosition();

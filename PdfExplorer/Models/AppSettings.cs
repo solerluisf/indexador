@@ -22,4 +22,5 @@ public class AppSettings
     public string? PathFilter { get; set; }
     public string? BooleanQuery { get; set; }
     public string? ThemeName { get; set; } = "Light";
+    public int RenderDpi { get; set; } = 150;
 }

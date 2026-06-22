@@ -16,6 +16,17 @@
                         <ComboBoxItem Content="Dark" />
                         <ComboBoxItem Content="Light Blue" />
                     </ComboBox>
+                    <Label Content="Render DPI" />
+                    <ComboBox x:Name="DpiSelector" Width="100" HorizontalAlignment="Left"
+                              SelectionChanged="OnDpiChanged">
+                        <ComboBoxItem Content="72" />
+                        <ComboBoxItem Content="96" />
+                        <ComboBoxItem Content="150" />
+                        <ComboBoxItem Content="200" />
+                        <ComboBoxItem Content="300" />
+                        <ComboBoxItem Content="400" />
+                        <ComboBoxItem Content="600" />
+                    </ComboBox>
                 </StackPanel>
             </Expander>
 

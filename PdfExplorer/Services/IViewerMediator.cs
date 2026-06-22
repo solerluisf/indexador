@@ -1,8 +1,5 @@
-using System.Collections.ObjectModel;
 using System.Threading;
-using System.Windows.Media;
 using PdfExplorer.Models;
-using PdfExplorer.ViewModels;
 
 namespace PdfExplorer.Services;
 
@@ -25,7 +22,6 @@ public interface IViewerMediator
     IReadOnlyList<WordPosition> Positions { get; }
     IReadOnlyList<int> MatchingPages { get; }
     IReadOnlyDictionary<int, List<WordPosition>> PositionsByPage { get; }
-    ObservableCollection<PdfPageViewModel>? PageViewModels { get; }
     string PositionsDebugText { get; }
 
     void OpenDocument(byte[] pdfBytes, string path);

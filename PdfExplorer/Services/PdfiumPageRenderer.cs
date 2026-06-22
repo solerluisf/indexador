@@ -17,12 +17,21 @@ public sealed class PdfiumPageRenderer : IDisposable
     private readonly object _lock = new();
     private int _docHandle = -1;
     private int _pageCount;
-    private readonly double _targetDpi;
+    private double _targetDpi;
     private GCHandle? _pinnedPdfData;
     private readonly ConcurrentDictionary<int, byte[]> _highlightJsonCache = new();
     private readonly ConcurrentDictionary<int, (double w, double h)> _pageDimsCache = new();
 
-    public double TargetDpi => _targetDpi;
+    public double TargetDpi
+    {
+        get => _targetDpi;
+        set
+        {
+            _targetDpi = value;
+            _pageDimsCache.Clear();
+            _highlightJsonCache.Clear();
+        }
+    }
 
     // ── C API imports ─────────────────────────────────────────────
 
@@ -62,6 +71,10 @@ public sealed class PdfiumPageRenderer : IDisposable
     private static extern int pdf_get_page_dimensions(
         int handle, int pageIndex,
         out double outWidthPts, out double outHeightPts);
+
+    [DllImport("pdf_extractor_capi.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_get_all_page_dimensions(
+        int handle, byte[] outJson, ref uint outLen);
 
     [DllImport("pdf_extractor_capi.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_render_page_to_buffer(
@@ -167,6 +180,61 @@ public sealed class PdfiumPageRenderer : IDisposable
                 return (w, h);
             }
         }
+    }
+
+    public (double WidthPts, double HeightPts)[] GetAllPageDimensions()
+    {
+        const int initialSize = 65536;
+        const int maxBufSize = 4 * 1024 * 1024;
+        const int maxRetries = 10;
+
+        var buf = new byte[initialSize];
+        uint len = (uint)buf.Length;
+        int rc;
+
+        lock (_lock)
+        {
+            if (_docHandle < 0)
+                throw new InvalidOperationException("No document open. Call OpenDocument first.");
+
+            lock (GlobalPdfiumLock)
+            {
+                rc = pdf_get_all_page_dimensions(_docHandle, buf, ref len);
+            }
+        }
+
+        int retries = 0;
+        while (rc == -4 && retries < maxRetries)
+        {
+            retries++;
+            if (len > maxBufSize)
+                throw new InvalidOperationException($"Batch dimensions require {len} bytes (exceeds {maxBufSize})");
+            buf = new byte[len];
+            lock (_lock)
+            {
+                lock (GlobalPdfiumLock)
+                {
+                    rc = pdf_get_all_page_dimensions(_docHandle, buf, ref len);
+                }
+            }
+        }
+
+        if (rc == -4)
+            throw new InvalidOperationException($"Batch dimensions buffer still insufficient after {maxRetries} retries");
+        if (rc < 0)
+            throw new InvalidOperationException($"Failed to get all page dimensions (rc={rc})");
+
+        var json = System.Text.Encoding.UTF8.GetString(buf, 0, (int)len);
+        var dims = JsonSerializer.Deserialize<double[][]>(json)
+            ?? throw new InvalidOperationException("Failed to deserialize page dimensions");
+
+        var result = new (double w, double h)[dims.Length];
+        for (int i = 0; i < dims.Length; i++)
+        {
+            result[i] = (dims[i][0], dims[i][1]);
+            _pageDimsCache[i] = (dims[i][0], dims[i][1]);
+        }
+        return result;
     }
 
     public int GetPageRotation(int pageIndex)

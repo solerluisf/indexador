@@ -15,6 +15,7 @@ use pdf_extractor::search::builders::{AutoPhraseQueryBuilder, BooleanPhraseQuery
 use pdf_extractor::search::engines::TantivyEngine;
 use pdf_extractor::search::pipeline::{SearchPipeline, default_enrichers};
 use pdf_extractor::search::types::*;
+use pdf_extractor::positions::StoredPosition;
 use pdf_extractor::search::SearchResponse;
 
 // ---------------------------------------------------------------------------
@@ -272,6 +273,7 @@ pub struct PdfEngine {
     cancel_tokens: HashMap<u32, Arc<AtomicBool>>,
     documents: DocumentManager,
     bitmaps: BitmapManager,
+    positions_cache: Mutex<HashMap<(i64, String), Vec<StoredPosition>>>,
 }
 
 impl PdfEngine {
@@ -288,6 +290,7 @@ impl PdfEngine {
             cancel_tokens: HashMap::new(),
             documents: DocumentManager::new(),
             bitmaps: BitmapManager::new(),
+            positions_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -855,8 +858,46 @@ impl PdfEngine {
         }
         let w = unsafe { (pdfium.FPDF_GetPageWidthF)(page) } as f64;
         let h = unsafe { (pdfium.FPDF_GetPageHeightF)(page) } as f64;
+        let rotation = pdfium.FPDF_GetPageRotation.map_or(0, |f| unsafe { f(page) });
         unsafe { (pdfium.FPDF_ClosePage)(page); }
-        Ok((w, h))
+        if rotation == 1 || rotation == 3 {
+            Ok((h, w))
+        } else {
+            Ok((w, h))
+        }
+    }
+
+    pub fn get_all_page_dimensions(&self, handle: i32) -> Result<String, i32> {
+        let pdfium = self.pdfium()?;
+        let doc_ptr = self.documents.get_doc_ptr(handle).ok_or_else(|| {
+            set_error("Invalid document handle".into());
+            ERR_INVALID_PARAM
+        })?;
+        let doc = doc_ptr as *mut std::ffi::c_void;
+        let total_pages = unsafe { (pdfium.FPDF_GetPageCount)(doc) };
+
+        let mut dims: Vec<[f64; 2]> = Vec::with_capacity(total_pages as usize);
+        for i in 0..total_pages {
+            let page = unsafe { (pdfium.FPDF_LoadPage)(doc, i) };
+            if page.is_null() {
+                set_error(format!("Failed to load page {}", i));
+                return Err(ERR_GENERAL);
+            }
+            let w = unsafe { (pdfium.FPDF_GetPageWidthF)(page) } as f64;
+            let h = unsafe { (pdfium.FPDF_GetPageHeightF)(page) } as f64;
+            let rotation = pdfium.FPDF_GetPageRotation.map_or(0, |f| unsafe { f(page) });
+            unsafe { (pdfium.FPDF_ClosePage)(page); }
+            if rotation == 1 || rotation == 3 {
+                dims.push([h, w]);
+            } else {
+                dims.push([w, h]);
+            }
+        }
+
+        serde_json::to_string(&dims).map_err(|e| {
+            set_error(format!("Failed to serialize dimensions: {}", e));
+            ERR_GENERAL
+        })
     }
 
     pub fn get_page_rotation(&self, handle: i32, page_index: i32) -> Result<i32, i32> {
@@ -1047,9 +1088,21 @@ impl PdfEngine {
         let is_phrase = !self.config.boolean_mode && is_search_phrase(&stripped);
         let words: Vec<&str> = stripped.split_whitespace().collect();
 
+        // Load (or retrieve from cache) the full position list for this document.
+        let all = {
+            let cache_key = (doc_id, index_path.to_string_lossy().to_string());
+            let mut cache = self.positions_cache.lock().unwrap();
+            if let Some(cached) = cache.get(&cache_key) {
+                cached.clone()
+            } else {
+                let loaded = position_store.load_all_for_doc(doc_id).unwrap_or_default();
+                cache.insert(cache_key, loaded.clone());
+                loaded
+            }
+        };
+
         let all_positions: Vec<pdf_extractor::positions::StoredPosition> = if is_phrase {
             // Phrase query: return only positions forming the exact consecutive phrase
-            let all = position_store.load_all_for_doc(doc_id).unwrap_or_default();
             let by_offset: std::collections::HashMap<usize, &pdf_extractor::positions::StoredPosition> =
                 all.iter().map(|p| (p.word_offset, p)).collect();
 
@@ -1091,14 +1144,12 @@ impl PdfEngine {
             let (quoted_phrases, standalone_terms) = parse_phrases_and_terms(term);
 
             if quoted_phrases.is_empty() {
-                // Simple case: only standalone terms — use the efficient path
-                let all = position_store.load_all_for_doc(doc_id).unwrap_or_default();
+                // Simple case: only standalone terms
                 all.into_iter()
                     .filter(|p| standalone_terms.iter().any(|t| p.word_text.to_lowercase() == *t))
                     .collect()
             } else {
                 // Mixed: quoted phrases + standalone terms
-                let all = position_store.load_all_for_doc(doc_id).unwrap_or_default();
                 let mut matched_offsets = HashSet::new();
 
                 for phrase in &quoted_phrases {
@@ -1117,12 +1168,15 @@ impl PdfEngine {
                     .collect()
             }
         } else {
+            // Single-word query: filter in-memory from cached data
             let mut seen = std::collections::HashSet::new();
             let mut positions = Vec::new();
             let word = words.first().copied().unwrap_or("");
             if !word.is_empty() {
-                if let Ok(found) = position_store.get_positions_by_term(doc_id, word) {
-                    for pos in &found {
+                let term_lower = word.to_lowercase();
+                for pos in &all {
+                    let lower = pos.word_text.to_lowercase();
+                    if lower == term_lower || lower.split(' ').any(|seg| seg == term_lower) {
                         let key = (pos.page, (pos.x_min * 100.0) as i32, (pos.y_min * 100.0) as i32);
                         if seen.insert(key) {
                             positions.push(pos.clone());
@@ -1388,6 +1442,7 @@ impl PdfEngine {
 
         let w_pts = unsafe { (pdfium.FPDF_GetPageWidthF)(page) };
         let h_pts = unsafe { (pdfium.FPDF_GetPageHeightF)(page) };
+        let rotation = pdfium.FPDF_GetPageRotation.map_or(0, |f| unsafe { f(page) });
 
         if width <= 0 || height <= 0 || stride <= 0 {
             unsafe { (pdfium.FPDF_ClosePage)(page); }
@@ -1425,8 +1480,13 @@ impl PdfEngine {
         }
 
         unsafe {
-            *out_width_pts = w_pts as f64;
-            *out_height_pts = h_pts as f64;
+            let (out_w, out_h) = if rotation == 1 || rotation == 3 {
+                (h_pts as f64, w_pts as f64)
+            } else {
+                (w_pts as f64, h_pts as f64)
+            };
+            *out_width_pts = out_w;
+            *out_height_pts = out_h;
         }
         Ok(0)
     }

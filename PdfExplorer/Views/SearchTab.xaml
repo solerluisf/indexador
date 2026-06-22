@@ -88,25 +88,14 @@
                     </StackPanel>
                 </Border>
 
-                <!-- Page list with pixel-based scrolling (not virtualized) -->
+                <!-- Canvas-based virtualized PDF viewer -->
                 <Grid Grid.Row="1" Focusable="True"
                       PreviewKeyDown="OnViewerKeyDown">
                     <ScrollViewer x:Name="PageScroller" VerticalScrollBarVisibility="Auto"
                                   HorizontalScrollBarVisibility="Disabled"
-                                  CanContentScroll="False">
-                        <ItemsControl x:Name="PageList"
-                                      VirtualizingStackPanel.IsVirtualizing="False">
-                            <ItemsControl.ItemsPanel>
-                                <ItemsPanelTemplate>
-                                    <VirtualizingStackPanel />
-                                </ItemsPanelTemplate>
-                            </ItemsControl.ItemsPanel>
-                            <ItemsControl.ItemTemplate>
-                                <DataTemplate>
-                                    <local:PdfPageView />
-                                </DataTemplate>
-                            </ItemsControl.ItemTemplate>
-                        </ItemsControl>
+                                  CanContentScroll="False"
+                                  ScrollChanged="OnPageScrollerScroll">
+                        <Canvas x:Name="PageCanvas" HorizontalAlignment="Stretch" />
                     </ScrollViewer>
                 </Grid>
 
@@ -136,6 +125,9 @@
                 <ColumnDefinition Width="120"/>
                 <ColumnDefinition Width="80"/>
                 <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="80"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
@@ -169,7 +161,20 @@
                         Click="OnNextPosition" IsEnabled="False" ToolTip="Next match"/>
             </StackPanel>
 
-            <StatusBar Grid.Column="7" Margin="10,0,0,0">
+            <Separator Grid.Column="7" Width="1" Height="20" Margin="4,0" Background="LightGray"/>
+            <Label Grid.Column="8" Content="Zoom:" VerticalAlignment="Center" Margin="4,0,0,0"/>
+            <ComboBox Grid.Column="9" x:Name="ZoomCombo" Width="75" Height="28"
+                      SelectedIndex="3" SelectionChanged="OnZoomChanged">
+                <ComboBoxItem Content="50%"/>
+                <ComboBoxItem Content="75%"/>
+                <ComboBoxItem Content="100%"/>
+                <ComboBoxItem Content="Fit Width"/>
+                <ComboBoxItem Content="Fit Page"/>
+                <ComboBoxItem Content="150%"/>
+                <ComboBoxItem Content="200%"/>
+            </ComboBox>
+
+            <StatusBar Grid.Column="10" Margin="10,0,0,0">
                 <StatusBarItem x:Name="StatusItem">
                     <TextBlock x:Name="ResultCountLabel" Text="Ready"/>
                 </StatusBarItem>

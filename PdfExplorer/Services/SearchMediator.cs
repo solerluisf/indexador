@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using PdfExplorer.ViewModels;
@@ -98,10 +99,16 @@ public sealed class SearchMediator : ISearchMediator, IDisposable
 
         try
         {
+            var sw = Stopwatch.StartNew();
             var results = await Task.Run(() => _engine.Search(query, limit: 1000, offset: _currentPage * 1000, collId: collId));
             _totalHits = results.Total;
+            sw.Stop();
+            Log($"Search query: {sw.Elapsed.TotalMilliseconds:F0}ms, hits={results.Total}");
 
+            sw.Restart();
             var viewModels = results.Results.Select(r => new SearchResultViewModel(r)).ToList();
+            sw.Stop();
+            Log($"ViewModel creation: {sw.Elapsed.TotalMilliseconds:F0}ms, count={viewModels.Count}");
 
             CancelThumbnails();
             _thumbCts = new CancellationTokenSource();
@@ -206,6 +213,12 @@ public sealed class SearchMediator : ISearchMediator, IDisposable
             catch (OperationCanceledException) { }
             catch (Exception) { }
         }));
+    }
+
+    private static void Log(string msg)
+    {
+        Console.Error.WriteLine($"[SearchMediator] {msg}");
+        LogHelper.Log("SearchMediator", msg);
     }
 
     public void Dispose()

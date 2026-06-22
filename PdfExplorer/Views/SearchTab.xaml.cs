@@ -1,16 +1,15 @@
-using System.Buffers;
-using System.Collections.Concurrent;
-using System.Collections.ObjectModel;
-using System.Runtime.InteropServices;
+using System.Diagnostics;
+using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Media.Imaging;
+using System.Windows.Shapes;
 using System.Windows.Threading;
 using PdfExplorer.Models;
 using PdfExplorer.Services;
 using PdfExplorer.ViewModels;
+
 
 namespace PdfExplorer.Views;
 
@@ -25,6 +24,24 @@ public partial class SearchTab : Page, IPdfRenderingService
     private bool _isNavigating;
     private const double LineScrollPx = 24.0;
     private const double ViewportScrollFactor = 0.9;
+    private const double PageGap = 8.0;
+    private const double PageHeaderHeight = 20.0;
+
+    private sealed class PageElement
+    {
+        public required StackPanel Panel { get; init; }
+        public required Image Image { get; init; }
+        public required Canvas HighlightOverlay { get; init; }
+    }
+
+    private readonly Dictionary<int, PageElement> _pageElements = new();
+    private (double WidthPts, double HeightPts)[] _pageDimensions = [];
+    private int _totalPages;
+    private double _renderDpi = 150;
+    private double _currentRenderDpi = 150;
+    private int _zoomMode = 3;
+
+    private static readonly double[] ZoomMultipliers = [0.5, 0.75, 1.0, -1, -2, 1.5, 2.0];
 
     private static readonly Dictionary<Key, Func<double, double, double, double>> ScrollStrategies = new()
     {
@@ -47,13 +64,14 @@ public partial class SearchTab : Page, IPdfRenderingService
         _engine = App.Engine;
         _viewerMediator = new ViewerMediator();
         _viewerMediator.StateChanged += OnViewerStateChanged;
-        _viewerMediator.ViewModelsBuilt += OnViewModelsBuilt;
+        _viewerMediator.ViewModelsBuilt += OnPageDataReady;
         _searchMediator = new SearchMediator(_engine, new ThumbnailService());
         _searchMediator.SearchCompleted += OnSearchCompleted;
         _searchMediator.SearchFailed += OnSearchFailed;
         _navigationMediator = new NavigationMediator();
         _navigationMediator.StateChanged += OnNavStateChanged;
         Loaded += OnLoaded;
+        InitRenderDpi();
         Log("Constructor end, engine=" + (_engine is not null ? "ok" : "null"));
     }
 
@@ -88,6 +106,384 @@ public partial class SearchTab : Page, IPdfRenderingService
         _engine.SearchBooleanMode = isBoolean;
     }
 
+    // ── Zoom ────────────────────────────────────────────────────────
+
+    private void OnZoomChanged(object sender, SelectionChangedEventArgs e)
+    {
+        _zoomMode = ZoomCombo.SelectedIndex;
+        UpdateDpiAndRefresh();
+    }
+
+    private void InitRenderDpi()
+    {
+        _renderDpi = App.RenderDpi;
+        _viewerMediator.Renderer.TargetDpi = _renderDpi;
+        App.RenderDpiChanged += OnRenderDpiChanged;
+    }
+
+    private void OnRenderDpiChanged()
+    {
+        int newDpi = App.RenderDpi;
+        if (newDpi == _renderDpi || _totalPages == 0) return;
+        _renderDpi = newDpi;
+        _viewerMediator.Renderer.TargetDpi = _renderDpi;
+        Log($"DPI changed to {_renderDpi}");
+
+        RemoveAllPageElements();
+        _viewerMediator.InvalidateAllPages();
+        ComputeRenderDpi();
+        LayoutCanvas();
+        UpdateVisiblePages();
+    }
+
+    private void UpdateDpiAndRefresh()
+    {
+        if (_totalPages == 0) return;
+
+        ComputeRenderDpi();
+
+        Log($"UpdateDpiAndRefresh: dpi={_currentRenderDpi:F0}, viewW={PageScroller.ViewportWidth:F0}");
+
+        RelayoutPageContainers();
+        LayoutCanvas();
+    }
+
+    private void ComputeRenderDpi()
+    {
+        if (_totalPages == 0) return;
+
+        double viewW = PageScroller.ViewportWidth;
+        double baseDpi = _viewerMediator.Renderer.TargetDpi;
+        double mult = _zoomMode >= 0 && _zoomMode < ZoomMultipliers.Length
+            ? ZoomMultipliers[_zoomMode]
+            : -1;
+
+        if (mult >= 0)
+        {
+            _currentRenderDpi = baseDpi * mult;
+            return;
+        }
+
+        if (_zoomMode == 3)
+        {
+            double maxW = _pageDimensions.Max(d => d.WidthPts);
+            if (maxW > 0 && viewW > 0)
+                _currentRenderDpi = 72.0 * viewW / maxW;
+            else
+                _currentRenderDpi = baseDpi;
+            return;
+        }
+
+        if (_zoomMode == 4)
+        {
+            double maxW = _pageDimensions.Max(d => d.WidthPts);
+            double maxH = _pageDimensions.Max(d => d.HeightPts);
+            if (maxW > 0 && maxH > 0 && viewW > 0)
+            {
+                double viewH = PageScroller.ViewportHeight;
+                double dpiW = 72.0 * viewW / maxW;
+                double dpiH = 72.0 * viewH / maxH;
+                _currentRenderDpi = Math.Min(dpiW, dpiH);
+            }
+            else
+                _currentRenderDpi = baseDpi;
+            return;
+        }
+
+        _currentRenderDpi = baseDpi;
+    }
+
+    private double GetRenderedHeight(int pageIdx)
+    {
+        if (pageIdx < 0 || pageIdx >= _pageDimensions.Length) return 0;
+        var (wPts, hPts) = _pageDimensions[pageIdx];
+        return hPts * _currentRenderDpi / 72.0;
+    }
+
+    private double GetPageDisplayHeight(int pageIdx)
+    {
+        double wPts = _pageDimensions[pageIdx].WidthPts;
+        double hPts = _pageDimensions[pageIdx].HeightPts;
+        double viewW = PageScroller.ViewportWidth;
+        double displayW = Math.Min(wPts * _currentRenderDpi / 72.0, viewW);
+        return hPts * displayW / wPts;
+    }
+
+    private double GetPageY(int pageIdx)
+    {
+        double y = 0;
+        for (int i = 0; i < pageIdx && i < _totalPages; i++)
+            y += GetPageDisplayHeight(i) + PageGap + PageHeaderHeight;
+        return y;
+    }
+
+    private double GetPageBottom(int pageIdx)
+    {
+        return GetPageY(pageIdx) + GetPageDisplayHeight(pageIdx) + PageGap + PageHeaderHeight;
+    }
+
+    private double GetTotalContentHeight()
+    {
+        return GetPageY(_totalPages);
+    }
+
+    // ── Canvas page management ──────────────────────────────────────
+
+    private double _lastViewW;
+
+    private void OnPageScrollerScroll(object sender, ScrollChangedEventArgs e)
+    {
+        UpdateVisiblePages();
+    }
+
+    private void OnPageScrollerSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        DetectCanvasResize();
+    }
+
+    private void DetectCanvasResize()
+    {
+        if (_totalPages == 0) return;
+        double viewW = PageScroller.ViewportWidth;
+        if (viewW <= 0) return;
+        if (Math.Abs(viewW - _lastViewW) <= 1) return;
+
+        Log($"DetectCanvasResize: viewW={viewW:F0} (was {_lastViewW:F0}), zoom={_zoomMode}, dpi={_currentRenderDpi:F0}");
+        _lastViewW = viewW;
+        if (_zoomMode >= 3)
+            UpdateDpiAndRefresh();
+        else
+            RelayoutPageContainers();
+    }
+
+    private void UpdateVisiblePages()
+    {
+        if (_totalPages == 0) return;
+
+        double viewW = PageScroller.ViewportWidth;
+        if (viewW <= 0) return;
+
+        double scrollTop = PageScroller.VerticalOffset;
+        double scrollBottom = scrollTop + PageScroller.ViewportHeight;
+        double buffer = PageScroller.ViewportHeight;
+        double rangeTop = Math.Max(0, scrollTop - buffer);
+        double rangeBottom = scrollBottom + buffer;
+
+        HashSet<int> needed = new();
+        for (int i = 0; i < _totalPages; i++)
+        {
+            double itemTop = GetPageY(i);
+            double itemBottom = GetPageBottom(i);
+            if (itemBottom < rangeTop || itemTop > rangeBottom)
+                continue;
+            needed.Add(i);
+        }
+
+        foreach (var key in _pageElements.Keys.ToList())
+        {
+            if (!needed.Contains(key))
+                RemovePageElement(key);
+        }
+
+        double viewCenter = scrollTop + PageScroller.ViewportHeight / 2;
+        foreach (int pageIdx in needed
+            .Where(p => !_pageElements.ContainsKey(p))
+            .OrderBy(p =>
+            {
+                double c = (GetPageY(p) + GetPageBottom(p)) / 2;
+                return Math.Abs(c - viewCenter);
+            }))
+        {
+            _ = EnsurePageElementAsync(pageIdx);
+        }
+    }
+
+    private void RelayoutPageContainers()
+    {
+        double viewW = PageScroller.ViewportWidth;
+        if (viewW <= 0) return;
+
+        foreach (var (pageIdx, elem) in _pageElements.ToList())
+        {
+            double wPts = _pageDimensions[pageIdx].WidthPts;
+            double hPts = _pageDimensions[pageIdx].HeightPts;
+            double displayW = Math.Min(wPts * _currentRenderDpi / 72.0, viewW);
+            double displayH = hPts * displayW / wPts;
+
+            elem.Panel.Width = viewW;
+            elem.Image.Width = displayW;
+            Canvas.SetTop(elem.Panel, GetPageY(pageIdx));
+
+            elem.HighlightOverlay.Width = displayW;
+            elem.HighlightOverlay.Height = displayH;
+        }
+    }
+
+    private void RemovePageElement(int pageIdx)
+    {
+        if (_pageElements.TryGetValue(pageIdx, out var elem))
+        {
+            PageCanvas.Children.Remove(elem.Panel);
+            _pageElements.Remove(pageIdx);
+        }
+    }
+
+    private void RemoveAllPageElements()
+    {
+        foreach (var key in _pageElements.Keys.ToList())
+            RemovePageElement(key);
+        _pageElements.Clear();
+    }
+
+    private async Task EnsurePageElementAsync(int pageIdx)
+    {
+        if (_pageElements.ContainsKey(pageIdx))
+            return;
+
+        var pathBefore = _viewerMediator.PdfPath;
+        var pagePositions = _viewerMediator.PositionsByPage.TryGetValue(pageIdx, out var pp)
+            ? pp : new List<WordPosition>();
+
+        PageRenderItem? renderItem;
+        try
+        {
+            renderItem = await ((IPdfRenderingService)this).GetOrRenderPageAsync(pageIdx, pagePositions);
+        }
+        catch (OperationCanceledException) { return; }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[SearchTab] Render error: {ex.Message}");
+            return;
+        }
+
+        if (renderItem?.PageImage is null) return;
+
+        if (_viewerMediator.PdfPath != pathBefore) return;
+
+        await Dispatcher.InvokeAsync(() =>
+        {
+            if (_pageElements.ContainsKey(pageIdx))
+                return;
+
+            if (_viewerMediator.PdfPath != pathBefore) return;
+
+            double viewW = PageScroller.ViewportWidth;
+            if (viewW <= 0) return;
+
+            double pageY = GetPageY(pageIdx);
+
+            double wPts = _pageDimensions[pageIdx].WidthPts;
+            double hPts = _pageDimensions[pageIdx].HeightPts;
+            double displayW = Math.Min(wPts * _currentRenderDpi / 72.0, viewW);
+            double displayH = hPts * displayW / wPts;
+
+            Log($"EnsurePageElement: page={pageIdx + 1}, viewW={viewW:F0}, dispW={displayW:F0}, dispH={displayH:F0}, pageY={pageY:F0}");
+
+            var header = new TextBlock
+            {
+                Text = $"Page {pageIdx + 1}",
+                FontWeight = FontWeights.SemiBold,
+                FontSize = 12,
+                Height = PageHeaderHeight,
+                HorizontalAlignment = HorizontalAlignment.Center,
+            };
+
+            var image = new Image
+            {
+                Source = renderItem.PageImage,
+                Stretch = Stretch.Uniform,
+                Width = displayW,
+                HorizontalAlignment = HorizontalAlignment.Center,
+            };
+
+            var highlightOverlay = new Canvas
+            {
+                Width = displayW,
+                Height = displayH,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                IsHitTestVisible = false,
+            };
+
+            var panel = new StackPanel
+            {
+                Width = viewW,
+            };
+            panel.Children.Add(header);
+            panel.Children.Add(image);
+            panel.Children.Add(highlightOverlay);
+
+            Canvas.SetTop(panel, pageY);
+            Canvas.SetLeft(panel, 0);
+
+            var elem = new PageElement
+            {
+                Panel = panel,
+                Image = image,
+                HighlightOverlay = highlightOverlay,
+            };
+            _pageElements[pageIdx] = elem;
+            PageCanvas.Children.Add(panel);
+
+            UpdatePageHighlights(pageIdx);
+        });
+    }
+
+    private void UpdatePageHighlights(int pageIdx)
+    {
+        if (!_pageElements.TryGetValue(pageIdx, out var elem))
+            return;
+
+        elem.HighlightOverlay.Children.Clear();
+
+        int currentPos = _navigationMediator.CurrentPositionIndex;
+        if (currentPos < 0 || currentPos >= _viewerMediator.Positions.Count)
+            return;
+
+        var pos = _viewerMediator.Positions[currentPos];
+        if (pos.Page - 1 != pageIdx)
+            return;
+
+        var (wPts, hPts) = _pageDimensions[pageIdx];
+        double renderH = GetRenderedHeight(pageIdx);
+        double viewW = PageScroller.ViewportWidth;
+        double dispW = Math.Min(wPts * _currentRenderDpi / 72.0, viewW);
+        double scaleX = dispW / (wPts * _currentRenderDpi / 72.0);
+        double scaleY = renderH > 0 ? (dispW / (wPts * _currentRenderDpi / 72.0)) : 1;
+
+        double overlayW = dispW;
+        double overlayH = renderH * scaleY;
+        elem.HighlightOverlay.Width = overlayW;
+        elem.HighlightOverlay.Height = overlayH;
+
+        int rotation = _viewerMediator.Renderer.GetPageRotation(pageIdx);
+        var mapper = new PdfCoordinateMapper(wPts, hPts, overlayW, overlayH);
+        var pdfRect = PdfRect.FromLtrb(pos.XMin, pos.YMin, pos.XMax, pos.YMax);
+        var renderRect = mapper.ToRenderRect(pdfRect);
+
+        var rect = new Rectangle
+        {
+            Fill = new SolidColorBrush(Color.FromArgb(20, 255, 255, 0)),
+            Stroke = Brushes.Gold,
+            StrokeThickness = 2,
+            Width = renderRect.Width,
+            Height = renderRect.Height,
+        };
+        Canvas.SetLeft(rect, renderRect.Left);
+        Canvas.SetTop(rect, renderRect.Top);
+        elem.HighlightOverlay.Children.Add(rect);
+    }
+
+    private void UpdateAllHighlights()
+    {
+        foreach (var pageIdx in _pageElements.Keys.ToList())
+            UpdatePageHighlights(pageIdx);
+    }
+
+    private void LayoutCanvas()
+    {
+        PageCanvas.Height = GetTotalContentHeight();
+    }
+
     // ── Search ──────────────────────────────────────────────────────
 
     private void OnSearchBoxKeyDown(object sender, KeyEventArgs e)
@@ -100,7 +496,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private void OnViewerKeyDown(object sender, KeyEventArgs e)
     {
-        if (_isLoading || _viewerMediator.PageViewModels is null)
+        if (_isLoading || _totalPages == 0)
             return;
 
         if (ScrollStrategies.TryGetValue(e.Key, out var strategy))
@@ -152,10 +548,15 @@ public partial class SearchTab : Page, IPdfRenderingService
         catch (Exception ex) { Log($"OnViewerStateChanged error: {ex.Message}"); }
     }
 
-    private void OnViewModelsBuilt(object? sender, EventArgs e)
+    private void OnPageDataReady(object? sender, EventArgs e)
     {
-        try { PageList.ItemsSource = _viewerMediator.PageViewModels; }
-        catch (Exception ex) { Log($"OnViewModelsBuilt error: {ex.Message}"); }
+        try
+        {
+            Canvas.SetTop(PageCanvas, 0);
+            Canvas.SetLeft(PageCanvas, 0);
+            UpdateVisiblePages();
+        }
+        catch (Exception ex) { Log($"OnPageDataReady error: {ex.Message}"); }
     }
 
     private async void OnNextPage(object sender, RoutedEventArgs e)
@@ -178,7 +579,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         catch (Exception ex) { Log($"OnPrevPage error: {ex.Message}"); }
     }
 
-    // ── Document selection + filtered rendering ─────────────────────
+    // ── Document selection ──────────────────────────────────────────
 
     private async void OnResultSelected(object sender, SelectionChangedEventArgs e)
     {
@@ -203,7 +604,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
             var ct = _viewerMediator.CurrentRenderToken;
 
-            var t0 = DateTime.UtcNow;
+            var sw = Stopwatch.StartNew();
             Log($"OnResultSelected: id={result.Id}, path={result.Path}, collId={result.CollectionId}, query='{_searchMediator.LastQuery}'");
             StatusLabel.Text = System.IO.Path.GetFileName(result.Path);
 
@@ -211,7 +612,7 @@ public partial class SearchTab : Page, IPdfRenderingService
             try
             {
                 pdfBytes = System.IO.File.ReadAllBytes(result.Path);
-                Log($"Read PDF file: {pdfBytes.Length} bytes");
+                Log($"File read: {sw.Elapsed.TotalMilliseconds:F0}ms, {pdfBytes.Length} bytes");
             }
             catch (Exception ex)
             {
@@ -230,6 +631,7 @@ public partial class SearchTab : Page, IPdfRenderingService
                 {
                     positions = await _viewerMediator.FetchPositionsAsync(
                         _engine, (uint)result.CollectionId.Value, result.Id, _searchMediator.LastQuery);
+                    Log($"Fetch positions: {sw.Elapsed.TotalMilliseconds:F0}ms, count={positions.Count}");
                 }
                 catch (Exception ex)
                 {
@@ -244,7 +646,10 @@ public partial class SearchTab : Page, IPdfRenderingService
             }
 
             _viewerMediator.SetPositions(positions, _navigationMediator, _searchMediator.LastQuery, isBooleanMode: SearchModeCombo.SelectedIndex == 1);
+
             _viewerMediator.OpenDocument(pdfBytes, result.Path);
+            int pageCount = _viewerMediator.Renderer.GetPageCount();
+            Log($"Open document: {sw.Elapsed.TotalMilliseconds:F0}ms, pages={pageCount}");
 
             if (positions.Count == 0)
             {
@@ -258,10 +663,10 @@ public partial class SearchTab : Page, IPdfRenderingService
                 return;
             }
 
-            BuildOrDeferViewModels(ct);
+            BuildPageData();
+            Log($"Build page data: {sw.Elapsed.TotalMilliseconds:F0}ms");
 
-            var tEnd = DateTime.UtcNow;
-            Log($"OnResultSelected complete (total {(tEnd - t0).TotalMilliseconds:F0}ms)");
+            Log($"OnResultSelected complete (total {sw.Elapsed.TotalMilliseconds:F0}ms)");
         }
         catch (Exception ex)
         {
@@ -321,6 +726,8 @@ public partial class SearchTab : Page, IPdfRenderingService
             : "0 / 0";
         PrevPosition.IsEnabled = _navigationMediator.CanGoPrevPosition;
         NextPosition.IsEnabled = _navigationMediator.CanGoNextPosition;
+
+        Dispatcher.InvokeAsync(() => UpdateAllHighlights());
     }
 
     private void ScrollToMatch(int index, bool scrollToTop = false)
@@ -331,95 +738,25 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         int pageIdx = matchingPages[index];
 
-        double targetPx;
-        double viewH = PageScroller.ViewportHeight;
-
         if (scrollToTop)
         {
-            PageList.UpdateLayout();
-            var container = PageList.ItemContainerGenerator.ContainerFromIndex(pageIdx) as FrameworkElement;
-            if (container is not null)
-            {
-                container.UpdateLayout();
-                Point containerOrigin = container.TransformToAncestor(PageScroller).Transform(new Point(0, 0));
-                targetPx = PageScroller.VerticalOffset + containerOrigin.Y;
-            }
-            else
-            {
-                targetPx = AccumulatePageHeightBefore(pageIdx);
-            }
-            targetPx = Math.Max(0, Math.Min(targetPx, PageScroller.ScrollableHeight));
-            PageScroller.ScrollToVerticalOffset(targetPx);
+            double target = GetPageY(pageIdx);
+            PageScroller.ScrollToVerticalOffset(target);
             return;
         }
 
-        var posIdx = Enumerable.Range(0, _viewerMediator.Positions.Count).FirstOrDefault(i => _viewerMediator.Positions[i].Page - 1 == pageIdx, -1);
-        if (posIdx >= 0 && _viewerMediator.PageViewModels is not null && pageIdx < _viewerMediator.PageViewModels.Count)
+        // Try to scroll to the first position on this page
+        var posIdx = Enumerable.Range(0, _viewerMediator.Positions.Count)
+            .FirstOrDefault(i => _viewerMediator.Positions[i].Page - 1 == pageIdx, -1);
+        if (posIdx >= 0)
         {
-            var pos = _viewerMediator.Positions[posIdx];
-            var (wPts, hPts) = _viewerMediator.Renderer.GetPageDimensions(pageIdx);
-            int rotation = _viewerMediator.Renderer.GetPageRotation(pageIdx);
-            var mapper = new PdfCoordinateMapper(wPts, hPts, 0, 0);
-            double normalizedY = mapper.ToNormalizedCenterY(PdfRect.FromLtrb(pos.XMin, pos.YMin, pos.XMax, pos.YMax), rotation);
-
-            double wordContentY = 0;
-            bool refined = false;
-
-            PageList.UpdateLayout();
-
-            var container = PageList.ItemContainerGenerator.ContainerFromIndex(pageIdx) as FrameworkElement;
-            if (container is not null)
-            {
-                container.UpdateLayout();
-                var imgControl = FindChild<Image>(container);
-                if (imgControl is not null && imgControl.ActualHeight > 0)
-                {
-                    Rect pdfRealBounds = GetActualImageRect(imgControl);
-                if (pdfRealBounds != Rect.Empty)
-                {
-                    double wordYLocal = pdfRealBounds.Top + normalizedY * pdfRealBounds.Height;
-                    Point relativeWord = imgControl.TransformToAncestor(PageScroller).Transform(new Point(0, wordYLocal));
-                    wordContentY = PageScroller.VerticalOffset + relativeWord.Y;
-                    refined = true;
-                }
-                }
-            }
-
-            if (!refined)
-            {
-                double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
-                wordContentY = AccumulatePageHeightBefore(pageIdx);
-                wordContentY += LayoutConstants.WordOffsetWithinItem(
-                    availW,
-                    _viewerMediator.PageViewModels[pageIdx].ImagePixelWidth,
-                    _viewerMediator.PageViewModels[pageIdx].ImagePixelHeight,
-                    normalizedY);
-            }
-
-            targetPx = wordContentY - viewH / 2;
-        }
-        else
-        {
-            targetPx = AccumulatePageHeightBefore(pageIdx);
+            _ = ScrollToPosition(posIdx);
+            return;
         }
 
-        targetPx = Math.Max(0, Math.Min(targetPx, PageScroller.ScrollableHeight));
+        double targetPx = GetPageY(pageIdx);
         PageScroller.ScrollToVerticalOffset(targetPx);
         Log($"ScrollToMatch: targetPx={targetPx:F1}");
-    }
-
-    private double AccumulatePageHeightBefore(int pageIdx)
-    {
-        if (_viewerMediator.PageViewModels is null || pageIdx <= 0) return 0;
-        double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
-        double total = 0;
-        for (int i = 0; i < pageIdx; i++)
-        {
-            var vm = _viewerMediator.PageViewModels[i];
-            total += LayoutConstants.TotalItemHeight(
-                availW, vm.ImagePixelWidth, vm.ImagePixelHeight);
-        }
-        return total;
     }
 
     // ── Position (individual match) navigation ─────────────────────
@@ -505,171 +842,85 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         var pos = _viewerMediator.Positions[posIdx];
         var pageIdx = pos.Page - 1;
-        var matchIdx = _navigationMediator.FindMatchForPage(pageIdx);
-        if (matchIdx < 0)
+
+        if (pageIdx < 0 || pageIdx >= _totalPages)
         {
-            Log($"ScrollToPosition: matchIdx={matchIdx} out of range — returning early");
+            Log($"ScrollToPosition: page {pageIdx} out of range");
             return;
         }
 
-        // Get normalized Y position of the word within its page (0 = top, 1 = bottom)
-        var (wPts, hPts) = _viewerMediator.Renderer.GetPageDimensions(pageIdx);
+        var (wPts, hPts) = _pageDimensions[pageIdx];
         int rotation = _viewerMediator.Renderer.GetPageRotation(pageIdx);
         var mapper = new PdfCoordinateMapper(wPts, hPts, 0, 0);
         double normalizedY = mapper.ToNormalizedCenterY(PdfRect.FromLtrb(pos.XMin, pos.YMin, pos.XMax, pos.YMax), rotation);
         Log($"ScrollToPosition: pagePts={wPts:F1}x{hPts:F1} rotation={rotation} normalizedY={normalizedY:F4}");
 
-        // Ensure target page is rendered
-        double viewH = PageScroller.ViewportHeight;
-        var pagePositions = _viewerMediator.PositionsByPage.TryGetValue(pageIdx, out var pp) ? pp : new List<WordPosition>();
-        var pathBefore = _viewerMediator.PdfPath;
-        await ((IPdfRenderingService)this).GetOrRenderPageAsync(pageIdx, pagePositions);
-        if (_viewerMediator.PdfPath != pathBefore) return;
+        double pageY = GetPageY(pageIdx);
+        double renderH = GetRenderedHeight(pageIdx);
+        double wordOffset = normalizedY * renderH;
+        double target = pageY + PageHeaderHeight + wordOffset - PageScroller.ViewportHeight / 2;
 
-        // Flush dispatcher queue
-        await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Background);
-        if (_viewerMediator.PdfPath != pathBefore) return;
-        Log($"ScrollToPosition: dispatcher flushed");
-
-        // Compute scroll target
-        double wordContentY = 0;
-        bool refined = false;
-
-        PageList.UpdateLayout();
-
-        var targetContainer = PageList.ItemContainerGenerator.ContainerFromIndex(pageIdx) as FrameworkElement;
-        if (targetContainer is not null)
-        {
-            targetContainer.UpdateLayout();
-            var imgControl = FindChild<Image>(targetContainer);
-            if (imgControl is not null && imgControl.Source is not null && imgControl.ActualHeight > 0)
-            {
-                Rect pdfRealBounds = GetActualImageRect(imgControl);
-                if (pdfRealBounds != Rect.Empty)
-                {
-                    double wordY = pdfRealBounds.Top + normalizedY * pdfRealBounds.Height;
-                    Point relativeWord = imgControl.TransformToAncestor(PageScroller).Transform(new Point(0, wordY));
-                    wordContentY = PageScroller.VerticalOffset + relativeWord.Y;
-                    refined = true;
-                }
-            }
-        }
-
-        if (!refined)
-        {
-            double availW = LayoutConstants.AvailWidth(PageScroller.ViewportWidth);
-            double accBefore = AccumulatePageHeightBefore(pageIdx);
-            var fallbackVm = _viewerMediator.PageViewModels?[pageIdx];
-            if (fallbackVm is null) return;
-            double offsetWithin = LayoutConstants.WordOffsetWithinItem(availW, fallbackVm.ImagePixelWidth, fallbackVm.ImagePixelHeight, normalizedY);
-            wordContentY = accBefore + offsetWithin;
-        }
-
-        double target = wordContentY - viewH / 2;
         target = Math.Max(0, Math.Min(target, PageScroller.ScrollableHeight));
         PageScroller.ScrollToVerticalOffset(target);
         Log($"ScrollToPosition: targetPx={target:F1}");
+
+        UpdateAllHighlights();
     }
 
+    // ── Build page data ─────────────────────────────────────────────
 
-    // ── Helpers ────────────────────────────────────────────────────
-
-    private static T? FindChild<T>(DependencyObject parent) where T : DependencyObject
-    {
-        for (int i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
-        {
-            var child = VisualTreeHelper.GetChild(parent, i);
-            if (child is T t) return t;
-            var found = FindChild<T>(child);
-            if (found != null) return found;
-        }
-        return null;
-    }
-
-    private static Rect GetActualImageRect(Image imageControl)
-    {
-        var source = imageControl.Source;
-        if (source is null) return Rect.Empty;
-
-        double bitmapW = source.Width;
-        double bitmapH = source.Height;
-        double controlW = imageControl.ActualWidth;
-        double controlH = imageControl.ActualHeight;
-
-        if (bitmapW <= 0 || bitmapH <= 0 || controlW <= 0 || controlH <= 0)
-            return Rect.Empty;
-
-        double scale = Math.Min(controlW / bitmapW, controlH / bitmapH);
-        double actualPdfW = bitmapW * scale;
-        double actualPdfH = bitmapH * scale;
-        double offsetX = (controlW - actualPdfW) / 2;
-        double offsetY = (controlH - actualPdfH) / 2;
-
-        return new Rect(offsetX, offsetY, actualPdfW, actualPdfH);
-    }
-
-    // ── Build page models (no virtualization) ──────────────────────
-
-    private void BuildOrDeferViewModels(CancellationToken ct)
+    private void BuildPageData()
     {
         try
         {
-            if (PageScroller.ViewportWidth > 0)
+            if (PageScroller.ViewportWidth <= 0)
             {
-                _viewerMediator.BuildPageViewModels();
-                PageList.ItemsSource = _viewerMediator.PageViewModels;
-                _navigationMediator.GotoInitialPosition();
-                FinishLoading();
-                _ = Dispatcher.InvokeAsync(async () =>
+                Log("BuildPageData: viewport not laid out yet, deferring...");
+                EventHandler? handler = null;
+                handler = (_, _) =>
                 {
-                    try
+                    if (PageScroller.ViewportWidth > 35)
                     {
-                        Log("BuildOrDeferViewModels: deferred ScrollToPosition(0) at Loaded");
-                        if (_viewerMediator.Positions.Count > 0)
-                            await ScrollToPosition(0);
+                        PageScroller.LayoutUpdated -= handler;
+                        DoBuildPageData();
                     }
-                    catch (Exception ex) { Log($"BuildOrDeferViewModels scroll error: {ex.Message}"); }
-                }, DispatcherPriority.Loaded);
+                };
+                PageScroller.LayoutUpdated += handler;
                 return;
             }
 
-            Log("BuildOrDeferViewModels: viewport not yet laid out — deferring");
-            EventHandler? handler = null;
-            handler = (_, _) =>
-            {
-                if (ct.IsCancellationRequested)
-                {
-                    PageScroller.LayoutUpdated -= handler;
-                    return;
-                }
-
-                if (PageScroller.ViewportWidth > 35)
-                {
-                    PageScroller.LayoutUpdated -= handler;
-                    Log("BuildOrDeferViewModels: deferred build now");
-                    try
-                    {
-                        _viewerMediator.BuildPageViewModels();
-                        PageList.ItemsSource = _viewerMediator.PageViewModels;
-                        _navigationMediator.GotoInitialPosition();
-                        FinishLoading();
-                        _ = Dispatcher.InvokeAsync(async () =>
-                        {
-                            try
-                            {
-                                Log("BuildOrDeferViewModels: deferred ScrollToPosition(0) at Loaded (deferred path)");
-                                if (_viewerMediator.Positions.Count > 0)
-                                    await ScrollToPosition(0);
-                            }
-                            catch (Exception ex) { Log($"BuildOrDeferViewModels deferred scroll error: {ex.Message}"); }
-                        }, DispatcherPriority.Loaded);
-                    }
-                    catch (Exception ex) { Log($"BuildOrDeferViewModels deferred build error: {ex.Message}"); }
-                }
-            };
-            PageScroller.LayoutUpdated += handler;
+            DoBuildPageData();
         }
-        catch (Exception ex) { Log($"BuildOrDeferViewModels error: {ex.Message}"); }
+        catch (Exception ex) { Log($"BuildPageData error: {ex.Message}"); }
+    }
+
+    private void DoBuildPageData()
+    {
+        _totalPages = _viewerMediator.Renderer.GetPageCount();
+        var allDims = _viewerMediator.Renderer.GetAllPageDimensions();
+        _pageDimensions = allDims;
+
+        _viewerMediator.Renderer.TargetDpi = _renderDpi;
+        ComputeRenderDpi();
+        LayoutCanvas();
+        _lastViewW = PageScroller.ViewportWidth;
+
+        _viewerMediator.BuildPageViewModels();
+        _navigationMediator.GotoInitialPosition();
+        FinishLoading();
+
+        Log($"DoBuildPageData: {_totalPages} pages, dpi={_currentRenderDpi:F0}, viewW={_lastViewW:F0}, zoom={_zoomMode}");
+
+        _ = Dispatcher.InvokeAsync(async () =>
+        {
+            try
+            {
+                if (_viewerMediator.Positions.Count > 0)
+                    await ScrollToPosition(0);
+            }
+            catch (Exception ex) { Log($"BuildPageData scroll error: {ex.Message}"); }
+            UpdateVisiblePages();
+        }, DispatcherPriority.Loaded);
     }
 
     private void FinishLoading()
@@ -684,8 +935,10 @@ public partial class SearchTab : Page, IPdfRenderingService
         _viewerMediator.Clear();
         _navigationMediator.Reset();
 
-        PageList.ItemsSource = null;
-        PageScroller.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        RemoveAllPageElements();
+        _pageDimensions = [];
+        _totalPages = 0;
+        PageScroller.ScrollToVerticalOffset(0);
         WordsField.Text = "";
     }
 }

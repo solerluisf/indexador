@@ -221,6 +221,7 @@ public sealed class PdfEngine : IDisposable
     public string? BooleanQuery { set { Settings.BooleanQuery = value; pdf_set_boolean_query(value is not null ? Utf8(value) : null); } }
     public bool SearchBooleanMode { set { pdf_set_search_boolean_mode(value ? 1 : 0); } }
     public string? ThemeName { get => Settings.ThemeName; set => Settings.ThemeName = value; }
+    public int RenderDpi { get => Settings.RenderDpi; set => Settings.RenderDpi = value; }
     public void SetCollectionBoost(uint collId, float weight)
     {
         Settings.CollectionBoosts[collId] = weight;
