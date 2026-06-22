@@ -11,7 +11,6 @@ use tantivy::tokenizer::{TextAnalyzer, TokenStream, Tokenizer};
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy, SnippetGenerator, TantivyDocument, Term};
 use tantivy::{DocSet, Postings, TERMINATED};
 
-use crate::math_tokenizer::MathAwareTokenizer;
 
 /// Canonical token pattern used by both the extractor (`clean_word_text`) and
 /// Tantivy's tokenizers. Single source of truth — guarantees lockstep alignment.
@@ -24,7 +23,6 @@ pub struct SearchIndex {
     pub id_field: Field,
     pub path_field: Field,
     pub content_field: Field,
-    pub math_tokens_field: Option<Field>,
     ram_buffer: u64,
 }
 
@@ -71,17 +69,10 @@ impl SearchIndex {
             .build();
         index.tokenizers().register("multilang", multilang_analyzer);
 
-        // Register math-aware tokenizer for math_tokens field.
-        let math_tokens_analyzer = TextAnalyzer::builder(MathAwareTokenizer)
-            .filter(tantivy::tokenizer::LowerCaser)
-            .build();
-        index.tokenizers().register("math_tokens", math_tokens_analyzer);
-
         let schema = index.schema();
         let id_field = schema.get_field("id").map_err(|_| anyhow::anyhow!("Missing 'id' field in index schema"))?;
         let path_field = schema.get_field("path").map_err(|_| anyhow::anyhow!("Missing 'path' field in index schema"))?;
         let content_field = schema.get_field("content").map_err(|_| anyhow::anyhow!("Missing 'content' field — index was created with an older schema version; please re-index"))?;
-        let math_tokens_field = schema.get_field("math_tokens").ok();
 
         Ok(Self {
             index,
@@ -89,7 +80,6 @@ impl SearchIndex {
             id_field,
             path_field,
             content_field,
-            math_tokens_field,
             ram_buffer: 3_000_000_000,
         })
     }
@@ -128,24 +118,16 @@ impl SearchIndex {
         id: i64,
         path: &str,
         text: &str,
-        math_source: Option<&str>,
     ) -> Result<()> {
         // Delete any existing document with the same id before adding,
         // so re-processing a file after a crash does not create duplicates.
         writer
             .delete_term(Term::from_field_u64(self.id_field, id as u64));
-        let mut doc = TantivyDocument::from(doc!(
+        let doc = TantivyDocument::from(doc!(
             self.id_field => id as u64,
             self.path_field => path,
             self.content_field => text,
         ));
-        if let Some(math_field) = self.math_tokens_field {
-            if let Some(src) = math_source {
-                if !src.is_empty() {
-                    doc.add_text(math_field, src);
-                }
-            }
-        }
         writer
             .add_document(doc)
             .context("Failed to add document to index")?;
@@ -818,15 +800,6 @@ fn build_schema() -> Schema {
                     .set_index_option(IndexRecordOption::WithFreqsAndPositions),
             ),
     );
-    schema_builder.add_text_field(
-        "math_tokens",
-        TextOptions::default()
-            .set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("math_tokens")
-                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-            ),
-    );
     schema_builder.build()
 }
 
@@ -862,7 +835,7 @@ impl Indexer {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn index_document(&self, id: i64, path: &str, text: &str) -> Result<()> {
         let mut writer = self.search_index.writer()?;
-        self.search_index.add_document(&mut writer, id, path, text, None)?;
+        self.search_index.add_document(&mut writer, id, path, text)?;
         writer.commit()?;
         self.metrics.docs_indexed.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut t) = self.metrics.last_commit.lock() {
@@ -971,9 +944,8 @@ fn unique_index_dir() -> PathBuf {
 mod tests {
     use super::*;
 
-    fn add_doc(idx: &SearchIndex, writer: &mut IndexWriter, _id: i64, _path: &str, _checksum: &str, text: &str, _raw: &str, _lang: &str, _math: &str) -> Result<()> {
-        let math = if _math.is_empty() { None } else { Some(_math) };
-        idx.add_document(writer, _id, _path, text, math)
+    fn add_doc(idx: &SearchIndex, writer: &mut IndexWriter, _id: i64, _path: &str, _checksum: &str, text: &str, _raw: &str, _lang: &str) -> Result<()> {
+        idx.add_document(writer, _id, _path, text)
     }
 
     // --- SearchIndex: basic flows ---
@@ -984,7 +956,6 @@ mod tests {
         assert!(schema.get_field("id").is_ok());
         assert!(schema.get_field("path").is_ok());
         assert!(schema.get_field("content").is_ok());
-        assert!(schema.get_field("math_tokens").is_ok(), "math_tokens field should exist");
     }
 
     #[test]
@@ -993,7 +964,6 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let tokenizers = idx.index.tokenizers();
         assert!(tokenizers.get("multilang").is_some(), "multilang tokenizer should be registered");
-        assert!(tokenizers.get("math_tokens").is_some(), "math_tokens tokenizer should be registered");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1005,7 +975,7 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         // fuzzy=0, stem=false -> exact search via QueryParser
@@ -1021,7 +991,7 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         // fuzzy=2 should match "hxllo" -> "hello"
@@ -1041,7 +1011,7 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_in_field_fuzzy_stem("", "content", 10, None, 0, 2, false).unwrap();
@@ -1056,7 +1026,7 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         let result = idx.search_in_field_fuzzy_stem("hello", "bad_field", 10, None, 0, 2, false);
@@ -1072,84 +1042,12 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_in_field_fuzzy_stem("hello", "content", 10, Some("/a.pdf"), 0, 0, false).unwrap();
         assert_eq!(results.len(), 1, "Path filter + field fuzzy_stem should find only the matching doc");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_math_tokens_field_is_searchable() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        add_doc(&idx, &mut writer, 1, "/math.pdf", "m1",
-            "The equation $E = mc^2$ is famous.",
-            "raw", "", r"inline:E = mc^2").unwrap();
-        writer.commit().unwrap();
-
-        // math_tokens is INDEXED only (not STORED), so verify it's searchable.
-        let results = idx.search_in_field("inline", "math_tokens", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 1, "math_tokens field should be searchable");
-        let results2 = idx.search_in_field("display", "math_tokens", 10, None, 0).unwrap();
-        assert_eq!(results2.len(), 0, "No display token in this doc");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_math_tokens_index_latex_construct() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        add_doc(&idx, &mut writer, 1, "/sum.pdf", "m2",
-            "The sum $$\\sum_{i=1}^{n} i$$ is computed.",
-            "raw", "", r"display:\sum_{i=1}^{n} i").unwrap();
-        writer.commit().unwrap();
-
-        // Search for the composed MATH_SUM_LIMITS token in math_tokens using a term query.
-        // Tokenizer includes LowerCaser, so the token is lowercased.
-        if let Some(math_tokens_field) = idx.math_tokens_field {
-            let term = tantivy::Term::from_field_text(math_tokens_field, "math_sum_limits");
-            let reader = idx.index.reader_builder().try_into().unwrap();
-            let searcher = reader.searcher();
-            let top_docs = searcher.search(
-                &TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic),
-                &tantivy::collector::TopDocs::with_limit(10),
-            ).unwrap();
-            assert_eq!(top_docs.len(), 1,
-                "Math doc should be findable via math_sum_limits token in math_tokens");
-            // Also verify individual sub-tokens are searchable via the query parser.
-            let query_parser = tantivy::query::QueryParser::for_index(&idx.index, vec![math_tokens_field]);
-            let sub_query = query_parser.parse_query("sum").unwrap();
-            let sub_docs = searcher.search(&sub_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
-            assert_eq!(sub_docs.len(), 1,
-                "Individual sub-token 'sum' should also be searchable in math_tokens");
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_math_tokens_field_empty_when_no_math() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        add_doc(&idx, &mut writer, 1, "/plain.pdf", "m3",
-            "This is plain text without math.",
-            "raw", "", "").unwrap();
-        writer.commit().unwrap();
-
-        // math_tokens is INDEXED only; no math tokens should be findable.
-        let results = idx.search_in_field("inline", "math_tokens", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 0, "No math tokens for plain text");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1160,7 +1058,7 @@ mod tests {
         {
             let idx = SearchIndex::new(&dir).unwrap();
             let mut writer = idx.writer().unwrap();
-            add_doc(&idx, &mut writer, 1, "/test.pdf", "cs1", "hello world", "hello world", "", "").unwrap();
+            add_doc(&idx, &mut writer, 1, "/test.pdf", "cs1", "hello world", "hello world", "").unwrap();
             writer.commit().unwrap();
         }
         {
@@ -1177,7 +1075,7 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", "the quick brown fox", "the quick brown fox", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", "the quick brown fox", "the quick brown fox", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -1205,7 +1103,7 @@ mod tests {
 
         for i in 0..10 {
             let content = format!("document number {}", i);
-            add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
+            add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "").unwrap()
 ;
         }
         writer.commit().unwrap();
@@ -1222,7 +1120,7 @@ mod tests {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", "Hello World", "Hello World", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", "Hello World", "Hello World", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -1243,9 +1141,9 @@ fn test_search_with_path_filter_filters_by_path() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/reports/2024.pdf", "cs1", "quarterly earnings report", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/reports/2024.pdf", "cs1", "quarterly earnings report", "content", "").unwrap()
 ;
-    add_doc(&idx, &mut writer, 2, "/invoices/2024.pdf", "cs2", "invoice total earnings", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/invoices/2024.pdf", "cs2", "invoice total earnings", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1268,9 +1166,9 @@ fn test_search_path_filter_without_text_query() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/docs/a.pdf", "cs1", "rust language", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/docs/a.pdf", "cs1", "rust language", "content", "").unwrap()
 ;
-    add_doc(&idx, &mut writer, 2, "/docs/b.pdf", "cs2", "python language", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/docs/b.pdf", "cs2", "python language", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1289,9 +1187,9 @@ fn test_search_path_filter_empty_string_no_filtering() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "").unwrap()
 ;
-    add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello world", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1308,7 +1206,7 @@ fn test_search_path_filter_no_match_returns_empty() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1324,9 +1222,9 @@ fn test_search_path_filter_matches_all() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/x/a.pdf", "cs1", "hello", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/x/a.pdf", "cs1", "hello", "content", "").unwrap()
 ;
-    add_doc(&idx, &mut writer, 2, "/y/b.pdf", "cs2", "hello", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/y/b.pdf", "cs2", "hello", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1342,7 +1240,7 @@ fn test_search_path_filter_invalid_regex_returns_error() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1362,7 +1260,7 @@ fn test_search_offset_skips_results() {
 
     for i in 0..10 {
         let content = format!("document number {}", i);
-        add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
+        add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "").unwrap()
 ;
     }
     writer.commit().unwrap();
@@ -1384,7 +1282,7 @@ fn test_search_offset_beyond_total_returns_empty() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1403,7 +1301,7 @@ fn test_search_offset_and_limit_together() {
 
     for i in 0..20 {
         let content = format!("item {}", i);
-        add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
+        add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "").unwrap()
 ;
     }
     writer.commit().unwrap();
@@ -1435,7 +1333,7 @@ fn test_search_offset_zero_same_as_no_offset() {
 
     for i in 0..5 {
         let content = format!("item {}", i);
-        add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "", "").unwrap()
+        add_doc(&idx, &mut writer, i, &format!("/{}.pdf", i), &format!("cs{}", i), &content, &content, "").unwrap()
 ;
     }
     writer.commit().unwrap();
@@ -1456,7 +1354,7 @@ fn test_search_offset_with_path_filter() {
     for i in 0..6 {
         let sub = if i < 3 { "reports" } else { "invoices" };
         let content = format!("document {}", i);
-        add_doc(&idx, &mut writer, i, &format!("/{}/{}.pdf", sub, i), &format!("cs{}", i), &content, &content, "", "").unwrap()
+        add_doc(&idx, &mut writer, i, &format!("/{}/{}.pdf", sub, i), &format!("cs{}", i), &content, &content, "").unwrap()
 ;
     }
     writer.commit().unwrap();
@@ -1484,9 +1382,9 @@ fn test_search_phrase_query_matches_exact_phrase() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "The quick brown fox jumps over the lazy dog", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "The quick brown fox jumps over the lazy dog", "content", "").unwrap()
 ;
-    add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "quick brown fox jumps high", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "quick brown fox jumps high", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1505,7 +1403,7 @@ fn test_search_phrase_query_no_match_when_words_out_of_order() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1522,9 +1420,9 @@ fn test_phrase_learning_machine_does_not_match() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/test_phrase.pdf", "cs1", "support vector machine", "content", "", "").unwrap();
-    add_doc(&idx, &mut writer, 2, "/test_phrase.pdf", "cs2", "machine learning", "content", "", "").unwrap();
-    add_doc(&idx, &mut writer, 3, "/test_phrase.pdf", "cs3", "vector machine learning", "content", "", "").unwrap();
+    add_doc(&idx, &mut writer, 1, "/test_phrase.pdf", "cs1", "support vector machine", "content", "").unwrap();
+    add_doc(&idx, &mut writer, 2, "/test_phrase.pdf", "cs2", "machine learning", "content", "").unwrap();
+    add_doc(&idx, &mut writer, 3, "/test_phrase.pdf", "cs3", "vector machine learning", "content", "").unwrap();
     writer.commit().unwrap();
 
     // "learning machine" reversed — should NOT match any doc
@@ -1544,9 +1442,9 @@ fn test_phrase_extra_learning_machine_does_not_match() {
     let mut writer = idx.writer().unwrap();
 
     // Same content as test_phrase_extra.pdf
-    add_doc(&idx, &mut writer, 1, "/test_phrase_extra.pdf", "cse1", "machine learning", "content", "", "").unwrap();
-    add_doc(&idx, &mut writer, 2, "/test_phrase_extra.pdf", "cse2", "machine", "content", "", "").unwrap();
-    add_doc(&idx, &mut writer, 3, "/test_phrase_extra.pdf", "cse3", "machine learning", "content", "", "").unwrap();
+    add_doc(&idx, &mut writer, 1, "/test_phrase_extra.pdf", "cse1", "machine learning", "content", "").unwrap();
+    add_doc(&idx, &mut writer, 2, "/test_phrase_extra.pdf", "cse2", "machine", "content", "").unwrap();
+    add_doc(&idx, &mut writer, 3, "/test_phrase_extra.pdf", "cse3", "machine learning", "content", "").unwrap();
     writer.commit().unwrap();
 
     // "learning machine" reversed — should NOT match any doc
@@ -1569,7 +1467,7 @@ fn test_search_phrase_query_empty_string_returns_nothing() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1594,13 +1492,13 @@ fn test_raw_string_machine_learning_returns_exactly_2_pages() {
     let mut writer = idx.writer().unwrap();
 
     // Page 1: solo "machine" — no tiene "learning" después
-    add_doc(&idx, &mut writer, 1, "/book.pdf", "cs1", "machine", "raw", "", "").unwrap();
+    add_doc(&idx, &mut writer, 1, "/book.pdf", "cs1", "machine", "raw", "").unwrap();
     // Page 2: "machine learning" — frase exacta contigua
-    add_doc(&idx, &mut writer, 2, "/book.pdf", "cs2", "machine learning", "raw", "", "").unwrap();
+    add_doc(&idx, &mut writer, 2, "/book.pdf", "cs2", "machine learning", "raw", "").unwrap();
     // Page 3: "machine learning" — frase exacta contigua
-    add_doc(&idx, &mut writer, 3, "/book.pdf", "cs3", "machine learning", "raw", "", "").unwrap();
+    add_doc(&idx, &mut writer, 3, "/book.pdf", "cs3", "machine learning", "raw", "").unwrap();
     // Page 4: "the machine is learning fast" — palabras sueltas, NO contiguas
-    add_doc(&idx, &mut writer, 4, "/book.pdf", "cs4", "the machine is learning fast", "raw", "", "").unwrap();
+    add_doc(&idx, &mut writer, 4, "/book.pdf", "cs4", "the machine is learning fast", "raw", "").unwrap();
 
     writer.commit().unwrap();
 
@@ -1634,7 +1532,7 @@ fn test_search_fuzzy_matches_with_typo() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1651,7 +1549,7 @@ fn test_search_fuzzy_edit_distance_2_matches() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "algorithm", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "algorithm", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1668,7 +1566,7 @@ fn test_search_fuzzy_no_match_when_edit_distance_too_low() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "algorithm", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "algorithm", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1688,7 +1586,7 @@ fn test_search_fuzzy_empty_query_returns_nothing() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1704,9 +1602,9 @@ fn test_search_fuzzy_with_path_filter() {
     let idx = SearchIndex::new(&dir).unwrap();
     let mut writer = idx.writer().unwrap();
 
-    add_doc(&idx, &mut writer, 1, "/reports/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 1, "/reports/a.pdf", "cs1", "hello world", "content", "").unwrap()
 ;
-    add_doc(&idx, &mut writer, 2, "/invoices/b.pdf", "cs2", "hello world", "content", "", "").unwrap()
+    add_doc(&idx, &mut writer, 2, "/invoices/b.pdf", "cs2", "hello world", "content", "").unwrap()
 ;
     writer.commit().unwrap();
 
@@ -1718,30 +1616,6 @@ fn test_search_fuzzy_with_path_filter() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// --- Math symbol tokenizer ---
-
-    #[test]
-    fn test_math_symbols_are_searchable() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        // Use simple math expression with âˆ‘ (N-ARY SUMMATION) and âˆ« (INTEGRAL)
-        let text = "E = mc^2 and âˆ‘ and âˆ« symbols";
-        add_doc(&idx, &mut writer, 1, "/math.pdf", "cs1", text, text, "", "").unwrap()
-;
-        writer.commit().unwrap();
-
-        // Search for âˆ‘ â€” the "math" tokenizer should preserve it as a single token
-        let results_sum = idx.search("âˆ‘", 10, None, 0).unwrap();
-        assert_eq!(results_sum.len(), 1, "âˆ‘ should be searchable as a token");
-
-        let results_int = idx.search("âˆ«", 10, None, 0).unwrap();
-        assert_eq!(results_int.len(), 1, "âˆ« should be searchable as a token");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     // --- Dedup / resumability ---
 
     #[test]
@@ -1750,9 +1624,9 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "same", "old content", "old content", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "same", "old content", "old content", "").unwrap()
 ;
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "same", "new content", "new content", "", "").unwrap()
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "same", "new content", "new content", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -1770,9 +1644,9 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "content a", "content a", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "content a", "content a", "").unwrap()
 ;
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "content b", "content b", "", "").unwrap()
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "content b", "content b", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -1791,7 +1665,7 @@ fn test_search_fuzzy_with_path_filter() {
         let mut writer = idx.writer().unwrap();
 
         let text = "This is a very long document about cryptography.";
-        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", text, text, "", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", text, text, "").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search("cryptography", 10, None, 0).unwrap();
@@ -1884,9 +1758,9 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "").unwrap()
 ;
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "foo bar", "content", "", "").unwrap()
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "foo bar", "content", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -1933,7 +1807,7 @@ fn test_search_fuzzy_with_path_filter() {
 
         {
             let mut writer = idx.writer().unwrap();
-            add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "").unwrap()
 ;
             writer.commit().unwrap();
         }
@@ -1953,11 +1827,11 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         {
             let mut writer = idx.writer().unwrap();
-            add_doc(&idx, &mut writer, 1, "/reports/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 1, "/reports/a.pdf", "cs1", "hello", "hello", "").unwrap()
 ;
-            add_doc(&idx, &mut writer, 2, "/invoices/b.pdf", "cs2", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 2, "/invoices/b.pdf", "cs2", "hello", "hello", "").unwrap()
 ;
-            add_doc(&idx, &mut writer, 3, "/reports/c.pdf", "cs3", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 3, "/reports/c.pdf", "cs3", "hello", "hello", "").unwrap()
 ;
             writer.commit().unwrap();
         } // writer dropped, lock released
@@ -1979,9 +1853,9 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         {
             let mut writer = idx.writer().unwrap();
-            add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "").unwrap()
 ;
-            add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "world", "world", "", "").unwrap()
+            add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "world", "world", "").unwrap()
 ;
             writer.commit().unwrap();
         } // writer dropped, lock released
@@ -2004,8 +1878,8 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "running quickly", "running quickly", "", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "the cat runs fast", "the cat runs fast", "", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "running quickly", "running quickly", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "the cat runs fast", "the cat runs fast", "").unwrap();
         writer.commit().unwrap();
 
         // Exact match works
@@ -2025,7 +1899,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "the cat and the dog", "the cat and the dog", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "the cat and the dog", "the cat and the dog", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2042,7 +1916,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "the running cats", "the running cats", "", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "the running cats", "the running cats", "").unwrap();
         writer.commit().unwrap();
 
         // Phrase search matches exact phrase
@@ -2058,7 +1932,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world hello", "content", "eng", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world hello", "content", "eng").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2098,7 +1972,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "eng", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "eng").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2114,7 +1988,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "eng", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "content", "eng").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2130,7 +2004,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_stem("nonexistent", 10, None, 0, true).unwrap();
@@ -2145,7 +2019,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "", "").unwrap()
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "").unwrap()
 ;
         writer.commit().unwrap();
 
@@ -2178,7 +2052,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         {
             let mut writer = idx.writer().unwrap();
-            add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "").unwrap()
 ;
             writer.commit().unwrap();
         }
@@ -2199,7 +2073,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         {
             let mut writer = idx.writer().unwrap();
-            add_doc(&idx, &mut writer, 1, "/reports/a.pdf", "cs1", "hello", "hello", "", "").unwrap()
+            add_doc(&idx, &mut writer, 1, "/reports/a.pdf", "cs1", "hello", "hello", "").unwrap()
 ;
             writer.commit().unwrap();
         }
@@ -2245,7 +2119,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/en.pdf", "en1", "hello world", "hello world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/en.pdf", "en1", "hello world", "hello world", "eng").unwrap();
         writer.commit().unwrap();
 
         // English text should be searchable via content.
@@ -2261,7 +2135,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/plain.pdf", "cs1", "some text", "some text", "", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/plain.pdf", "cs1", "some text", "some text", "").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search("text", 10, None, 0).unwrap();
@@ -2278,7 +2152,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/en.pdf", "en1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/en.pdf", "en1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_in_field("hello", "content", 10, None, 0).unwrap();
@@ -2296,7 +2170,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/doc.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_in_field("world", "content", 10, None, 0).unwrap();
@@ -2311,8 +2185,8 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "running quickly", "raw", "", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "the cat runs fast", "raw", "", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "running quickly", "raw", "").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "the cat runs fast", "raw", "").unwrap();
         writer.commit().unwrap();
 
         // Without stemming, search is exact (no morphological variants).
@@ -2326,36 +2200,13 @@ fn test_search_fuzzy_with_path_filter() {
     }
 
     #[test]
-    fn test_search_in_field_math_tokens() {
-        let dir = unique_index_dir();
-        let idx = SearchIndex::new(&dir).unwrap();
-        let mut writer = idx.writer().unwrap();
-
-        add_doc(&idx, &mut writer, 1, "/sum.pdf", "m1",
-            "The sum $$\\sum_{i=1}^{n} i$$ is computed.",
-            "raw", "", r"display:\sum_{i=1}^{n} i").unwrap();
-        writer.commit().unwrap();
-
-        // MathAwareTokenizer splits "math_sum_limits" at '_', so query for
-        // individual sub-tokens like "sum" or "display" that appear in the
-        // token stream alongside the composed MATH_SUM_LIMITS construct.
-        let results = idx.search_in_field("display", "math_tokens", 10, None, 0).unwrap();
-        assert_eq!(results.len(), 1, "Individual token 'display' should be searchable in math_tokens");
-
-        let results2 = idx.search_in_field("sum", "math_tokens", 10, None, 0).unwrap();
-        assert_eq!(results2.len(), 1, "Sub-token 'sum' should be searchable in math_tokens");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn test_search_in_field_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         // With matching path filter
@@ -2375,9 +2226,9 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng", "").unwrap();
-        add_doc(&idx, &mut writer, 3, "/c.pdf", "cs3", "hello again", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "raw", "eng").unwrap();
+        add_doc(&idx, &mut writer, 3, "/c.pdf", "cs3", "hello again", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         // Limit
@@ -2403,7 +2254,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_in_field("nonexistent", "content", 10, None, 0).unwrap();
@@ -2418,7 +2269,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_in_field("", "content", 10, None, 0).unwrap();
@@ -2433,7 +2284,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         // content_raw is stored-only, not indexed. QueryParser requires an
@@ -2450,7 +2301,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/my-path.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/my-path.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         // path is a STRING field (indexed as raw). Search must match the full string.
@@ -2468,7 +2319,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         let result = idx.search_in_field("hello", "nonexistent_field", 10, None, 0);
@@ -2485,7 +2336,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         let result = idx.search_in_field("hello", "", 10, None, 0);
@@ -2500,7 +2351,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
 
-        add_doc(&idx, &mut writer, 42, "/a.pdf", "cs1", "hello world", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 42, "/a.pdf", "cs1", "hello world", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         // id is a u64 field; QueryParser should fail to parse a text query against it.
@@ -2529,7 +2380,7 @@ fn test_search_fuzzy_with_path_filter() {
         assert_eq!(idx.ram_buffer(), 1_000_000_000, "Custom ram_buffer should be 1GB");
         // Verify the writer uses the custom value (doesn't crash)
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng").unwrap();
         writer.commit().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2549,7 +2400,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer_with_num_threads(2).unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng").unwrap();
         writer.commit().unwrap();
         let results = idx.search("hello", 10, None, 0).unwrap();
         assert_eq!(results.len(), 1, "should index and find doc with writer_with_num_threads");
@@ -2563,7 +2414,7 @@ fn test_search_fuzzy_with_path_filter() {
         // Use a larger ram_buffer so per-thread memory stays above tantivy's 15MB minimum
         idx.set_ram_buffer(500_000_000);
         let mut writer = idx.writer_with_num_threads(16).unwrap();
-        add_doc(&idx, &mut writer, 1, "/big.pdf", "cs1", "test", "test", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/big.pdf", "cs1", "test", "test", "eng").unwrap();
         writer.commit().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2575,8 +2426,8 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "world hello", "world hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "world hello", "world hello", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
@@ -2593,7 +2444,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_weighted_fields("hello", &[], 10, None, 0).unwrap();
@@ -2607,8 +2458,8 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello", "eng", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello", "eng").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello there", "hello", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, Some("/a\\.pdf"), 0).unwrap();
@@ -2623,8 +2474,8 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "hello", "hello", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 1).unwrap();
@@ -2640,7 +2491,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         // ingested_at_field is None, so apply_recency_boost is a no-op
@@ -2657,7 +2508,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
@@ -2674,7 +2525,7 @@ fn test_search_fuzzy_with_path_filter() {
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
         // Use add_document (no ingested_at)
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng").unwrap();
         writer.commit().unwrap();
 
         // Temporarily clear ingested_at_field to simulate old index
@@ -2692,7 +2543,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "raw", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
@@ -2707,7 +2558,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_weighted_fields("", &[("content", 1.0)], 10, None, 0).unwrap();
@@ -2721,7 +2572,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng").unwrap();
         writer.commit().unwrap();
 
         // Nonexistent field names are silently skipped → no query clauses → empty
@@ -2736,8 +2587,8 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
-        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "world", "world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng").unwrap();
+        add_doc(&idx, &mut writer, 2, "/b.pdf", "cs2", "world", "world", "eng").unwrap();
         writer.commit().unwrap();
 
         // Empty query + path filter should still match via path regex
@@ -2753,7 +2604,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello", "hello", "eng").unwrap();
         writer.commit().unwrap();
 
         let results = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();
@@ -2770,7 +2621,7 @@ fn test_search_fuzzy_with_path_filter() {
         let dir = unique_index_dir();
         let idx = SearchIndex::new(&dir).unwrap();
         let mut writer = idx.writer().unwrap();
-        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng", "").unwrap();
+        add_doc(&idx, &mut writer, 1, "/a.pdf", "cs1", "hello world", "hello world", "eng").unwrap();
         writer.commit().unwrap();
 
         let results_low = idx.search_weighted_fields("hello", &[("content", 1.0)], 10, None, 0).unwrap();

@@ -447,10 +447,6 @@ pub unsafe extern "C" fn pdf_extract(
 
             let jobs = pdf_extractor::scanner::JobStore::open(&db)
                 .map_err(|e| { set_error(format!("Failed to open job store: {}", e)); ERR_GENERAL })?;
-            let writer = pdf_extractor::output::JsonlWriter::new(
-                &db.parent().unwrap_or(&db).join("output"),
-            )
-            .map_err(|e| { set_error(format!("Failed to create output writer: {}", e)); ERR_GENERAL })?;
             let metrics = Arc::new(pdf_extractor::metrics::Metrics::new());
             let indexer = pdf_extractor::indexer::Indexer::new(&idx)
                 .map_err(|e| { set_error(format!("{}", e)); ERR_GENERAL })?;
@@ -465,7 +461,6 @@ pub unsafe extern "C" fn pdf_extract(
 
             pdf_extractor::pipeline::run_pipeline(
                 Arc::new(jobs),
-                Arc::new(writer),
                 metrics.clone(),
                 &std::path::PathBuf::from(input),
                 Some(Arc::new(indexer)),
@@ -1898,12 +1893,12 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
 
         let si1 = SearchIndex::new(&idx1).unwrap();
         let mut w1 = si1.writer().unwrap();
-        si1.add_document(&mut w1, 1, "/doc1.pdf", "math algebra", Some("math algebra")).unwrap();
+        si1.add_document(&mut w1, 1, "/doc1.pdf", "math algebra").unwrap();
         w1.commit().unwrap();
 
         let si2 = SearchIndex::new(&idx2).unwrap();
         let mut w2 = si2.writer().unwrap();
-        si2.add_document(&mut w2, 1, "/doc2.pdf", "math algebra", Some("math algebra")).unwrap();
+        si2.add_document(&mut w2, 1, "/doc2.pdf", "math algebra").unwrap();
         w2.commit().unwrap();
 
         assert_eq!(unsafe { pdf_set_collection_boost(coll2 as u32, 2.0) }, 0);
@@ -2014,11 +2009,11 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         let idx_path = PathBuf::from(&idx);
         let search_index = SearchIndex::new(&idx_path).unwrap();
         let mut writer = search_index.writer().unwrap();
-        search_index.add_document(&mut writer, 1, "/doc1.pdf", "hello world", None).unwrap();
-        search_index.add_document(&mut writer, 2, "/doc2.pdf", "hello there", None).unwrap();
-        search_index.add_document(&mut writer, 3, "/doc3.pdf", "rust programming language", None).unwrap();
-        search_index.add_document(&mut writer, 4, "/doc4.pdf", "hello AND world boolean test", None).unwrap();
-        search_index.add_document(&mut writer, 5, "/doc5.pdf", "hello OR world", None).unwrap();
+        search_index.add_document(&mut writer, 1, "/doc1.pdf", "hello world").unwrap();
+        search_index.add_document(&mut writer, 2, "/doc2.pdf", "hello there").unwrap();
+        search_index.add_document(&mut writer, 3, "/doc3.pdf", "rust programming language").unwrap();
+        search_index.add_document(&mut writer, 4, "/doc4.pdf", "hello AND world boolean test").unwrap();
+        search_index.add_document(&mut writer, 5, "/doc5.pdf", "hello OR world").unwrap();
         writer.commit().unwrap();
         drop(writer);
         drop(search_index);

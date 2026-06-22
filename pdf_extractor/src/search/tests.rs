@@ -22,7 +22,7 @@ mod tests {
     }
 
     fn add_doc(idx: &SearchIndex, writer: &mut IndexWriter, id: i64, path: &str, text: &str) {
-        idx.add_document(writer, id, path, text, None).unwrap();
+        idx.add_document(writer, id, path, text).unwrap();
     }
 
     /// Creates an index with 5 documents:

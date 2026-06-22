@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use pdf_extractor::indexer::{Indexer, SearchIndex};
 use pdf_extractor::metrics::Metrics;
 use pdf_extractor::ocr::find_tesseract;
-use pdf_extractor::output::JsonlWriter;
 use pdf_extractor::pipeline::{run_ocr_post_processing, run_pipeline, PipelineConfig};
 use pdf_extractor::registry::CollectionRegistry;
 use pdf_extractor::scanner::JobStore;
@@ -942,12 +941,9 @@ impl PdfEngine {
 
         let db_path = self.get_registry()?.db_path(coll_id as i64);
         let index_path = self.get_registry()?.index_path(coll_id as i64);
-        let output_path = self.get_registry()?.output_path(coll_id as i64);
 
         let jobs = Arc::new(JobStore::open(&db_path)
             .map_err(|e| { set_error(format!("Failed to open job store: {}", e)); ERR_GENERAL })?);
-        let writer = Arc::new(JsonlWriter::new(&output_path)
-            .map_err(|e| { set_error(format!("Failed to create output writer: {}", e)); ERR_GENERAL })?);
         let metrics = Arc::new(Metrics::new());
 
         let no_index = (flags & 2) != 0;
@@ -995,7 +991,6 @@ impl PdfEngine {
         let indexer_for_ocr = indexer.clone();
         run_pipeline(
             Arc::clone(&jobs),
-            Arc::clone(&writer),
             Arc::clone(&metrics),
             &canonical,
             indexer,
@@ -1011,7 +1006,6 @@ impl PdfEngine {
         }
 
         if (flags & 1) != 0 {
-            drop(writer);
 
             let tesseract_path = self.config.tesseract_path.clone()
                 .map(PathBuf::from)
@@ -1038,7 +1032,6 @@ impl PdfEngine {
                 jobs,
                 indexer_for_ocr,
                 &ocr_config,
-                Some(output_path),
                 num_workers,
                 Some(cancel_token.clone()),
                 self.config.log_cb,

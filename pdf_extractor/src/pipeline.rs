@@ -26,7 +26,7 @@ use crate::indexer::align_offsets_to_tantivy;
 use crate::indexer::Indexer;
 use crate::metrics::Metrics;
 use crate::ocr;
-use crate::output::{DocumentRecord, JsonlWriter};
+use crate::output::DocumentRecord;
 use crate::scanner::{scan_directory, JobStore};
 use crate::worker_ipc::{frame_crc32, WorkerFrame};
 
@@ -180,13 +180,12 @@ where
 
 pub fn run_pipeline(
     jobs: Arc<JobStore>,
-    writer: Arc<JsonlWriter>,
     metrics: Arc<Metrics>,
     input: &PathBuf,
     indexer: Option<Arc<Indexer>>,
     config: PipelineConfig,
 ) -> Result<()> {
-    PipelineOrchestrator::new(config, jobs, writer, metrics, input.clone(), indexer).run()
+    PipelineOrchestrator::new(config, jobs, metrics, input.clone(), indexer).run()
 }
 
 fn indexer_thread(
@@ -328,7 +327,6 @@ fn flush_batch(
             record.id,
             &record.path,
             &record.text,
-            None,
         ) {
             add_time += add_start.elapsed();
             log_msg(log_cb, &format!(
@@ -409,13 +407,12 @@ pub fn run_ocr_post_processing(
     jobs: Arc<JobStore>,
     indexer: Option<Arc<Indexer>>,
     ocr_config: &ocr::OcrConfig,
-    output_path: Option<PathBuf>,
     num_workers_override: Option<usize>,
     cancel_flag: Option<Arc<AtomicBool>>,
     log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) -> Result<u64> {
     let num_workers = resolve_ocr_workers(num_workers_override);
-    OcrPipelineActor::new(jobs, indexer, ocr_config, output_path, num_workers, cancel_flag, log_cb).run()
+    OcrPipelineActor::new(jobs, indexer, ocr_config, num_workers, cancel_flag, log_cb).run()
 }
 
 /// Attempt OCR on a PDF by extracting pages as images, preprocessing, and running Tesseract.
@@ -1192,11 +1189,6 @@ enum IndexerMsg {
     Index(DocumentRecord),
 }
 
-/// Messages for the JSONL writer actor.
-enum WriterMsg {
-    Write(Vec<u8>),
-}
-
 /// Format a slice of batch sizes into a compact human-readable string.
 /// Examples: `[5/2/3]`, `[8]`, `[0/0/0]`
 fn format_batch_dist(sizes: &[usize]) -> String {
@@ -1439,45 +1431,15 @@ impl Actor for IndexerActor {
     }
 }
 
-/// Receives pre-serialized JSONL bytes and writes them to disk.
-struct JsonlWriterActor {
-    rx: crossbeam_channel::Receiver<WriterMsg>,
-    writer: Arc<JsonlWriter>,
-    log_cb: Option<extern "C" fn(*const u8, u32)>,
-}
-
-impl JsonlWriterActor {
-    fn run(self) {
-        for msg in &self.rx {
-            let WriterMsg::Write(json_bytes) = msg;
-            if let Err(e) = self.writer.write_json_bytes(&json_bytes) {
-                log_msg(self.log_cb, &format!("[jsonl-writer] write failed: {}", e));
-                break;
-            }
-        }
-        let _ = self.writer.flush();
-    }
-}
-
-impl Actor for JsonlWriterActor {
-    type Msg = WriterMsg;
-    fn handle(&mut self, msg: WriterMsg) -> Result<()> {
-        let WriterMsg::Write(json_bytes) = msg;
-        self.writer.write_json_bytes(&json_bytes)?;
-        Ok(())
-    }
-}
-
 /// Orchestrates the entire extraction pipeline:
 /// 1. Scans directory, creates channels
-/// 2. Spawns ScannerActor, WorkerPoolActor, IndexerActor, JsonlWriterActor
+/// 2. Spawns ScannerActor, WorkerPoolActor, IndexerActor
 /// 3. Runs the consumer loop (blocking, in orchestrator's thread)
 /// 4. Handles cancel, joins all actors, cleans up
 pub struct PipelineOrchestrator {
     config: PipelineConfig,
     progress_cb: Option<Box<dyn Fn(u64, u64) + Send>>,
     jobs: Arc<JobStore>,
-    writer: Arc<JsonlWriter>,
     metrics: Arc<Metrics>,
     input: PathBuf,
     indexer: Option<Arc<Indexer>>,
@@ -1487,7 +1449,6 @@ impl PipelineOrchestrator {
     pub fn new(
         mut config: PipelineConfig,
         jobs: Arc<JobStore>,
-        writer: Arc<JsonlWriter>,
         metrics: Arc<Metrics>,
         input: PathBuf,
         indexer: Option<Arc<Indexer>>,
@@ -1500,7 +1461,6 @@ impl PipelineOrchestrator {
             },
             progress_cb,
             jobs,
-            writer,
             metrics,
             input,
             indexer,
@@ -1511,31 +1471,12 @@ impl PipelineOrchestrator {
         &self,
         record: DocumentRecord,
         result_rx: &crossbeam_channel::Receiver<DocumentRecord>,
-        jsonl_ref: &ActorRef<WriterMsg>,
         index_ref: Option<&ActorRef<IndexerMsg>>,
-        writer_jsonl_time: &mut Duration,
-        writer_docs: &mut u64,
         total_pending: u64,
         progress_throttle: u64,
         log_cb: Option<extern "C" fn(*const u8, u32)>,
     ) -> bool {
         self.metrics.set_result_queue_depth(result_rx.len() as u64);
-        let write_start = Instant::now();
-        let mut json_bytes = match serde_json::to_vec(&record) {
-            Ok(j) => j,
-            Err(e) => {
-                self.jobs.mark_error(record.id, &format!("json serialize failed: {}", e)).ok();
-                self.metrics.increment_errored();
-                return true;
-            }
-        };
-        json_bytes.push(b'\n');
-        if jsonl_ref.send(WriterMsg::Write(json_bytes)).is_err() {
-            log_msg(log_cb, "[pipeline] jsonl-writer channel disconnected");
-            return false;
-        }
-        *writer_jsonl_time += write_start.elapsed();
-        *writer_docs += 1;
         let processed = self.metrics.increment_processed();
 
         if record.file_extraction_ms > 0 {
@@ -1597,9 +1538,7 @@ impl PipelineOrchestrator {
         let (task_tx, task_rx) = bounded::<ExtractorMsg>(cap);
         let (result_tx, result_rx) = bounded::<DocumentRecord>(cap);
         let (index_tx, index_rx) = bounded::<IndexerMsg>(cap);
-        let (jsonl_tx, jsonl_rx) = bounded::<WriterMsg>(cap);
 
-        let jsonl_ref = ActorRef::new(jsonl_tx.clone());
         let index_ref = self.indexer.as_ref().map(|_| ActorRef::new(index_tx.clone()));
 
         let num_workers = self.config.extract_workers();
@@ -1668,31 +1607,18 @@ impl PipelineOrchestrator {
                 .expect("Failed to spawn indexer thread")
         });
 
-        // ── Spawn JsonlWriterActor ──
-        let writer_ref = Arc::clone(&self.writer);
-        let writer_handle = thread::Builder::new()
-            .name("jsonl-writer".into())
-            .spawn(move || {
-                JsonlWriterActor { rx: jsonl_rx, writer: writer_ref, log_cb }.run();
-            })
-            .expect("Failed to spawn writer thread");
-
         // ── Consumer loop ──
         let extraction_start = Instant::now();
         let total_pending = pending as u64;
         let is_cancelled = || self.config.cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed));
         let progress_throttle = 50u64;
-        let writer_start = Instant::now();
-        let mut writer_jsonl_time = Duration::ZERO;
-        let mut writer_docs: u64 = 0;
 
         // Phase 1: normal blocking receive, check cancel between records
         for record in &result_rx {
             if is_cancelled() {
                 break;
             }
-            if !self.process_record(record, &result_rx, &jsonl_ref, index_ref.as_ref(),
-                &mut writer_jsonl_time, &mut writer_docs,
+            if !self.process_record(record, &result_rx, index_ref.as_ref(),
                 total_pending, progress_throttle, log_cb)
             {
                 break;
@@ -1704,8 +1630,7 @@ impl PipelineOrchestrator {
             loop {
                 match result_rx.try_recv() {
                     Ok(record) => {
-                        self.process_record(record, &result_rx, &jsonl_ref, index_ref.as_ref(),
-                            &mut writer_jsonl_time, &mut writer_docs,
+                        self.process_record(record, &result_rx, index_ref.as_ref(),
                             total_pending, progress_throttle, log_cb);
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -1718,8 +1643,7 @@ impl PipelineOrchestrator {
             loop {
                 match result_rx.try_recv() {
                     Ok(record) => {
-                        self.process_record(record, &result_rx, &jsonl_ref, index_ref.as_ref(),
-                            &mut writer_jsonl_time, &mut writer_docs,
+                        self.process_record(record, &result_rx, index_ref.as_ref(),
                             total_pending, progress_throttle, log_cb);
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -1732,11 +1656,8 @@ impl PipelineOrchestrator {
 
         // ── Shutdown remaining actors ──
         drop(index_tx);
-        drop(jsonl_tx);
-        drop(jsonl_ref);
         drop(index_ref);
         scanner_handle.join().expect("Scanner panicked");
-        writer_handle.join().expect("Writer panicked");
         if let Some(h) = indexer_handle {
             h.join().expect("Indexer panicked");
         }
@@ -1745,12 +1666,10 @@ impl PipelineOrchestrator {
         let extract_elapsed = extraction_start.elapsed();
         let total_elapsed = pipeline_start.elapsed();
         log_msg(log_cb, &format!(
-            "[timing] scan={:.3}s extract={:.3}s total={:.3}s — {} docs in JSONL ({:.3}s serialize)",
+            "[timing] scan={:.3}s extract={:.3}s total={:.3}s",
             scan_elapsed.as_secs_f64(),
             extract_elapsed.as_secs_f64(),
             total_elapsed.as_secs_f64(),
-            writer_docs,
-            writer_jsonl_time.as_secs_f64(),
         ));
 
         self.jobs.reprocess_extracting()?;
@@ -1777,12 +1696,11 @@ impl PipelineOrchestrator {
 /// Creates internal producer/worker/consumer threads:
 /// - Producer fetches OCR-needed docs from DB in batches
 /// - N workers run Tesseract on rendered PDF page images
-/// - Consumer writes JSONL and re-indexes into Tantivy
+/// - Consumer re-indexes OCR results into Tantivy
 pub struct OcrPipelineActor {
     jobs: Arc<JobStore>,
     indexer: Option<Arc<Indexer>>,
     ocr_config: ocr::OcrConfig,
-    output_path: Option<PathBuf>,
     num_workers: usize,
     cancel_flag: Option<Arc<AtomicBool>>,
     log_cb: Option<extern "C" fn(*const u8, u32)>,
@@ -1793,7 +1711,6 @@ impl OcrPipelineActor {
         jobs: Arc<JobStore>,
         indexer: Option<Arc<Indexer>>,
         ocr_config: &ocr::OcrConfig,
-        output_path: Option<PathBuf>,
         num_workers: usize,
         cancel_flag: Option<Arc<AtomicBool>>,
         log_cb: Option<extern "C" fn(*const u8, u32)>,
@@ -1807,7 +1724,6 @@ impl OcrPipelineActor {
                 max_dim: ocr_config.max_dim,
                 language: ocr_config.language.clone(),
             },
-            output_path,
             num_workers,
             cancel_flag,
             log_cb,
@@ -1830,18 +1746,11 @@ impl OcrPipelineActor {
             pending, self.num_workers
         ));
 
-        let jsonl_writer = if let Some(ref out_path) = self.output_path {
-            Some(Arc::new(JsonlWriter::new(out_path)?))
-        } else {
-            None
-        };
-
         let (ocr_tx, ocr_rx) = bounded::<(i64, String, String)>(100);
         let (result_tx, result_rx) = bounded::<(i64, String, String, String)>(100);
 
         let consumer_cancel = self.cancel_flag.clone();
         let consumer_jobs = Arc::clone(&self.jobs);
-        let consumer_writer = jsonl_writer.clone();
         let consumer_indexer = self.indexer.clone();
         let consumer_log_cb = self.log_cb;
         let consumer_handle = thread::spawn(move || {
@@ -1856,7 +1765,7 @@ impl OcrPipelineActor {
                 result.ok()
             });
 
-            for (id, path, checksum, ocr_text) in &result_rx {
+            for (id, path, _checksum, ocr_text) in &result_rx {
                 if consumer_cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
                     break;
                 }
@@ -1868,31 +1777,11 @@ impl OcrPipelineActor {
                 ocr_processed += 1;
                 consumer_jobs.mark_ocr_attempt(id, true, None, max_retries).ok();
 
-                if let Some(ref writer) = consumer_writer {
-                    let record = DocumentRecord {
-                        id,
-                        path: path.clone(),
-                        checksum: checksum.clone(),
-                        ocr_flag: false,
-                        text: ocr_text.clone(),
-                        word_positions: Vec::new(),
-                        file_extraction_ms: 0,
-                        page_count: 0,
-                    };
-                    if let Err(e) = writer.write_record(&record) {
-                        log_msg(consumer_log_cb, &format!(
-                            "[ocr-consumer] JSONL write failed for id={}: {}", id, e
-                        ));
-                    }
-                }
-
                 if let (Some(idx), Some(w)) = (consumer_indexer.as_ref(), index_writer.as_mut()) {
                     let term = tantivy::Term::from_field_u64(idx.search_index().id_field, id as u64);
                     w.delete_term(term);
-                    let math_source = crate::math_tokenizer::extract_math_source(&ocr_text);
                     if let Err(e) = idx.search_index().add_document(
                         w, id, &path, &ocr_text,
-                        math_source.as_deref(),
                     ) {
                         log_msg(consumer_log_cb, &format!(
                             "[ocr-consumer] add_document_with_ts failed for id={} path='{}': {}",
@@ -2641,7 +2530,6 @@ mod tests {
     #[test]
     fn test_run_pipeline_requires_worker_path() {
         use crate::metrics::Metrics;
-        use crate::output::JsonlWriter;
         use crate::scanner::scan_directory;
 
         let tmp = std::env::temp_dir().join("pdf_extractor_test_req_worker");
@@ -2651,7 +2539,6 @@ mod tests {
         std::fs::write(books.join("dummy.pdf"), b"dummy").unwrap();
 
         let jobs = Arc::new(JobStore::open_in_memory().unwrap());
-        let writer = Arc::new(JsonlWriter::new(&tmp.join("out.jsonl")).unwrap());
         let metrics = Arc::new(Metrics::new());
 
         scan_directory(&jobs, &books).unwrap();
@@ -2661,7 +2548,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = run_pipeline(jobs, Arc::clone(&writer), metrics, &books, None, config);
+        let result = run_pipeline(jobs, metrics, &books, None, config);
         assert!(result.is_err(), "run_pipeline should error when worker_path=None");
         let err = format!("{}", result.unwrap_err());
         assert!(

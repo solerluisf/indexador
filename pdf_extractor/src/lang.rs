@@ -23,7 +23,7 @@ pub fn tokenizer_for_lang(lang: &str) -> &'static str {
         "cmn" | "zh" => "zh",       // Chinese (Jieba)
         "kor" | "ko" => "ko",       // Korean
         "tha" | "th" => "th",       // Thai
-        _ => "math",                // Default: the existing math tokenizer
+        _ => "multilang",           // Default: the multilang tokenizer
     }
 }
 
@@ -71,8 +71,8 @@ mod tests {
 
     #[test]
     fn test_tokenizer_for_unknown() {
-        assert_eq!(tokenizer_for_lang("eng"), "math");
-        assert_eq!(tokenizer_for_lang("deu"), "math");
-        assert_eq!(tokenizer_for_lang(""), "math");
+        assert_eq!(tokenizer_for_lang("eng"), "multilang");
+        assert_eq!(tokenizer_for_lang("deu"), "multilang");
+        assert_eq!(tokenizer_for_lang(""), "multilang");
     }
 }
