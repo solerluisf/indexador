@@ -114,7 +114,7 @@ impl SearchIndex {
 
     pub fn add_document(
         &self,
-        writer: &mut IndexWriter,
+        writer: &IndexWriter,
         id: i64,
         path: &str,
         text: &str,
@@ -892,10 +892,10 @@ pub fn tokenize_with_math(text: &str) -> Vec<(usize, String)> {
 /// This is O(N) lockstep alignment. The `text` parameter is kept only for a
 /// `debug_assert_eq!` sanity check that fires when Tantivy token count diverges
 /// from WP count.
-pub fn align_offsets_to_tantivy(
-    text: &str,
-    word_positions: &[crate::extractor::WordPosition],
-) -> Vec<(usize, crate::extractor::WordPosition)> {
+pub fn align_offsets_to_tantivy<'a>(
+    _text: &str,
+    word_positions: &'a [crate::extractor::WordPosition],
+) -> Vec<(usize, &'a crate::extractor::WordPosition)> {
     let mut result = Vec::with_capacity(word_positions.len());
     let mut pos = 0usize;
 
@@ -903,7 +903,7 @@ pub fn align_offsets_to_tantivy(
         if wp.text.is_empty() {
             continue;
         }
-        result.push((pos, wp.clone()));
+        result.push((pos, wp));
         pos += 1;
     }
 
@@ -911,7 +911,7 @@ pub fn align_offsets_to_tantivy(
     // los tokens de Tantivy. Solo en debug (cero overhead en release).
     #[cfg(debug_assertions)]
     {
-        let tantivy_count = tokenize_with_math(text).len();
+        let tantivy_count = tokenize_with_math(_text).len();
         if tantivy_count != pos {
             eprintln!(
                 "[LOCKSTEP] WARNING: Tantivy token count ({}) != WP count ({}). \

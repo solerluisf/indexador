@@ -146,6 +146,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         RelayoutPageContainers();
         LayoutCanvas();
+        UpdateVisiblePages();
     }
 
     private void ComputeRenderDpi()
@@ -265,7 +266,10 @@ public partial class SearchTab : Page, IPdfRenderingService
         if (_zoomMode >= 3)
             UpdateDpiAndRefresh();
         else
+        {
             RelayoutPageContainers();
+            UpdateVisiblePages();
+        }
     }
 
     private void UpdateVisiblePages()
@@ -328,6 +332,7 @@ public partial class SearchTab : Page, IPdfRenderingService
             Canvas.SetTop(elem.Panel, GetPageY(pageIdx));
 
         }
+        LayoutCanvas();
     }
 
     private void RemovePageElement(int pageIdx)
@@ -404,6 +409,7 @@ public partial class SearchTab : Page, IPdfRenderingService
                 Source = renderItem.PageImage,
                 Stretch = Stretch.Uniform,
                 Width = displayW,
+                Height = displayH,
                 HorizontalAlignment = HorizontalAlignment.Center,
             };
 
@@ -841,8 +847,8 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private void DoBuildPageData()
     {
-        _totalPages = _viewerMediator.Renderer.GetPageCount();
         var allDims = _viewerMediator.Renderer.GetAllPageDimensions();
+        _totalPages = allDims.Length;
         _pageDimensions = allDims;
 
         _viewerMediator.Renderer.TargetDpi = _renderDpi;

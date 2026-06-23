@@ -24,6 +24,7 @@ fn cmd_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command
 
 use crate::indexer::align_offsets_to_tantivy;
 use crate::indexer::Indexer;
+use tantivy::merge_policy::LogMergePolicy;
 use crate::metrics::Metrics;
 use crate::ocr;
 use crate::output::DocumentRecord;
@@ -60,7 +61,7 @@ fn align_pool() -> &'static rayon::ThreadPool {
 const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 const BATCH_SIZE: i64 = 30;
 const DEFAULT_INDEXER_BATCH_SIZE: usize = 500;
-const DEFAULT_COMMIT_INTERVAL: u64 = 50000;
+const DEFAULT_COMMIT_INTERVAL: u64 = 5000;
 const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 30;
 const RESERVOIR_FACTOR: usize = 4;
 
@@ -144,7 +145,7 @@ impl PipelineConfig {
     pub fn indexer_threads(&self) -> usize {
         self.num_indexer_threads
             .map(|v| std::cmp::max(1, v))
-            .unwrap_or_else(|| num_cpus::get())
+            .unwrap_or_else(|| std::cmp::min(num_cpus::get(), 4))
     }
 
     pub fn reservoir_size(&self) -> usize {
@@ -213,6 +214,11 @@ fn indexer_thread(
     let mut doc_count: u64 = 0;
     let mut last_commit = Instant::now();
     let mut writer = index_writer;
+
+    // Keep a single segment so delete_term is fast — no per-segment scans.
+    let mut merge_policy = LogMergePolicy::default();
+    merge_policy.set_min_num_segments(1);
+    writer.set_merge_policy(Box::new(merge_policy));
     let mut total_flush_time = Duration::ZERO;
     let mut flush_count: u64 = 0;
 
@@ -225,7 +231,7 @@ fn indexer_thread(
                 if buf.len() >= batch_size {
                     let batch: Vec<DocumentRecord> = buf.drain(..).collect();
                     let flush_start = Instant::now();
-                    flush_batch(&mut writer, indexer, &mut done_ids, &batch, log_cb);
+                    flush_batch(&writer, indexer, &mut done_ids, &batch, log_cb);
                     let flush_elapsed = flush_start.elapsed();
                     total_flush_time += flush_elapsed;
                     flush_count += 1;
@@ -240,7 +246,7 @@ fn indexer_thread(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 if !buf.is_empty() {
                     let batch: Vec<DocumentRecord> = buf.drain(..).collect();
-                    flush_batch(&mut writer, indexer, &mut done_ids, &batch, log_cb);
+                    flush_batch(&writer, indexer, &mut done_ids, &batch, log_cb);
                 }
                 break;
             }
@@ -303,7 +309,7 @@ fn indexer_thread(
 }
 
 fn flush_batch(
-    writer: &mut tantivy::IndexWriter,
+    writer: &tantivy::IndexWriter,
     indexer: &Indexer,
     done_ids: &mut Vec<(i64, bool, String)>,
     batch: &[DocumentRecord],
@@ -316,30 +322,42 @@ fn flush_batch(
     let mut add_time = Duration::ZERO;
     let mut align_time = Duration::ZERO;
 
-    // Phase 1a: add documents to Tantivy (sequential, touches IndexWriter).
-    // Collect IDs of successful docs and work items for parallel alignment.
+    // Phase 1a: add documents to Tantivy in parallel.
+    // Tantivy's IndexWriter::add_document is thread-safe (takes &self),
+    // so we can submit all docs concurrently via rayon.
     let mut pending_done: Vec<(i64, bool, String)> = Vec::new();
     let mut pending_align: Vec<(i64, &str, &[crate::extractor::WordPosition])> = Vec::new();
-    for record in batch {
-        let add_start = Instant::now();
-        if let Err(e) = indexer.search_index().add_document(
-            writer,
-            record.id,
-            &record.path,
-            &record.text,
-        ) {
-            add_time += add_start.elapsed();
-            log_msg(log_cb, &format!(
-                "[flush_batch] add_document failed for id={} path='{}': {}",
-                record.id, record.path, e
-            ));
-        } else {
-            add_time += add_start.elapsed();
-            indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            pending_done.push((record.id, record.ocr_flag, record.checksum.clone()));
 
-            if !record.word_positions.is_empty() {
-                pending_align.push((record.id, &record.text, &record.word_positions));
+    let add_start = Instant::now();
+    let results: Vec<(&DocumentRecord, anyhow::Result<()>)> = batch
+        .par_iter()
+        .map(|record| {
+            let r = indexer.search_index().add_document(
+                writer,
+                record.id,
+                &record.path,
+                &record.text,
+            );
+            (record, r)
+        })
+        .collect();
+    add_time += add_start.elapsed();
+
+    for (record, result) in results {
+        match result {
+            Ok(()) => {
+                indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                pending_done.push((record.id, record.ocr_flag, record.checksum.clone()));
+
+                if !record.word_positions.is_empty() {
+                    pending_align.push((record.id, &record.text, &record.word_positions));
+                }
+            }
+            Err(e) => {
+                log_msg(log_cb, &format!(
+                    "[flush_batch] add_document failed for id={} path='{}': {}",
+                    record.id, record.path, e
+                ));
             }
         }
     }
@@ -349,7 +367,7 @@ fn flush_batch(
     // (producer, IPC reader, writer) on large batches.  The ALIGN_POOL is
     // capped to at most 4 threads, balancing throughput vs memory pressure.
     let align_start = Instant::now();
-    let positions_to_store: Vec<(i64, Vec<(usize, crate::extractor::WordPosition)>)> = align_pool()
+    let positions_to_store: Vec<(i64, Vec<(usize, &crate::extractor::WordPosition)>)> = align_pool()
         .install(|| {
             pending_align
                 .par_iter()
@@ -366,12 +384,10 @@ fn flush_batch(
 
     let phase2_start = Instant::now();
 
-    // Phase 2: store word positions (SQLite I/O).
+    // Phase 2: store word positions (SQLite I/O, batched in one transaction).
     if !positions_to_store.is_empty() {
         if let Ok(pos_store) = indexer.position_store.lock() {
-            for (id, aligned) in &positions_to_store {
-                let _ = pos_store.store_positions(*id, aligned);
-            }
+            let _ = pos_store.store_positions_batch(&positions_to_store);
         }
     }
 
@@ -2927,5 +2943,93 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.reservoir_size(), 200);
+    }
+
+    // ---------------------------------------------------------------------------
+    // flush_batch micro-benchmark
+    // ---------------------------------------------------------------------------
+    //
+    // Generates synthetic DocumentRecords and runs flush_batch, reporting
+    // per-phase timings (add / align / store).  Useful for tracking indexing
+    // performance changes.
+    //
+    // Run with:
+    //   cargo test -p pdf_extractor -- bench_flush_batch --nocapture
+    //
+    // Adjust N / WORDS_PER_DOC to match production scale.
+    //
+    // NOTE: on the reference machine (Ryzen 5950X, NVMe SSD), N=500 with
+    // 5000 words/doc produces ~2.5M total word positions and takes ~30-270s
+    // depending on the current code path.
+
+    #[test]
+    fn bench_flush_batch() {
+        const N: usize = 100; // override to 500 for production-scale measurement
+        const WORDS_PER_DOC: usize = 5000;
+        const INDEXER_THREADS: usize = 4;
+
+        let lorem = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum";
+        let words: Vec<&str> = lorem.split_whitespace().collect();
+
+        eprintln!("\n=== Generating {} synthetic docs ({} words each, {} total words) ===",
+            N, WORDS_PER_DOC, N * WORDS_PER_DOC);
+
+        let gen_start = Instant::now();
+        let batch: Vec<DocumentRecord> = (0..N as i64).map(|id| {
+            let mut text = String::with_capacity(WORDS_PER_DOC * 7);
+            let mut word_positions = Vec::with_capacity(WORDS_PER_DOC);
+
+            for i in 0..WORDS_PER_DOC {
+                let word = words[i % words.len()];
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(word);
+
+                let page = 1 + (i / 250) as u32;
+                let line = (i % 250) / 8;
+                let col = i % 8;
+                let x_min = 50.0 + col as f32 * 70.0;
+                let y_min = 750.0 - line as f32 * 15.0;
+                word_positions.push(crate::extractor::WordPosition {
+                    page,
+                    x_min,
+                    y_min,
+                    x_max: x_min + 60.0,
+                    y_max: y_min + 12.0,
+                    text: word.to_string(),
+                });
+            }
+
+            DocumentRecord {
+                id,
+                path: format!("/doc_{}.pdf", id),
+                checksum: format!("cs{}", id),
+                ocr_flag: false,
+                text,
+                word_positions,
+                file_extraction_ms: 0,
+                page_count: 20,
+            }
+        }).collect();
+        eprintln!("Generation: {:.3}s", gen_start.elapsed().as_secs_f64());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let indexer = crate::indexer::Indexer::new(tmp.path()).unwrap();
+        let writer = indexer.search_index().writer_with_num_threads(INDEXER_THREADS).unwrap();
+
+        let mut done_ids: Vec<(i64, bool, String)> = Vec::new();
+
+        eprintln!("=== Running flush_batch (N={}) ===", N);
+        let flush_start = Instant::now();
+        flush_batch(&writer, &indexer, &mut done_ids, &batch, None);
+        let flush_elapsed = flush_start.elapsed();
+
+        assert_eq!(done_ids.len(), N);
+
+        eprintln!("=== Results ===");
+        eprintln!("  Total:    {:.3}s", flush_elapsed.as_secs_f64());
+        eprintln!("  Per doc:  {:.3}s", flush_elapsed.as_secs_f64() / N as f64);
+        eprintln!("  Docs/s:   {:.1}", N as f64 / flush_elapsed.as_secs_f64());
     }
 }
