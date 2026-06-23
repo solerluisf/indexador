@@ -322,28 +322,22 @@ fn flush_batch(
     let mut add_time = Duration::ZERO;
     let mut align_time = Duration::ZERO;
 
-    // Phase 1a: add documents to Tantivy in parallel.
-    // Tantivy's IndexWriter::add_document is thread-safe (takes &self),
-    // so we can submit all docs concurrently via rayon.
+    // Phase 1a: add documents to Tantivy sequentially.
+    // Tantivy's IndexWriter::add_document is internally serialized — all calls
+    // contend for the same internal pipeline lock.  Parallelising this with
+    // rayon creates lock contention that *slows down* indexing (more threads
+    // just means more waiting + cache bouncing).  A plain for-loop avoids this.
     let mut pending_done: Vec<(i64, bool, String)> = Vec::new();
     let mut pending_align: Vec<(i64, &str, &[crate::extractor::WordPosition])> = Vec::new();
 
     let add_start = Instant::now();
-    let results: Vec<(&DocumentRecord, anyhow::Result<()>)> = batch
-        .par_iter()
-        .map(|record| {
-            let r = indexer.search_index().add_document(
-                writer,
-                record.id,
-                &record.path,
-                &record.text,
-            );
-            (record, r)
-        })
-        .collect();
-    add_time += add_start.elapsed();
-
-    for (record, result) in results {
+    for record in batch {
+        let result = indexer.search_index().add_document(
+            writer,
+            record.id,
+            &record.path,
+            &record.text,
+        );
         match result {
             Ok(()) => {
                 indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -361,6 +355,7 @@ fn flush_batch(
             }
         }
     }
+    add_time += add_start.elapsed();
 
     // Phase 1b: align offsets in parallel using a dedicated small thread-pool.
     // Using the global rayon pool here could starve other pipeline components
