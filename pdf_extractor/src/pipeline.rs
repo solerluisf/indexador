@@ -62,7 +62,9 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 const BATCH_SIZE: i64 = 30;
 const DEFAULT_INDEXER_BATCH_SIZE: usize = 500;
 const DEFAULT_COMMIT_INTERVAL: u64 = 5000;
-const DEFAULT_COMMIT_TIMEOUT_SECS: u64 = 30;
+/// Polling interval for the indexer thread's channel receive.
+/// Keeps the loop responsive to shutdown without forcing spurious commits.
+const POLL_INTERVAL_MS: u64 = 500;
 const RESERVOIR_FACTOR: usize = 4;
 
 pub struct PipelineConfig {
@@ -131,9 +133,9 @@ impl PipelineConfig {
     }
 
     pub fn commit_to(&self) -> u64 {
-        self.commit_timeout
-            .map(|v| if v == 0 { 1 } else { v })
-            .unwrap_or(DEFAULT_COMMIT_TIMEOUT_SECS)
+        // Deprecated — time-based commits are no longer used internally.
+        // The field is kept for API backward compatibility only.
+        self.commit_timeout.unwrap_or(0)
     }
 
     pub fn channel_cap(&self) -> usize {
@@ -196,7 +198,6 @@ fn indexer_thread(
     metrics: &Metrics,
     batch_size: usize,
     commit_interval: u64,
-    commit_timeout: u64,
     num_threads: usize,
     log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) {
@@ -212,7 +213,6 @@ fn indexer_thread(
     let mut buf: Vec<DocumentRecord> = Vec::with_capacity(batch_size);
     let mut done_ids: Vec<(i64, bool, String)> = Vec::new();
     let mut doc_count: u64 = 0;
-    let mut last_commit = Instant::now();
     let mut writer = index_writer;
 
     // Keep a single segment so delete_term is fast — no per-segment scans.
@@ -223,8 +223,7 @@ fn indexer_thread(
     let mut flush_count: u64 = 0;
 
     loop {
-        let timeout = Duration::from_secs(commit_timeout);
-        let result = rx.recv_timeout(timeout);
+        let result = rx.recv_timeout(Duration::from_millis(POLL_INTERVAL_MS));
         match result {
             Ok(IndexerMsg::Index(record)) => {
                 buf.push(record);
@@ -252,9 +251,7 @@ fn indexer_thread(
             }
         }
 
-        let should_commit = !done_ids.is_empty()
-            && (doc_count >= commit_interval
-                || last_commit.elapsed() > Duration::from_secs(commit_timeout));
+        let should_commit = !done_ids.is_empty() && doc_count >= commit_interval;
         if should_commit {
             // Commit Tantivy FIRST, then mark done in SQLite.
             // `add_document` now deletes any pre-existing document for the
@@ -271,7 +268,6 @@ fn indexer_thread(
                 metrics.set_indexer_docs_indexed(total);
                 metrics.set_indexer_last_commit_age(0);
 
-                last_commit = Instant::now();
                 doc_count = 0;
             } else {
                 log_msg(log_cb, &format!(
@@ -281,8 +277,6 @@ fn indexer_thread(
             }
         }
 
-        // Update age between commits so the 5s snapshot sees the real value
-        metrics.set_indexer_last_commit_age(last_commit.elapsed().as_secs());
     }
 
     // Final commit: Tantivy first, then mark done in SQLite.
@@ -1415,7 +1409,6 @@ struct IndexerActor {
     metrics: Arc<Metrics>,
     batch_size: usize,
     commit_interval: u64,
-    commit_timeout: u64,
     num_threads: usize,
     log_cb: Option<extern "C" fn(*const u8, u32)>,
 }
@@ -1424,7 +1417,7 @@ impl IndexerActor {
     fn run(self) {
         indexer_thread(
             &self.indexer, self.jobs, self.rx, &self.metrics,
-            self.batch_size, self.commit_interval, self.commit_timeout,
+            self.batch_size, self.commit_interval,
             self.num_threads, self.log_cb,
         );
     }
@@ -1598,7 +1591,6 @@ impl PipelineOrchestrator {
             let jobs = Arc::clone(&self.jobs);
             let ibs = self.config.indexer_batch();
             let ci = self.config.commit_int();
-            let ct = self.config.commit_to();
             let it = self.config.indexer_threads();
             thread::Builder::new()
                 .name("indexer".into())
@@ -1610,7 +1602,6 @@ impl PipelineOrchestrator {
                         metrics,
                         batch_size: ibs,
                         commit_interval: ci,
-                        commit_timeout: ct,
                         num_threads: it,
                         log_cb,
                     }.run();
@@ -2260,30 +2251,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.commit_int(), 1, "Zero interval should clamp to 1");
-    }
-
-    #[test]
-    fn test_pipeline_config_default_commit_timeout() {
-        let cfg = PipelineConfig::default();
-        assert_eq!(cfg.commit_to(), DEFAULT_COMMIT_TIMEOUT_SECS);
-    }
-
-    #[test]
-    fn test_pipeline_config_custom_commit_timeout() {
-        let cfg = PipelineConfig {
-            commit_timeout: Some(60),
-            ..Default::default()
-        };
-        assert_eq!(cfg.commit_to(), 60);
-    }
-
-    #[test]
-    fn test_pipeline_config_commit_timeout_clamps_zero() {
-        let cfg = PipelineConfig {
-            commit_timeout: Some(0),
-            ..Default::default()
-        };
-        assert_eq!(cfg.commit_to(), 1, "Zero timeout should clamp to 1");
     }
 
     #[test]
