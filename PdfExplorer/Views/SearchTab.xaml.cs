@@ -138,11 +138,12 @@ public partial class SearchTab : Page, IPdfRenderingService
         _viewerMediator.Renderer.TargetDpi = _renderDpi;
         Log($"DPI changed to {_renderDpi}");
 
-        var (anchorIdx, anchorOff) = SaveScrollAnchor();
-        RemoveAllPageElements();
-        _viewerMediator.InvalidateAllPages();
-        ComputeRenderDpi();
-        LayoutCanvas();
+            var (anchorIdx, anchorOff) = SaveScrollAnchor();
+            RemoveAllPageElements();
+            _viewerMediator.InvalidateAllPages();
+            ComputeRenderDpi();
+            RecomputePageYOffsets();
+            LayoutCanvas();
         RestoreScrollAnchor(anchorIdx, anchorOff);
         UpdateVisiblePages();
     }
@@ -183,7 +184,6 @@ public partial class SearchTab : Page, IPdfRenderingService
     private void ComputeRenderDpi()
     {
         if (_totalPages == 0) return;
-        RecomputePageYOffsets();
 
         double viewW = PageScroller.ViewportWidth;
         double baseDpi = _viewerMediator.Renderer.TargetDpi;
@@ -888,6 +888,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
         _viewerMediator.Renderer.TargetDpi = _renderDpi;
         ComputeRenderDpi();
+        RecomputePageYOffsets();
         LayoutCanvas();
         _lastViewW = PageScroller.ViewportWidth;
 
