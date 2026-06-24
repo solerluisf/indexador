@@ -229,6 +229,7 @@ pub struct EngineConfig {
     pub collection_boosts: HashMap<i64, f32>,
     pub boolean_query: Option<Vec<(String, String)>>,
     pub boolean_mode: bool,
+    pub render_inverted: bool,
     pub log_cb: Option<extern "C" fn(*const u8, u32)>,
     pub process_cb: Option<extern "C" fn(*const u8, u32)>,
 }
@@ -251,6 +252,7 @@ impl Default for EngineConfig {
             collection_boosts: HashMap::new(),
             boolean_query: None,
             boolean_mode: false,
+            render_inverted: false,
             log_cb: None,
             process_cb: None,
         }
@@ -1317,6 +1319,28 @@ impl PdfEngine {
         }
     }
 
+    /// Invert BGRA pixel buffer colors (full channel inversion).
+    /// White → Black, Black → White, preserving alpha.
+    fn invert_page_colors(
+        &self,
+        buf: &mut [u8],
+        dest_width: i32,
+        dest_height: i32,
+        stride: i32,
+    ) {
+        for y in 0..dest_height {
+            let row_off = (y as usize) * (stride as usize);
+            for x in 0..dest_width {
+                let i = row_off + (x as usize) * 4;
+                if i + 3 >= buf.len() { continue; }
+                buf[i]     = 255u8.wrapping_sub(buf[i]);     // B
+                buf[i + 1] = 255u8.wrapping_sub(buf[i + 1]); // G
+                buf[i + 2] = 255u8.wrapping_sub(buf[i + 2]); // R
+                // Alpha (buf[i + 3]) unchanged
+            }
+        }
+    }
+
     pub fn render_page_bgra(
         &mut self,
         handle: i32,
@@ -1389,9 +1413,14 @@ impl PdfEngine {
             return Err(ERR_GENERAL);
         }
 
+        let buf_size = (dest_height as usize) * (stride as usize);
+        let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_size) };
+
+        if self.config.render_inverted {
+            self.invert_page_colors(buf, dest_width, dest_height, stride);
+        }
+
         if let Some(hj) = highlight_json {
-            let buf_size = (dest_height as usize) * (stride as usize);
-            let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_size) };
             self.apply_highlights_to_buffer(buf, dest_width, dest_height, stride, page_index, scale, page, hj);
         }
 
@@ -1460,9 +1489,14 @@ impl PdfEngine {
             (pdfium.FPDF_RenderPageBitmap)(bitmap, page, 0, 0, width, height, 0, pdf_extractor::pdfium::FPDF_NONE);
         }
 
+        let buf_size = (height as usize) * (stride as usize);
+        let buf = unsafe { std::slice::from_raw_parts_mut(buffer, buf_size) };
+
+        if self.config.render_inverted {
+            self.invert_page_colors(buf, width, height, stride);
+        }
+
         if let Some(hj) = highlight_json {
-            let buf_size = (height as usize) * (stride as usize);
-            let buf = unsafe { std::slice::from_raw_parts_mut(buffer, buf_size) };
             let scale = dpi / 72.0;
             self.apply_highlights_to_buffer(buf, width, height, stride, page_index, scale, page, hj);
         }

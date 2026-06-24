@@ -8,6 +8,7 @@ public partial class SettingsTab : Page
 {
     private readonly PdfEngine _engine;
     private bool _wired;
+    private bool _themeInit;
 
     public SettingsTab()
     {
@@ -53,6 +54,10 @@ public partial class SettingsTab : Page
 
     private void WireEvents()
     {
+        _themeInit = false;
+        InvertPdfCheckbox.IsChecked = _engine.Settings.InvertPdf;
+        App.RenderInverted = _engine.Settings.InvertPdf;
+
         var theme = _engine.ThemeName ?? "Light";
         ThemeSelector.SelectedIndex = theme switch
         {
@@ -60,6 +65,7 @@ public partial class SettingsTab : Page
             "LightBlue" => 2,
             _ => 0
         };
+        _themeInit = true;
 
         TesseractPath.LostFocus += (_, _) => { _engine.TesseractPath = TesseractPath.Text; _engine.SaveSettings(); };
         OcrLanguage.LostFocus += (_, _) => { _engine.OcrLanguage = OcrLanguage.Text; _engine.SaveSettings(); };
@@ -83,6 +89,18 @@ public partial class SettingsTab : Page
             _ => "Light"
         };
         App.ApplyTheme(name);
+
+        // Auto-toggle PDF inversion with Dark theme (only on explicit user changes)
+        if (_themeInit)
+        {
+            InvertPdfCheckbox.IsChecked = name == "Dark";
+            App.RenderInverted = name == "Dark";
+        }
+    }
+
+    private void OnInvertPdfToggled(object sender, RoutedEventArgs e)
+    {
+        App.RenderInverted = InvertPdfCheckbox.IsChecked == true;
     }
 
     private void OnDpiChanged(object sender, SelectionChangedEventArgs e)

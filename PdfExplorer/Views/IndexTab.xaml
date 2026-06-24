@@ -52,7 +52,7 @@
             <CheckBox x:Name="OcrCheckbox" Content="OCR image PDFs" VerticalAlignment="Center"
                        IsChecked="False" Margin="0,0,10,0" Checked="OnOcrToggled" Unchecked="OnOcrToggled" />
             <TextBlock x:Name="OcrStatus" VerticalAlignment="Center" Margin="0,0,10,0"
-                       Foreground="Gray" FontSize="11" />
+                       Foreground="{DynamicResource ControlForeground}" FontSize="11" Opacity="0.7"/>
             <Button x:Name="IndexBtn" Content="Index" Width="100" Height="32"
                     Click="OnIndex" />
             <Button x:Name="CancelBtn" Content="Cancel" Width="100" Height="32" Margin="10,0,0,0"

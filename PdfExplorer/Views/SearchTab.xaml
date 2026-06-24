@@ -30,7 +30,7 @@
                          SelectionChanged="OnResultSelected">
                     <ListBox.ItemTemplate>
                         <DataTemplate>
-                            <Border BorderBrush="LightGray" BorderThickness="0,0,0,1" Padding="4">
+                            <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1" Padding="4">
                                 <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto"/>
@@ -54,10 +54,10 @@
                                     <!-- Text info -->
                                     <StackPanel Grid.Column="1">
                                         <TextBlock Text="{Binding FileName}" FontWeight="Bold" TextWrapping="NoWrap"/>
-                                        <TextBlock Text="{Binding FolderPath}" FontSize="10" Foreground="Gray" TextWrapping="NoWrap"/>
-                                        <TextBlock Text="{Binding Snippet}" FontSize="10" Foreground="DimGray"
-                                                   TextWrapping="Wrap" MaxHeight="40"/>
-                                        <TextBlock Text="{Binding Score, Mode=OneWay, StringFormat='Score: {0:F2}'}" FontSize="9" Foreground="DarkBlue"/>
+                                         <TextBlock Text="{Binding FolderPath}" FontSize="10" Foreground="{DynamicResource ControlForeground}" TextWrapping="NoWrap" Opacity="0.7"/>
+                                        <TextBlock Text="{Binding Snippet}" FontSize="10" Foreground="{DynamicResource ControlForeground}"
+                                                   TextWrapping="Wrap" MaxHeight="40" Opacity="0.6"/>
+                                        <TextBlock Text="{Binding Score, Mode=OneWay, StringFormat='Score: {0:F2}'}" FontSize="9" Foreground="{DynamicResource AccentBrush}"/>
                                     </StackPanel>
                                 </Grid>
                             </Border>
@@ -75,7 +75,7 @@
                 </Grid.RowDefinitions>
 
                 <!-- Match navigation bar -->
-                <Border Grid.Row="0" BorderBrush="LightGray" BorderThickness="0,0,0,1" Padding="4" Margin="0,0,0,5">
+                <Border Grid.Row="0" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1" Padding="4" Margin="0,0,0,5">
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="Filtered Viewer" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,10,0"/>
                         <Button x:Name="PrevMatch" Content="◀" Width="28" Height="24"
@@ -83,13 +83,14 @@
                         <Label x:Name="MatchInfo" Content="0 matches" VerticalAlignment="Center" Margin="4,0"/>
                         <Button x:Name="NextMatch" Content="▶" Width="28" Height="24"
                                 Click="OnNextMatch" IsEnabled="False" ToolTip="Next match"/>
-                        <Separator Width="1" Height="20" Margin="8,0" Background="LightGray"/>
-                        <TextBlock x:Name="StatusLabel" Text="Ready" VerticalAlignment="Center" Foreground="Gray"/>
+                        <Separator Width="1" Height="20" Margin="8,0" Background="{DynamicResource SeparatorBackground}"/>
+                        <TextBlock x:Name="StatusLabel" Text="Ready" VerticalAlignment="Center" Foreground="{DynamicResource ControlForeground}" Opacity="0.7"/>
                     </StackPanel>
                 </Border>
 
                 <!-- Canvas-based virtualized PDF viewer -->
                 <Grid Grid.Row="1" Focusable="True"
+                      Background="{DynamicResource WindowBackground}"
                       PreviewKeyDown="OnViewerKeyDown">
                     <ScrollViewer x:Name="PageScroller" VerticalScrollBarVisibility="Auto"
                                   HorizontalScrollBarVisibility="Disabled"
@@ -153,7 +154,7 @@
                 <Label x:Name="PageInfo" Content="0 / 0" VerticalAlignment="Center" Margin="5,0"/>
                 <Button x:Name="NextPage" Content="▶▶" Width="30" Height="28"
                         Click="OnNextPage" IsEnabled="False" ToolTip="Next page of results"/>
-                <Separator Width="1" Height="20" Margin="8,0" Background="LightGray"/>
+                <Separator Width="1" Height="20" Margin="8,0" Background="{DynamicResource SeparatorBackground}"/>
                 <Button x:Name="PrevPosition" Content="◀" Width="28" Height="24"
                         Click="OnPrevPosition" IsEnabled="False" ToolTip="Previous match"/>
                 <Label x:Name="PositionInfo" Content="0 / 0" VerticalAlignment="Center" Margin="4,0"/>
@@ -161,7 +162,7 @@
                         Click="OnNextPosition" IsEnabled="False" ToolTip="Next match"/>
             </StackPanel>
 
-            <Separator Grid.Column="7" Width="1" Height="20" Margin="4,0" Background="LightGray"/>
+            <Separator Grid.Column="7" Width="1" Height="20" Margin="4,0" Background="{DynamicResource SeparatorBackground}"/>
             <Label Grid.Column="8" Content="Zoom:" VerticalAlignment="Center" Margin="4,0,0,0"/>
             <ComboBox Grid.Column="9" x:Name="ZoomCombo" Width="75" Height="28"
                       SelectedIndex="3" SelectionChanged="OnZoomChanged">

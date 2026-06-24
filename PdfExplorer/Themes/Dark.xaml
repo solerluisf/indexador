@@ -1,15 +1,83 @@
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 
-    <SolidColorBrush x:Key="PageBackground" Color="#1E1E1E" />
-    <SolidColorBrush x:Key="PageForeground" Color="#E0E0E0" />
-    <SolidColorBrush x:Key="ControlBackground" Color="#2D2D2D" />
-    <SolidColorBrush x:Key="ControlForeground" Color="#E0E0E0" />
-    <SolidColorBrush x:Key="AccentBrush" Color="#0078D4" />
-    <SolidColorBrush x:Key="SubtleBrush" Color="#3E3E3E" />
-    <SolidColorBrush x:Key="BorderBrush" Color="#555555" />
-    <SolidColorBrush x:Key="ErrorBackground" Color="#2D2D2D" />
+    <!-- Page/Window -->
+    <SolidColorBrush x:Key="PageBackground" Color="#2D2D2D" />
+    <SolidColorBrush x:Key="PageForeground" Color="#F0F0F0" />
+    <SolidColorBrush x:Key="WindowBackground" Color="#2D2D2D" />
+    <SolidColorBrush x:Key="WindowForeground" Color="#F0F0F0" />
+
+    <!-- Controls -->
+    <SolidColorBrush x:Key="ControlBackground" Color="#3C3C3C" />
+    <SolidColorBrush x:Key="ControlForeground" Color="#F0F0F0" />
+    <SolidColorBrush x:Key="ControlBorder" Color="#555555" />
+
+    <!-- Accent -->
+    <SolidColorBrush x:Key="AccentBrush" Color="#0098FF" />
+    <SolidColorBrush x:Key="SubtleBrush" Color="#383838" />
+    <SolidColorBrush x:Key="BorderBrush" Color="#4A4A4A" />
+
+    <!-- Error -->
+    <SolidColorBrush x:Key="ErrorBackground" Color="#3C3C3C" />
     <SolidColorBrush x:Key="ErrorForeground" Color="#FF6B6B" />
-    <SolidColorBrush x:Key="ProgressBrush" Color="#0078D4" />
+
+    <!-- Progress -->
+    <SolidColorBrush x:Key="ProgressBrush" Color="#0098FF" />
+
+    <!-- Button -->
+    <SolidColorBrush x:Key="ButtonBackground" Color="#3C3C3C" />
+    <SolidColorBrush x:Key="ButtonForeground" Color="#F0F0F0" />
+    <SolidColorBrush x:Key="ButtonHoverBackground" Color="#505050" />
+    <SolidColorBrush x:Key="ButtonPressedBackground" Color="#2D2D2D" />
+
+    <!-- Selection -->
+    <SolidColorBrush x:Key="SelectionBackground" Color="#264F78" />
+    <SolidColorBrush x:Key="SelectionForeground" Color="#FFFFFF" />
+
+    <!-- ScrollBar -->
+    <SolidColorBrush x:Key="ScrollBarBackground" Color="#1E1E1E" />
+    <SolidColorBrush x:Key="ScrollBarThumb" Color="#424242" />
+    <SolidColorBrush x:Key="ScrollBarThumbHover" Color="#555555" />
+
+    <!-- ListBox -->
+    <SolidColorBrush x:Key="ListBoxBackground" Color="#252526" />
+    <SolidColorBrush x:Key="ListBoxForeground" Color="#F0F0F0" />
+
+    <!-- ComboBox -->
+    <SolidColorBrush x:Key="ComboBoxBackground" Color="#3C3C3C" />
+    <SolidColorBrush x:Key="ComboBoxForeground" Color="#F0F0F0" />
+    <SolidColorBrush x:Key="ComboBoxPopupBackground" Color="#2D2D2D" />
+
+    <!-- TextBox -->
+    <SolidColorBrush x:Key="TextBoxBackground" Color="#3C3C3C" />
+    <SolidColorBrush x:Key="TextBoxForeground" Color="#F0F0F0" />
+
+    <!-- StatusBar -->
+    <SolidColorBrush x:Key="StatusBarBackground" Color="#252526" />
+    <SolidColorBrush x:Key="StatusBarForeground" Color="#CCCCCC" />
+
+    <!-- Disabled -->
+    <SolidColorBrush x:Key="DisabledBackground" Color="#1E1E1E" />
+    <SolidColorBrush x:Key="DisabledForeground" Color="#888888" />
+
+    <!-- Header/Separator -->
+    <SolidColorBrush x:Key="HeaderBackground" Color="#252526" />
+    <SolidColorBrush x:Key="SeparatorBackground" Color="#3C3C3C" />
+
+    <!-- ToolTip -->
+    <SolidColorBrush x:Key="ToolTipBackground" Color="#3C3C3C" />
+    <SolidColorBrush x:Key="ToolTipForeground" Color="#F0F0F0" />
+
+    <!-- Tab -->
+    <SolidColorBrush x:Key="TabBackground" Color="#2D2D2D" />
+    <SolidColorBrush x:Key="TabSelectedBackground" Color="#1E1E1E" />
+    <SolidColorBrush x:Key="TabForeground" Color="#F0F0F0" />
+
+    <!-- Hyperlink -->
+    <SolidColorBrush x:Key="HyperlinkForeground" Color="#4FC1FF" />
+
+    <!-- Search highlight in PDF -->
+    <SolidColorBrush x:Key="SearchHighlightBackground" Color="#FFD700" />
+    <SolidColorBrush x:Key="SearchHighlightBorder" Color="#FFA500" />
 
 </ResourceDictionary>

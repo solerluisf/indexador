@@ -217,11 +217,15 @@ public sealed class PdfEngine : IDisposable
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_set_search_boolean_mode(int enabled);
 
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_set_render_inverted(int enabled);
+
     public string? PathFilter { set { Settings.PathFilter = value; pdf_set_path_filter(value is not null ? Utf8(value) : null); } }
     public string? BooleanQuery { set { Settings.BooleanQuery = value; pdf_set_boolean_query(value is not null ? Utf8(value) : null); } }
     public bool SearchBooleanMode { set { pdf_set_search_boolean_mode(value ? 1 : 0); } }
     public string? ThemeName { get => Settings.ThemeName; set => Settings.ThemeName = value; }
     public int RenderDpi { get => Settings.RenderDpi; set => Settings.RenderDpi = value; }
+    public bool RenderInverted { get => Settings.InvertPdf; set { Settings.InvertPdf = value; pdf_set_render_inverted(value ? 1 : 0); } }
     public void SetCollectionBoost(uint collId, float weight)
     {
         Settings.CollectionBoosts[collId] = weight;
@@ -469,18 +473,24 @@ public sealed class PdfEngine : IDisposable
         {
             var json = JsonSerializer.Serialize(Settings, new JsonSerializerOptions { WriteIndented = true });
             System.IO.File.WriteAllText(_settingsPath, json);
+            Log($"SaveSettings: ThemeName={Settings.ThemeName}, InvertPdf={Settings.InvertPdf}, path={_settingsPath}");
         }
-        catch { /* best-effort */ }
+        catch (Exception ex) { Log($"SaveSettings FAILED: {ex.Message}"); }
     }
 
     public void LoadSettings()
     {
-        if (!System.IO.File.Exists(_settingsPath)) return;
+        if (!System.IO.File.Exists(_settingsPath))
+        {
+            Log($"LoadSettings: file NOT FOUND at {_settingsPath}");
+            return;
+        }
         try
         {
             var json = System.IO.File.ReadAllText(_settingsPath);
+            Log($"LoadSettings: raw JSON = {json}");
             var s = JsonSerializer.Deserialize<AppSettings>(json);
-            if (s is null) return;
+            if (s is null) { Log("LoadSettings: deserialize returned null"); return; }
 
             Settings.TesseractPath = s.TesseractPath;
             Settings.OcrLanguage = s.OcrLanguage;
@@ -496,6 +506,9 @@ public sealed class PdfEngine : IDisposable
             Settings.PathFilter = s.PathFilter;
             Settings.BooleanQuery = s.BooleanQuery;
             Settings.ThemeName = s.ThemeName ?? "Light";
+            Settings.InvertPdf = s.InvertPdf;
+            Settings.RenderDpi = s.RenderDpi;
+            Log($"LoadSettings: loaded ThemeName={Settings.ThemeName}, InvertPdf={Settings.InvertPdf}");
 
             // Push to DLL
             if (Settings.TesseractPath is not null)
@@ -516,8 +529,9 @@ public sealed class PdfEngine : IDisposable
                 pdf_set_path_filter(Utf8(Settings.PathFilter));
             if (Settings.BooleanQuery is not null)
                 pdf_set_boolean_query(Utf8(Settings.BooleanQuery));
+            pdf_set_render_inverted(Settings.InvertPdf ? 1 : 0);
         }
-        catch { /* best-effort — corrupt or old settings file */ }
+        catch (Exception ex) { Log($"LoadSettings FAILED: {ex.Message}"); }
     }
 
     // ── Utilities ──────────────────────────────────────────────────

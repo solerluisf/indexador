@@ -1,15 +1,83 @@
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 
+    <!-- Page/Window -->
     <SolidColorBrush x:Key="PageBackground" Color="#FFFFFF" />
     <SolidColorBrush x:Key="PageForeground" Color="#000000" />
+    <SolidColorBrush x:Key="WindowBackground" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="WindowForeground" Color="#000000" />
+
+    <!-- Controls -->
     <SolidColorBrush x:Key="ControlBackground" Color="#FFFFFF" />
     <SolidColorBrush x:Key="ControlForeground" Color="#000000" />
+    <SolidColorBrush x:Key="ControlBorder" Color="#CCCCCC" />
+
+    <!-- Accent -->
     <SolidColorBrush x:Key="AccentBrush" Color="#0078D4" />
     <SolidColorBrush x:Key="SubtleBrush" Color="#F0F0F0" />
     <SolidColorBrush x:Key="BorderBrush" Color="#CCCCCC" />
+
+    <!-- Error -->
     <SolidColorBrush x:Key="ErrorBackground" Color="#F5F5F5" />
     <SolidColorBrush x:Key="ErrorForeground" Color="#CC0000" />
+
+    <!-- Progress -->
     <SolidColorBrush x:Key="ProgressBrush" Color="#0078D4" />
+
+    <!-- Button -->
+    <SolidColorBrush x:Key="ButtonBackground" Color="#E1E1E1" />
+    <SolidColorBrush x:Key="ButtonForeground" Color="#000000" />
+    <SolidColorBrush x:Key="ButtonHoverBackground" Color="#C5C5C5" />
+    <SolidColorBrush x:Key="ButtonPressedBackground" Color="#A0A0A0" />
+
+    <!-- Selection -->
+    <SolidColorBrush x:Key="SelectionBackground" Color="#0078D4" />
+    <SolidColorBrush x:Key="SelectionForeground" Color="#FFFFFF" />
+
+    <!-- ScrollBar -->
+    <SolidColorBrush x:Key="ScrollBarBackground" Color="#F0F0F0" />
+    <SolidColorBrush x:Key="ScrollBarThumb" Color="#C0C0C0" />
+    <SolidColorBrush x:Key="ScrollBarThumbHover" Color="#A0A0A0" />
+
+    <!-- ListBox -->
+    <SolidColorBrush x:Key="ListBoxBackground" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="ListBoxForeground" Color="#000000" />
+
+    <!-- ComboBox -->
+    <SolidColorBrush x:Key="ComboBoxBackground" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="ComboBoxForeground" Color="#000000" />
+    <SolidColorBrush x:Key="ComboBoxPopupBackground" Color="#FFFFFF" />
+
+    <!-- TextBox -->
+    <SolidColorBrush x:Key="TextBoxBackground" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="TextBoxForeground" Color="#000000" />
+
+    <!-- StatusBar -->
+    <SolidColorBrush x:Key="StatusBarBackground" Color="#0078D4" />
+    <SolidColorBrush x:Key="StatusBarForeground" Color="#FFFFFF" />
+
+    <!-- Disabled -->
+    <SolidColorBrush x:Key="DisabledBackground" Color="#F0F0F0" />
+    <SolidColorBrush x:Key="DisabledForeground" Color="#999999" />
+
+    <!-- Header/Separator -->
+    <SolidColorBrush x:Key="HeaderBackground" Color="#F0F0F0" />
+    <SolidColorBrush x:Key="SeparatorBackground" Color="#CCCCCC" />
+
+    <!-- ToolTip -->
+    <SolidColorBrush x:Key="ToolTipBackground" Color="#FFFFE1" />
+    <SolidColorBrush x:Key="ToolTipForeground" Color="#000000" />
+
+    <!-- Tab -->
+    <SolidColorBrush x:Key="TabBackground" Color="#F0F0F0" />
+    <SolidColorBrush x:Key="TabSelectedBackground" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="TabForeground" Color="#000000" />
+
+    <!-- Hyperlink -->
+    <SolidColorBrush x:Key="HyperlinkForeground" Color="#0066CC" />
+
+    <!-- Search highlight in PDF -->
+    <SolidColorBrush x:Key="SearchHighlightBackground" Color="#FFD700" />
+    <SolidColorBrush x:Key="SearchHighlightBorder" Color="#FFA500" />
 
 </ResourceDictionary>

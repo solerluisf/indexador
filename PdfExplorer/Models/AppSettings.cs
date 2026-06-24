@@ -23,4 +23,5 @@ public class AppSettings
     public string? BooleanQuery { get; set; }
     public string? ThemeName { get; set; } = "Light";
     public int RenderDpi { get; set; } = 150;
+    public bool InvertPdf { get; set; } = false;
 }

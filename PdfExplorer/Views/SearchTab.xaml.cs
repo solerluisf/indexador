@@ -119,6 +119,15 @@ public partial class SearchTab : Page, IPdfRenderingService
         _renderDpi = App.RenderDpi;
         _viewerMediator.Renderer.TargetDpi = _renderDpi;
         App.RenderDpiChanged += OnRenderDpiChanged;
+        App.RenderInvertedChanged += OnRenderInvertedChanged;
+    }
+
+    private void OnRenderInvertedChanged()
+    {
+        if (_totalPages == 0) return;
+        RemoveAllPageElements();
+        _viewerMediator.InvalidateAllPages();
+        UpdateVisiblePages();
     }
 
     private void OnRenderDpiChanged()
@@ -402,6 +411,7 @@ public partial class SearchTab : Page, IPdfRenderingService
                 FontSize = 12,
                 Height = PageHeaderHeight,
                 HorizontalAlignment = HorizontalAlignment.Center,
+                Foreground = (System.Windows.Media.Brush)FindResource("PageForeground"),
             };
 
             var image = new Image

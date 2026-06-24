@@ -12,11 +12,22 @@ public partial class App : Application
         get => Engine?.RenderDpi ?? 150;
         set
         {
-            if (Engine is not null) Engine.RenderDpi = value;
+            if (Engine is not null) { Engine.RenderDpi = value; Engine.SaveSettings(); }
             RenderDpiChanged?.Invoke();
         }
     }
     public static event Action? RenderDpiChanged;
+
+    public static bool RenderInverted
+    {
+        get => Engine?.RenderInverted ?? false;
+        set
+        {
+            if (Engine is not null) { Engine.RenderInverted = value; Engine.SaveSettings(); }
+            RenderInvertedChanged?.Invoke();
+        }
+    }
+    public static event Action? RenderInvertedChanged;
 
     protected override void OnStartup(StartupEventArgs e)
     {
