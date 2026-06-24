@@ -3,18 +3,75 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="PdfExplorer" Height="800" Width="1200"
         WindowStartupLocation="CenterScreen"
-        Background="{DynamicResource PageBackground}" Foreground="{DynamicResource PageForeground}">
+        WindowStyle="None"
+        Background="{DynamicResource PageBackground}" Foreground="{DynamicResource PageForeground}"
+        StateChanged="OnWindowStateChanged">
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="30" GlassFrameThickness="0" CornerRadius="0"
+                      ResizeBorderThickness="6" UseAeroCaptionButtons="False"/>
+    </WindowChrome.WindowChrome>
     <Grid>
-        <TabControl>
-            <TabItem Header="Search">
-                <Frame Source="Views/SearchTab.xaml" NavigationUIVisibility="Hidden" />
-            </TabItem>
-            <TabItem Header="Index Creation">
-                <Frame Source="Views/IndexTab.xaml" NavigationUIVisibility="Hidden" />
-            </TabItem>
-            <TabItem Header="Settings">
-                <Frame Source="Views/SettingsTab.xaml" NavigationUIVisibility="Hidden" />
-            </TabItem>
-        </TabControl>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="30"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Background="{DynamicResource PageBackground}">
+            <Grid>
+                <TextBlock Text="PdfExplorer"
+                           Foreground="{DynamicResource PageForeground}"
+                           VerticalAlignment="Center" Margin="10,0,0,0"
+                           FontSize="13" FontWeight="SemiBold"
+                           IsHitTestVisible="False"/>
+
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
+                            VerticalAlignment="Stretch">
+                    <Button x:Name="MinimizeBtn" Width="46" ToolTip="Minimize"
+                            WindowChrome.IsHitTestVisibleInChrome="True"
+                            Style="{StaticResource CaptionButtonStyle}">
+                        <Rectangle Width="10" Height="1.5" RadiusX="1" RadiusY="1"
+                                   Fill="{DynamicResource PageForeground}"
+                                   VerticalAlignment="Center" HorizontalAlignment="Center"/>
+                    </Button>
+                    <Button x:Name="MaximizeBtn" Width="46" ToolTip="Maximize"
+                            WindowChrome.IsHitTestVisibleInChrome="True"
+                            Style="{StaticResource CaptionButtonStyle}">
+                        <Grid Width="10" Height="10">
+                            <Rectangle x:Name="MaxIcon" Width="10" Height="10"
+                                       Stroke="{DynamicResource PageForeground}" StrokeThickness="1.5"
+                                       Fill="Transparent"/>
+                            <Rectangle x:Name="RestIcon" Width="8" Height="8"
+                                       Stroke="{DynamicResource PageForeground}" StrokeThickness="1.5"
+                                       Fill="Transparent" Visibility="Collapsed"
+                                       Margin="0,0,2,2"/>
+                        </Grid>
+                    </Button>
+                    <Button x:Name="CloseBtn" Width="46" ToolTip="Close"
+                            WindowChrome.IsHitTestVisibleInChrome="True"
+                            Style="{StaticResource CaptionButtonStyle}"
+                            MouseEnter="OnCloseMouseEnter" MouseLeave="OnCloseMouseLeave">
+                        <Path x:Name="CloseIcon" Data="M0,0 L10,10 M10,0 L0,10"
+                              Stroke="{DynamicResource PageForeground}"
+                              StrokeThickness="1.5" StrokeEndLineCap="Round"
+                              VerticalAlignment="Center" HorizontalAlignment="Center"
+                              Width="10" Height="10" Stretch="Fill"/>
+                    </Button>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1">
+            <TabControl>
+                <TabItem Header="Search">
+                    <Frame Source="Views/SearchTab.xaml" NavigationUIVisibility="Hidden" />
+                </TabItem>
+                <TabItem Header="Index Creation">
+                    <Frame Source="Views/IndexTab.xaml" NavigationUIVisibility="Hidden" />
+                </TabItem>
+                <TabItem Header="Settings">
+                    <Frame Source="Views/SettingsTab.xaml" NavigationUIVisibility="Hidden" />
+                </TabItem>
+            </TabControl>
+        </Grid>
     </Grid>
 </Window>

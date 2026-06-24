@@ -1,4 +1,6 @@
+using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Interop;
 using System.Windows.Threading;
 using PdfExplorer.Services;
 
@@ -45,6 +47,8 @@ public partial class App : Application
             Engine = new PdfEngine(registryDir);
             ApplyTheme(Engine.ThemeName ?? "Light");
             base.OnStartup(e);
+            if (MainWindow is not null)
+                MainWindow.SourceInitialized += OnMainWindowSourceInitialized;
         }
         catch (System.Exception ex)
         {
@@ -65,6 +69,54 @@ public partial class App : Application
 
         Engine.ThemeName = name;
         Engine.SaveSettings();
+
+        var hwnd = GetMainWindowHandle();
+        if (hwnd != IntPtr.Zero)
+            SetTitleBarTheme(hwnd, name);
+    }
+
+    private void OnMainWindowSourceInitialized(object? sender, EventArgs e)
+    {
+        try
+        {
+            var hwnd = new WindowInteropHelper(MainWindow).Handle;
+            if (hwnd == IntPtr.Zero)
+                hwnd = new WindowInteropHelper(MainWindow).EnsureHandle();
+            SetTitleBarTheme(hwnd, Engine.ThemeName ?? "Light");
+        }
+        catch (Exception ex)
+        {
+            LogHelper.Log("App", $"SourceInitialized error: {ex.Message}");
+        }
+    }
+
+    private static IntPtr GetMainWindowHandle()
+    {
+        if (Current.MainWindow is null) return IntPtr.Zero;
+        var source = PresentationSource.FromVisual(Current.MainWindow) as HwndSource;
+        return source?.Handle ?? IntPtr.Zero;
+    }
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+    private static void SetTitleBarTheme(IntPtr hwnd, string themeName)
+    {
+        if (hwnd == IntPtr.Zero) return;
+        try
+        {
+            int useDark = themeName == "Dark" ? 1 : 0;
+            // Try attribute 20 (Windows 10 2004+) then 19 (undocumented older builds)
+            int hr = DwmSetWindowAttribute(hwnd, 20, ref useDark, sizeof(int));
+            if (hr != 0)
+                hr = DwmSetWindowAttribute(hwnd, 19, ref useDark, sizeof(int));
+            if (hr != 0)
+                LogHelper.Log("App", $"DWM dark mode unavailable: hr={hr}");
+        }
+        catch (Exception ex)
+        {
+            LogHelper.Log("App", $"DWM error: {ex.Message}");
+        }
     }
 
     protected override void OnExit(ExitEventArgs e)

@@ -138,23 +138,45 @@ public partial class SearchTab : Page, IPdfRenderingService
         _viewerMediator.Renderer.TargetDpi = _renderDpi;
         Log($"DPI changed to {_renderDpi}");
 
+        var (anchorIdx, anchorOff) = SaveScrollAnchor();
         RemoveAllPageElements();
         _viewerMediator.InvalidateAllPages();
         ComputeRenderDpi();
         LayoutCanvas();
+        RestoreScrollAnchor(anchorIdx, anchorOff);
         UpdateVisiblePages();
+    }
+
+    private (int idx, double off) SaveScrollAnchor()
+    {
+        double scroll = PageScroller.VerticalOffset;
+        for (int i = 0; i < _totalPages; i++)
+            if (GetPageBottom(i) > scroll)
+                return (i, scroll - GetPageY(i));
+        return _totalPages > 0 ? (0, 0) : (-1, 0);
+    }
+
+    private void RestoreScrollAnchor(int idx, double off)
+    {
+        if (idx < 0 || idx >= _totalPages) return;
+        double newScroll = GetPageY(idx) + off;
+        newScroll = Math.Max(0, Math.Min(newScroll, PageScroller.ScrollableHeight));
+        PageScroller.ScrollToVerticalOffset(newScroll);
     }
 
     private void UpdateDpiAndRefresh()
     {
         if (_totalPages == 0) return;
 
+        var (anchorIdx, anchorOff) = SaveScrollAnchor();
+
         ComputeRenderDpi();
 
         Log($"UpdateDpiAndRefresh: dpi={_currentRenderDpi:F0}, viewW={PageScroller.ViewportWidth:F0}");
 
         RelayoutPageContainers();
-        LayoutCanvas();
+
+        RestoreScrollAnchor(anchorIdx, anchorOff);
         UpdateVisiblePages();
     }
 
@@ -276,7 +298,9 @@ public partial class SearchTab : Page, IPdfRenderingService
             UpdateDpiAndRefresh();
         else
         {
+            var (anchorIdx, anchorOff) = SaveScrollAnchor();
             RelayoutPageContainers();
+            RestoreScrollAnchor(anchorIdx, anchorOff);
             UpdateVisiblePages();
         }
     }
@@ -338,6 +362,7 @@ public partial class SearchTab : Page, IPdfRenderingService
 
             elem.Panel.Width = viewW;
             elem.Image.Width = displayW;
+            elem.Image.Height = displayH;
             Canvas.SetTop(elem.Panel, GetPageY(pageIdx));
 
         }
