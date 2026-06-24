@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -277,6 +278,23 @@ public partial class SearchTab : Page, IPdfRenderingService
 
     private void OnPageScrollerScroll(object sender, ScrollChangedEventArgs e)
     {
+        if (_totalPages > 0)
+        {
+            Log($"Scroll: VOffset={PageScroller.VerticalOffset:F0} VPH={PageScroller.ViewportHeight:F0} " +
+                $"SH={PageScroller.ScrollableHeight:F0} ExtH={PageScroller.ExtentHeight:F0} " +
+                $"Page0Y={GetPageY(0):F0} PageLastY={GetPageY(_totalPages - 1):F0}");
+
+            if (PageScroller.Template?.FindName("PART_VerticalScrollBar", PageScroller) is ScrollBar sb &&
+                sb.Template?.FindName("PART_Track", sb) is Track t)
+            {
+                Log($"Track: Rev={t.IsDirectionReversed} Orient={t.Orientation} " +
+                    $"Val={t.Value:F0} Min={t.Minimum:F0} Max={t.Maximum:F0} VS={t.ViewportSize:F0}");
+            }
+            else
+            {
+                Log("Track: NOT FOUND");
+            }
+        }
         UpdateVisiblePages();
     }
 
@@ -471,6 +489,7 @@ public partial class SearchTab : Page, IPdfRenderingService
     private void LayoutCanvas()
     {
         PageCanvas.Height = GetTotalContentHeight();
+        Log($"LayoutCanvas: H={PageCanvas.Height:F0}");
     }
 
     // ── Search ──────────────────────────────────────────────────────
@@ -897,6 +916,13 @@ public partial class SearchTab : Page, IPdfRenderingService
         FinishLoading();
 
         Log($"DoBuildPageData: {_totalPages} pages, dpi={_currentRenderDpi:F0}, viewW={_lastViewW:F0}, zoom={_zoomMode}");
+
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            Log($"PostLayout: CanvasH={PageCanvas.ActualHeight:F0} VOffset={PageScroller.VerticalOffset:F0} " +
+                $"VPH={PageScroller.ViewportHeight:F0} SH={PageScroller.ScrollableHeight:F0} " +
+                $"EH={PageScroller.ExtentHeight:F0}");
+        }, DispatcherPriority.Loaded);
 
         _ = Dispatcher.InvokeAsync(async () =>
         {
