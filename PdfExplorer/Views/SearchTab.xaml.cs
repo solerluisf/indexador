@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Windows;
@@ -965,11 +966,17 @@ public partial class SearchTab : Page, IPdfRenderingService
     {
         _isLoading = false;
         ResultsList.IsEnabled = true;
+
+        if (ResultsList.ItemsSource is IReadOnlyList<SearchResultViewModel> items)
+        {
+            var missing = items.Where(vm => vm.Thumbnail is null).ToList();
+            if (missing.Count > 0)
+                _searchMediator.RetryPendingThumbnails(missing);
+        }
     }
 
     private void ClearViewer()
     {
-        _searchMediator.CancelThumbnails();
         _viewerMediator.Clear();
         _navigationMediator.Reset();
 

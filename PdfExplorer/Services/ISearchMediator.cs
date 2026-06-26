@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using PdfExplorer.ViewModels;
 
 namespace PdfExplorer.Services;
@@ -34,4 +35,5 @@ public interface ISearchMediator
     Task PrevPageAsync(uint? collId);
     void ResetPage();
     void CancelThumbnails();
+    void RetryPendingThumbnails(IReadOnlyList<SearchResultViewModel> items);
 }

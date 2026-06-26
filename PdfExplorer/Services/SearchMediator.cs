@@ -11,6 +11,7 @@ public sealed class SearchMediator : ISearchMediator, IDisposable
     private readonly PdfEngine _engine;
     private readonly ThumbnailService _thumbService;
     private readonly SemaphoreSlim _searchLock = new(1, 1);
+    private readonly object _thumbLock = new();
     private CancellationTokenSource? _thumbCts;
     private int _currentPage;
     private long _totalHits;
@@ -111,8 +112,13 @@ public sealed class SearchMediator : ISearchMediator, IDisposable
             Log($"ViewModel creation: {sw.Elapsed.TotalMilliseconds:F0}ms, count={viewModels.Count}");
 
             CancelThumbnails();
-            _thumbCts = new CancellationTokenSource();
-            var ct = _thumbCts.Token;
+            CancellationTokenSource cts;
+            lock (_thumbLock)
+            {
+                _thumbCts = new CancellationTokenSource();
+                cts = _thumbCts;
+            }
+            var ct = cts.Token;
             _ = PreloadThumbnailsAsync(viewModels, ThumbnailPreloadCount, ct)
                 .ContinueWith(t =>
                 {
@@ -142,8 +148,53 @@ public sealed class SearchMediator : ISearchMediator, IDisposable
 
     public void CancelThumbnails()
     {
-        _thumbCts?.Cancel();
-        _thumbCts = null;
+        lock (_thumbLock)
+        {
+            _thumbCts?.Cancel();
+            _thumbCts?.Dispose();
+            _thumbCts = null;
+        }
+    }
+
+    public void RetryPendingThumbnails(IReadOnlyList<SearchResultViewModel> items)
+    {
+        if (items is null || items.Count == 0)
+            return;
+
+        CancellationToken ct;
+        lock (_thumbLock)
+        {
+            if (_thumbCts is null || _thumbCts.IsCancellationRequested)
+            {
+                _thumbCts?.Dispose();
+                _thumbCts = new CancellationTokenSource();
+            }
+            ct = _thumbCts.Token;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            foreach (var vm in items)
+            {
+                if (ct.IsCancellationRequested || vm.Thumbnail is not null)
+                    continue;
+
+                try
+                {
+                    var raw = await _thumbService.GetThumbnailAsync(vm.Path, ct);
+                    if (raw is null || ct.IsCancellationRequested)
+                        continue;
+
+                    var bmp = BitmapSource.Create(
+                        raw.Width, raw.Height, 96, 96,
+                        PixelFormats.Bgra32, null, raw.Pixels, raw.Stride);
+                    bmp.Freeze();
+                    vm.Thumbnail = bmp;
+                }
+                catch (OperationCanceledException) { }
+                catch (Exception) { }
+            }
+        });
     }
 
     private void SetIsSearching(bool value)
@@ -174,10 +225,10 @@ public sealed class SearchMediator : ISearchMediator, IDisposable
                 return (vm, null);
             }
         })))
-        .Where(r => r.raw is not null && !ct.IsCancellationRequested)
+        .Where(r => r.raw is not null)
         .ToList();
 
-        if (rawResults.Count == 0 || ct.IsCancellationRequested)
+        if (rawResults.Count == 0)
             return;
 
         foreach (var (vm, raw) in rawResults)
@@ -197,7 +248,7 @@ public sealed class SearchMediator : ISearchMediator, IDisposable
 
         await Task.WhenAll(remaining.Select<SearchResultViewModel, Task>(async vm =>
         {
-            if (ct.IsCancellationRequested || vm.Thumbnail is not null) return;
+            if (vm.Thumbnail is not null) return;
 
             try
             {
