@@ -1171,7 +1171,7 @@ impl PdfEngine {
                 let term_lower = word.to_lowercase();
                 for pos in &all {
                     let lower = pos.word_text.to_lowercase();
-                    if lower == term_lower || lower.split(' ').any(|seg| seg == term_lower) {
+                    if lower == term_lower {
                         let key = (pos.page, (pos.x_min * 100.0) as i32, (pos.y_min * 100.0) as i32);
                         if seen.insert(key) {
                             positions.push(pos.clone());
@@ -1278,6 +1278,14 @@ impl PdfEngine {
         let geom = unsafe { pdf_extractor::pdfium::PageGeometry::from_page(&pdfium, page) };
         let page_num = page_index as u32 + 1;
 
+        // Paso 1: recolectar todas las words de esta página
+        struct WordInfo {
+            px1: i32,
+            py1: i32,
+            px2: i32,
+            py2: i32,
+        }
+        let mut words: Vec<WordInfo> = Vec::new();
         for h in &highlights {
             let pos_page = match h.get("page").and_then(|v| v.as_u64()) {
                 Some(p) => p,
@@ -1296,24 +1304,64 @@ impl PdfEngine {
             let px2 = (r_x_max * scale).round() as i32;
             let py2 = (r_y_max * scale).round() as i32;
 
-            let px1 = px1.clamp(0, dest_width);
-            let py1 = py1.clamp(0, dest_height);
-            let px2 = px2.clamp(0, dest_width);
-            let py2 = py2.clamp(0, dest_height);
+            words.push(WordInfo { px1, py1, px2, py2 });
+        }
 
-            let src_a = 204u32;
-            let dst_a = 255u32 - src_a;
-            for y in py1..py2 {
-                let row_off = (y as usize) * (stride as usize);
-                for x in px1..px2 {
-                    let i = row_off + (x as usize) * 4;
-                    if i + 3 >= buf.len() { continue; }
-                    let b = buf[i] as u32;
-                    let g = buf[i + 1] as u32;
-                    let r = buf[i + 2] as u32;
-                    buf[i]     = ((0u32   * src_a + b * dst_a) / 255) as u8;
-                    buf[i + 1] = ((230u32 * src_a + g * dst_a) / 255) as u8;
-                    buf[i + 2] = ((255u32 * src_a + r * dst_a) / 255) as u8;
+        if words.is_empty() { return; }
+
+        // Ordenar por centro Y para agrupación por línea
+        words.sort_by_key(|w| (w.py1 + w.py2) / 2);
+
+        // Calcular mediana de alturas para threshold de agrupación
+        let mut heights: Vec<i32> = words.iter().map(|w| w.py2 - w.py1).collect();
+        heights.sort();
+        let median_h = heights[heights.len() / 2];
+        let threshold = ((median_h as f64) * 0.5).ceil() as i32;
+
+        // Agrupar en líneas por proximidad de centro Y
+        let mut lines: Vec<Vec<&WordInfo>> = Vec::new();
+        for w in &words {
+            let cy = (w.py1 + w.py2) / 2;
+            let mut found = false;
+            for line in lines.iter_mut() {
+                let line_cy = line.iter().map(|w| (w.py1 + w.py2) / 2).sum::<i32>() / line.len() as i32;
+                if (cy - line_cy).abs() <= threshold {
+                    line.push(w);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                lines.push(vec![w]);
+            }
+        }
+
+        // Paso 2: dibujar con bounding box unión por línea
+        let src_a = 204u32;
+        let dst_a = 255u32 - src_a;
+        for line in &lines {
+            // Altura uniforme = bounding box que cubre TODAS las palabras de la línea
+            let line_top = line.iter().map(|w| w.py1).min().unwrap_or(0).max(0).min(dest_height);
+            let line_bottom = line.iter().map(|w| w.py2).max().unwrap_or(0).max(0).min(dest_height);
+            if line_top >= line_bottom { continue; }
+
+            for w in line {
+                let l = w.px1.max(0).min(dest_width);
+                let r = w.px2.max(0).min(dest_width);
+                if l >= r { continue; }
+
+                for y in line_top..line_bottom {
+                    let row_off = (y as usize) * (stride as usize);
+                    for x in l..r {
+                        let i = row_off + (x as usize) * 4;
+                        if i + 3 >= buf.len() { continue; }
+                        let b = buf[i] as u32;
+                        let g = buf[i + 1] as u32;
+                        let r = buf[i + 2] as u32;
+                        buf[i]     = ((0u32   * src_a + b * dst_a) / 255) as u8;
+                        buf[i + 1] = ((230u32 * src_a + g * dst_a) / 255) as u8;
+                        buf[i + 2] = ((255u32 * src_a + r * dst_a) / 255) as u8;
+                    }
                 }
             }
         }
