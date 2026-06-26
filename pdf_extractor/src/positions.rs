@@ -235,7 +235,7 @@ impl PositionStore {
             .into_iter()
             .filter(|p| {
                 let lower = p.word_text.to_lowercase();
-                lower == term_lower || lower.split(' ').any(|seg| seg == term_lower)
+                lower == term_lower
             })
             .collect())
     }

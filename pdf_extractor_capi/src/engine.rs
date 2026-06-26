@@ -1265,15 +1265,15 @@ impl PdfEngine {
         }
         let json_str = match std::str::from_utf8(highlight_json) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => { set_error(format!("apply_highlights: invalid UTF-8 in highlight_json: {}", e)); return; },
         };
         let highlights: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
             Ok(v) => v,
-            Err(_) => return,
+            Err(e) => { set_error(format!("apply_highlights: invalid highlight JSON: {}", e)); return; },
         };
         let pdfium = match self.pdfium() {
             Ok(p) => p,
-            Err(_) => return,
+            Err(e) => { set_error(format!("apply_highlights: pdfium not available: {}", e)); return; },
         };
         let geom = unsafe { pdf_extractor::pdfium::PageGeometry::from_page(&pdfium, page) };
         let page_num = page_index as u32 + 1;
@@ -1413,7 +1413,7 @@ impl PdfEngine {
         let h_pts = unsafe { (pdfium.FPDF_GetPageHeightF)(page) };
         let rotation = pdfium.FPDF_GetPageRotation.map_or(0, |f| unsafe { f(page) });
         let geom = unsafe { pdf_extractor::pdfium::PageGeometry::from_page(&pdfium, page) };
-        let base_w = w_pts as f64;
+        let base_w = geom.unrotated_width();
         let base_h = geom.unrotated_height();
 
         let scale = dpi / 72.0;

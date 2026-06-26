@@ -310,11 +310,11 @@ unsafe fn extract_text_and_positions(
             // Apply Y-flip to all word positions on this page (PDF bottom-left → bitmap top-left)
             for pos in word_positions[start_pos..].iter_mut() {
                 let (new_x, new_y) = geom.pdf_to_stored(pos.x_min as f64, pos.y_max as f64);
-                let (_new_x2, new_y2) = geom.pdf_to_stored(pos.x_max as f64, pos.y_min as f64);
+                let (new_x_max, new_y_max) = geom.pdf_to_stored(pos.x_max as f64, pos.y_min as f64);
                 pos.x_min = new_x as f32;
                 pos.y_min = new_y as f32;
-                pos.x_max = _new_x2 as f32;
-                pos.y_max = new_y2 as f32;
+                pos.x_max = new_x_max as f32;
+                pos.y_max = new_y_max as f32;
             }
 
             total_chars += char_count as usize;

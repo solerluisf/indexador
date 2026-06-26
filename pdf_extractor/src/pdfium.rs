@@ -319,7 +319,7 @@ impl PageGeometry {
             1 => (pdf_y, u_w - pdf_x),      //  90°
             2 => (u_w - pdf_x, u_h - pdf_y),// 180°
             3 => (u_h - pdf_y, pdf_x),      // 270°
-            _ => (pdf_x, self.unrotated_height() - pdf_y), // 0°: flip to top-left
+            _ => (pdf_x, u_h - pdf_y), // 0°: flip to top-left
         }
     }
 
