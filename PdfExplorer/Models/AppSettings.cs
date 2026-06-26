@@ -24,4 +24,9 @@ public class AppSettings
     public string? ThemeName { get; set; } = "Light";
     public int RenderDpi { get; set; } = 150;
     public bool InvertPdf { get; set; } = false;
+
+    public byte HighlightRed { get; set; } = 255;
+    public byte HighlightGreen { get; set; } = 230;
+    public byte HighlightBlue { get; set; } = 0;
+    public byte HighlightAlpha { get; set; } = 204;
 }

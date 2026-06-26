@@ -220,6 +220,9 @@ public sealed class PdfEngine : IDisposable
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern int pdf_set_render_inverted(int enabled);
 
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int pdf_set_highlight_color(byte r, byte g, byte b, byte alpha);
+
     public string? PathFilter { set { Settings.PathFilter = value; pdf_set_path_filter(value is not null ? Utf8(value) : null); } }
     public string? BooleanQuery { set { Settings.BooleanQuery = value; pdf_set_boolean_query(value is not null ? Utf8(value) : null); } }
     public bool SearchBooleanMode { set { pdf_set_search_boolean_mode(value ? 1 : 0); } }
@@ -230,6 +233,15 @@ public sealed class PdfEngine : IDisposable
     {
         Settings.CollectionBoosts[collId] = weight;
         pdf_set_collection_boost(collId, weight);
+    }
+
+    public void SetHighlightColor(byte r, byte g, byte b, byte alpha)
+    {
+        Settings.HighlightRed = r;
+        Settings.HighlightGreen = g;
+        Settings.HighlightBlue = b;
+        Settings.HighlightAlpha = alpha;
+        pdf_set_highlight_color(r, g, b, alpha);
     }
 
     // ── Indexing ───────────────────────────────────────────────────
@@ -483,6 +495,7 @@ public sealed class PdfEngine : IDisposable
         if (!System.IO.File.Exists(_settingsPath))
         {
             Log($"LoadSettings: file NOT FOUND at {_settingsPath}");
+            pdf_set_highlight_color(Settings.HighlightRed, Settings.HighlightGreen, Settings.HighlightBlue, Settings.HighlightAlpha);
             return;
         }
         try
@@ -508,6 +521,10 @@ public sealed class PdfEngine : IDisposable
             Settings.ThemeName = s.ThemeName ?? "Light";
             Settings.InvertPdf = s.InvertPdf;
             Settings.RenderDpi = s.RenderDpi;
+            Settings.HighlightRed = s.HighlightRed;
+            Settings.HighlightGreen = s.HighlightGreen;
+            Settings.HighlightBlue = s.HighlightBlue;
+            Settings.HighlightAlpha = s.HighlightAlpha;
             Log($"LoadSettings: loaded ThemeName={Settings.ThemeName}, InvertPdf={Settings.InvertPdf}");
 
             // Push to DLL
@@ -530,6 +547,7 @@ public sealed class PdfEngine : IDisposable
             if (Settings.BooleanQuery is not null)
                 pdf_set_boolean_query(Utf8(Settings.BooleanQuery));
             pdf_set_render_inverted(Settings.InvertPdf ? 1 : 0);
+            pdf_set_highlight_color(Settings.HighlightRed, Settings.HighlightGreen, Settings.HighlightBlue, Settings.HighlightAlpha);
         }
         catch (Exception ex) { Log($"LoadSettings FAILED: {ex.Message}"); }
     }

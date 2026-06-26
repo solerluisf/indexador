@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Media;
 using PdfExplorer.Services;
 
 namespace PdfExplorer.Views;
@@ -9,6 +10,7 @@ public partial class SettingsTab : Page
     private readonly PdfEngine _engine;
     private bool _wired;
     private bool _themeInit;
+    private bool _loading;
 
     public SettingsTab()
     {
@@ -78,6 +80,65 @@ public partial class SettingsTab : Page
         CommitTimeout.ValueChanged += (_, e) => { _engine.CommitTimeout = (uint)e.NewValue; _engine.SaveSettings(); };
         ExtractWorkers.ValueChanged += (_, e) => { _engine.ExtractWorkers = (uint)e.NewValue; _engine.SaveSettings(); };
         ChannelCapacity.ValueChanged += (_, e) => { _engine.ChannelCapacity = (uint)e.NewValue; _engine.SaveSettings(); };
+
+        _loading = true;
+        InitHighlightControls();
+        _loading = false;
+    }
+
+    private void InitHighlightControls()
+    {
+        var s = _engine.Settings;
+        HighlightAlphaSlider.Value = s.HighlightAlpha * 100 / 255;
+        UpdateHighlightPreview(s.HighlightRed, s.HighlightGreen, s.HighlightBlue, s.HighlightAlpha);
+    }
+
+    private void OnSelectColor(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var s = _engine.Settings;
+            var initial = Color.FromArgb(s.HighlightAlpha, s.HighlightRed, s.HighlightGreen, s.HighlightBlue);
+            var owner = Window.GetWindow(this);
+            LogHelper.Log("SettingsTab", $"OnSelectColor: owner={(owner is not null ? "ok" : "NULL")}");
+            var picked = NativeColorDialog.Show(owner, initial);
+            if (picked is not null)
+            {
+                var c = picked.Value;
+                LogHelper.Log("SettingsTab", $"OnSelectColor: picked R={c.R} G={c.G} B={c.B} alpha={s.HighlightAlpha}");
+                _engine.SetHighlightColor(c.R, c.G, c.B, s.HighlightAlpha);
+                _engine.SaveSettings();
+                UpdateHighlightPreview(c.R, c.G, c.B, s.HighlightAlpha);
+                App.NotifyHighlightColorChanged();
+            }
+            else
+            {
+                LogHelper.Log("SettingsTab", "OnSelectColor: dialog returned null (cancel?)");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogHelper.Log("SettingsTab", $"OnSelectColor error: {ex.Message}");
+            MessageBox.Show($"Color selection error:\n{ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void OnHighlightAlphaChanged(object sender, RoutedEventArgs e)
+    {
+        if (_engine is null || _loading) return;
+        var s = _engine.Settings;
+        int pct = (int)HighlightAlphaSlider.Value;
+        var alpha = (byte)(pct * 255 / 100);
+        HighlightAlphaLabel.Content = $"{pct}%";
+        _engine.SetHighlightColor(s.HighlightRed, s.HighlightGreen, s.HighlightBlue, alpha);
+        _engine.SaveSettings();
+        UpdateHighlightPreview(s.HighlightRed, s.HighlightGreen, s.HighlightBlue, alpha);
+        App.NotifyHighlightColorChanged();
+    }
+
+    private void UpdateHighlightPreview(byte r, byte g, byte b, byte a)
+    {
+        HighlightPreview.Background = new SolidColorBrush(Color.FromArgb(a, r, g, b));
     }
 
     private void OnThemeChanged(object sender, SelectionChangedEventArgs e)

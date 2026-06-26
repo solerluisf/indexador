@@ -41,6 +41,7 @@ public partial class SearchTab : Page, IPdfRenderingService
     private double _renderDpi = 150;
     private double _currentRenderDpi = 150;
     private int _zoomMode = 3;
+    private bool _pendingRefresh;
 
     private static readonly double[] ZoomMultipliers = [0.5, 0.75, 1.0, -1, -2, 1.5, 2.0];
 
@@ -72,6 +73,7 @@ public partial class SearchTab : Page, IPdfRenderingService
         _navigationMediator = new NavigationMediator();
         _navigationMediator.StateChanged += OnNavStateChanged;
         Loaded += OnLoaded;
+        IsVisibleChanged += OnIsVisibleChanged;
         InitRenderDpi();
         Log("Constructor end, engine=" + (_engine is not null ? "ok" : "null"));
     }
@@ -121,6 +123,29 @@ public partial class SearchTab : Page, IPdfRenderingService
         _viewerMediator.Renderer.TargetDpi = _renderDpi;
         App.RenderDpiChanged += OnRenderDpiChanged;
         App.RenderInvertedChanged += OnRenderInvertedChanged;
+        App.HighlightColorChanged += OnHighlightColorChanged;
+    }
+
+    private void OnHighlightColorChanged()
+    {
+        if (_totalPages == 0) return;
+        RemoveAllPageElements();
+        _viewerMediator.InvalidateAllPages();
+        _pendingRefresh = true;
+        if (IsVisible)
+            RefreshPending();
+    }
+
+    private void OnIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (IsVisible && _pendingRefresh)
+            RefreshPending();
+    }
+
+    private void RefreshPending()
+    {
+        _pendingRefresh = false;
+        UpdateVisiblePages();
     }
 
     private void OnRenderInvertedChanged()

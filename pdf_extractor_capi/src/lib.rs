@@ -690,6 +690,18 @@ pub unsafe extern "C" fn pdf_set_render_inverted(enabled: i32) -> i32 {
     })
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn pdf_set_highlight_color(r: u8, g: u8, b: u8, alpha: u8) -> i32 {
+    ffi_try(|| {
+        ensure_engine_mut(|eng| {
+            let c = eng.config_mut();
+            c.highlight_color = (r, g, b);
+            c.highlight_alpha = alpha;
+            Ok(())
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Registry API
 // ---------------------------------------------------------------------------

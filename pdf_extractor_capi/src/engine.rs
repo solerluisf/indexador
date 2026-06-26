@@ -230,6 +230,8 @@ pub struct EngineConfig {
     pub boolean_query: Option<Vec<(String, String)>>,
     pub boolean_mode: bool,
     pub render_inverted: bool,
+    pub highlight_color: (u8, u8, u8),
+    pub highlight_alpha: u8,
     pub log_cb: Option<extern "C" fn(*const u8, u32)>,
     pub process_cb: Option<extern "C" fn(*const u8, u32)>,
 }
@@ -253,6 +255,8 @@ impl Default for EngineConfig {
             boolean_query: None,
             boolean_mode: false,
             render_inverted: false,
+            highlight_color: (255, 230, 0),
+            highlight_alpha: 204,
             log_cb: None,
             process_cb: None,
         }
@@ -1337,7 +1341,8 @@ impl PdfEngine {
         }
 
         // Paso 2: dibujar con bounding box unión por línea
-        let src_a = 204u32;
+        let (cr, cg, cb) = self.config.highlight_color;
+        let src_a = self.config.highlight_alpha as u32;
         let dst_a = 255u32 - src_a;
         for line in &lines {
             // Altura uniforme = bounding box que cubre TODAS las palabras de la línea
@@ -1358,9 +1363,9 @@ impl PdfEngine {
                         let b = buf[i] as u32;
                         let g = buf[i + 1] as u32;
                         let r = buf[i + 2] as u32;
-                        buf[i]     = ((0u32   * src_a + b * dst_a) / 255) as u8;
-                        buf[i + 1] = ((230u32 * src_a + g * dst_a) / 255) as u8;
-                        buf[i + 2] = ((255u32 * src_a + r * dst_a) / 255) as u8;
+                        buf[i]     = ((cb as u32 * src_a + b * dst_a) / 255) as u8;
+                        buf[i + 1] = ((cg as u32 * src_a + g * dst_a) / 255) as u8;
+                        buf[i + 2] = ((cr as u32 * src_a + r * dst_a) / 255) as u8;
                     }
                 }
             }

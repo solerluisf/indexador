@@ -31,6 +31,9 @@ public partial class App : Application
     }
     public static event Action? RenderInvertedChanged;
 
+    public static event Action? HighlightColorChanged;
+    public static void NotifyHighlightColorChanged() => HighlightColorChanged?.Invoke();
+
     protected override void OnStartup(StartupEventArgs e)
     {
         // Global exception handlers (must be registered BEFORE any UI work)
