@@ -5,7 +5,7 @@ using PdfExplorer.Services;
 
 namespace PdfExplorer.Views;
 
-public partial class SettingsTab : Page
+public partial class SettingsTab : UserControl
 {
     private readonly PdfEngine _engine;
     private bool _wired;

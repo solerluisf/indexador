@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -162,6 +162,94 @@ struct ExtractorTask {
     checksum: String,
 }
 
+/// Results from the deduplication check for a single document.
+enum DedupResult {
+    /// This document is the first occurrence of its content — index normally.
+    Original,
+    /// This document is a duplicate; `original_id` is the job id of the
+    /// already-indexed original.  The duplicated document should be marked
+    /// `done` with `duplicate_of = original_id` without indexing.
+    Duplicate { original_id: i64, original_path: String },
+}
+
+/// In-memory deduplication filter that maps content checksums to already-
+/// indexed original documents.  Loaded from SQLite at pipeline startup and
+/// updated atomically as new originals are indexed.
+///
+/// Performance:
+///   - O(1) lookup per document (HashMap)
+///   - O(1) register per indexed original
+///   - Zero SQLite round-trips in the hot path
+struct DedupFilter {
+    /// checksum → (original_id, original_path)
+    /// Only populated for original (non-duplicate) documents.
+    known: RwLock<HashMap<String, (i64, String)>>,
+    /// Checksums already seen within the current flush batch.
+    /// Prevents two documents with the same checksum in the same batch from
+    /// both being treated as originals.
+    batch_seen: Mutex<HashSet<String>>,
+}
+
+impl DedupFilter {
+    fn new(known: HashMap<String, (i64, String)>) -> Self {
+        Self {
+            known: RwLock::new(known),
+            batch_seen: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Check whether a document is a duplicate.  Returns `Original` if this
+    /// checksum has not been seen before (neither in the global map nor in
+    /// the current batch).
+    fn check(&self, checksum: &str) -> DedupResult {
+        // Skip empty checksums (e.g. files that failed extraction)
+        if checksum.is_empty() {
+            return DedupResult::Original;
+        }
+
+        // Intra-batch dedup: same checksum appearing twice in one batch
+        {
+            let seen = self.batch_seen.lock().unwrap();
+            if seen.contains(checksum) {
+                // Look up the original path from the global map
+                if let Some(&(orig_id, ref orig_path)) = self.known.read().unwrap().get(checksum) {
+                    return DedupResult::Duplicate {
+                        original_id: orig_id,
+                        original_path: orig_path.clone(),
+                    };
+                }
+            }
+        }
+
+        // Global dedup: check against all previously indexed documents
+        if let Some(&(orig_id, ref orig_path)) = self.known.read().unwrap().get(checksum) {
+            return DedupResult::Duplicate {
+                original_id: orig_id,
+                original_path: orig_path.clone(),
+            };
+        }
+
+        DedupResult::Original
+    }
+
+    /// Register a newly indexed original document so that subsequent
+    /// documents with the same checksum are recognised as duplicates.
+    fn register(&self, checksum: &str, id: i64, path: &str) {
+        if checksum.is_empty() {
+            return;
+        }
+        self.known.write().unwrap()
+            .insert(checksum.to_string(), (id, path.to_string()));
+        self.batch_seen.lock().unwrap()
+            .insert(checksum.to_string());
+    }
+
+    /// Clear the intra-batch seen set between flush batches.
+    fn end_batch(&self) {
+        self.batch_seen.lock().unwrap().clear();
+    }
+}
+
 thread_local! {
     static TEXT_BUF: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
 }
@@ -194,6 +282,7 @@ pub fn run_pipeline(
 fn indexer_thread(
     indexer: &Indexer,
     jobs: Arc<JobStore>,
+    dedup: &DedupFilter,
     rx: crossbeam_channel::Receiver<IndexerMsg>,
     metrics: &Metrics,
     batch_size: usize,
@@ -212,6 +301,7 @@ fn indexer_thread(
 
     let mut buf: Vec<DocumentRecord> = Vec::with_capacity(batch_size);
     let mut done_ids: Vec<(i64, bool, String)> = Vec::new();
+    let mut duplicate_ids: Vec<(i64, i64, bool, String)> = Vec::new();
     let mut doc_count: u64 = 0;
     let mut writer = index_writer;
 
@@ -230,7 +320,7 @@ fn indexer_thread(
                 if buf.len() >= batch_size {
                     let batch: Vec<DocumentRecord> = buf.drain(..).collect();
                     let flush_start = Instant::now();
-                    flush_batch(&writer, indexer, &mut done_ids, &batch, log_cb);
+                    flush_batch(&writer, indexer, dedup, &mut done_ids, &mut duplicate_ids, &batch, log_cb);
                     let flush_elapsed = flush_start.elapsed();
                     total_flush_time += flush_elapsed;
                     flush_count += 1;
@@ -245,7 +335,7 @@ fn indexer_thread(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 if !buf.is_empty() {
                     let batch: Vec<DocumentRecord> = buf.drain(..).collect();
-                    flush_batch(&writer, indexer, &mut done_ids, &batch, log_cb);
+                    flush_batch(&writer, indexer, dedup, &mut done_ids, &mut duplicate_ids, &batch, log_cb);
                 }
                 break;
             }
@@ -264,6 +354,10 @@ fn indexer_thread(
                 let _ = jobs.batch_mark_done(&done_ids);
                 done_ids.clear();
 
+                for (id, original_id, ocr_flag, checksum) in duplicate_ids.drain(..) {
+                    let _ = jobs.mark_duplicate(id, original_id, ocr_flag, &checksum);
+                }
+
                 let total = indexer.metrics().docs_indexed();
                 metrics.set_indexer_docs_indexed(total);
                 metrics.set_indexer_last_commit_age(0);
@@ -279,12 +373,15 @@ fn indexer_thread(
 
     }
 
-    // Final commit: Tantivy first, then mark done in SQLite.
+    // Final commit: Tantivy first, then mark done and duplicates in SQLite.
     let commit_start = Instant::now();
     if writer.commit().is_ok() {
         if !done_ids.is_empty() {
             jobs.batch_mark_done(&done_ids).ok();
             done_ids.clear();
+        }
+        for (id, original_id, ocr_flag, checksum) in duplicate_ids.drain(..) {
+            let _ = jobs.mark_duplicate(id, original_id, ocr_flag, &checksum);
         }
         let total = indexer.metrics().docs_indexed();
         metrics.set_indexer_docs_indexed(total);
@@ -305,7 +402,9 @@ fn indexer_thread(
 fn flush_batch(
     writer: &tantivy::IndexWriter,
     indexer: &Indexer,
+    dedup: &DedupFilter,
     done_ids: &mut Vec<(i64, bool, String)>,
+    duplicate_ids: &mut Vec<(i64, i64, bool, String)>,
     batch: &[DocumentRecord],
     log_cb: Option<extern "C" fn(*const u8, u32)>,
 ) {
@@ -326,30 +425,44 @@ fn flush_batch(
 
     let add_start = Instant::now();
     for record in batch {
-        let result = indexer.search_index().add_document(
-            writer,
-            record.id,
-            &record.path,
-            &record.text,
-        );
-        match result {
-            Ok(()) => {
-                indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                pending_done.push((record.id, record.ocr_flag, record.checksum.clone()));
-
-                if !record.word_positions.is_empty() {
-                    pending_align.push((record.id, &record.text, &record.word_positions));
-                }
-            }
-            Err(e) => {
+        match dedup.check(&record.checksum) {
+            DedupResult::Duplicate { original_id, original_path } => {
+                indexer.metrics().dedup_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                duplicate_ids.push((record.id, original_id, record.ocr_flag, record.checksum.clone()));
                 log_msg(log_cb, &format!(
-                    "[flush_batch] add_document failed for id={} path='{}': {}",
-                    record.id, record.path, e
+                    "[dedup] id={} path='{}' is duplicate of id={} path='{}'",
+                    record.id, record.path, original_id, original_path,
                 ));
+            }
+            DedupResult::Original => {
+                let result = indexer.search_index().add_document(
+                    writer,
+                    record.id,
+                    &record.path,
+                    &record.text,
+                );
+                match result {
+                    Ok(()) => {
+                        dedup.register(&record.checksum, record.id, &record.path);
+                        indexer.metrics().docs_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        pending_done.push((record.id, record.ocr_flag, record.checksum.clone()));
+
+                        if !record.word_positions.is_empty() {
+                            pending_align.push((record.id, &record.text, &record.word_positions));
+                        }
+                    }
+                    Err(e) => {
+                        log_msg(log_cb, &format!(
+                            "[flush_batch] add_document failed for id={} path='{}': {}",
+                            record.id, record.path, e
+                        ));
+                    }
+                }
             }
         }
     }
     add_time += add_start.elapsed();
+    dedup.end_batch();
 
     // Phase 1b: align offsets in parallel using a dedicated small thread-pool.
     // Using the global rayon pool here could starve other pipeline components
@@ -1405,6 +1518,7 @@ impl Actor for WorkerPoolActor {
 struct IndexerActor {
     rx: crossbeam_channel::Receiver<IndexerMsg>,
     indexer: Arc<Indexer>,
+    dedup: DedupFilter,
     jobs: Arc<JobStore>,
     metrics: Arc<Metrics>,
     batch_size: usize,
@@ -1416,7 +1530,7 @@ struct IndexerActor {
 impl IndexerActor {
     fn run(self) {
         indexer_thread(
-            &self.indexer, self.jobs, self.rx, &self.metrics,
+            &self.indexer, self.jobs, &self.dedup, self.rx, &self.metrics,
             self.batch_size, self.commit_interval,
             self.num_threads, self.log_cb,
         );
@@ -1592,12 +1706,24 @@ impl PipelineOrchestrator {
             let ibs = self.config.indexer_batch();
             let ci = self.config.commit_int();
             let it = self.config.indexer_threads();
+            // Load checksum map for dedup filter — only originals with checksum.
+            let checksum_map = jobs.load_checksum_map()
+                .unwrap_or_else(|e| {
+                    log_msg(log_cb, &format!("[pipeline] failed to load checksum map: {}", e));
+                    HashMap::new()
+                });
+            log_msg(log_cb, &format!(
+                "[pipeline] dedup filter loaded with {} entries",
+                checksum_map.len(),
+            ));
+            let dedup = DedupFilter::new(checksum_map);
             thread::Builder::new()
                 .name("indexer".into())
                 .spawn(move || {
                     IndexerActor {
                         rx: index_rx,
                         indexer: idx,
+                        dedup,
                         jobs,
                         metrics,
                         batch_size: ibs,
@@ -2984,7 +3110,9 @@ mod tests {
 
         eprintln!("=== Running flush_batch (N={}) ===", N);
         let flush_start = Instant::now();
-        flush_batch(&writer, &indexer, &mut done_ids, &batch, None);
+        let dedup = DedupFilter::new(HashMap::new());
+        let mut duplicate_ids = Vec::new();
+        flush_batch(&writer, &indexer, &dedup, &mut done_ids, &mut duplicate_ids, &batch, None);
         let flush_elapsed = flush_start.elapsed();
 
         assert_eq!(done_ids.len(), N);

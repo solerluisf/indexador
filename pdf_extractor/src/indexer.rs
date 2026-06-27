@@ -29,6 +29,7 @@ pub struct SearchIndex {
 #[allow(dead_code)]
 pub struct IndexerMetrics {
     pub docs_indexed: AtomicU64,
+    pub dedup_skipped: AtomicU64,
     pub last_commit: Mutex<Instant>,
 }
 
@@ -36,6 +37,7 @@ impl IndexerMetrics {
     pub fn new() -> Self {
         Self {
             docs_indexed: AtomicU64::new(0),
+            dedup_skipped: AtomicU64::new(0),
             last_commit: Mutex::new(Instant::now()),
         }
     }

@@ -1394,12 +1394,13 @@ impl PdfEngine {
         }
     }
 
-    pub fn render_page_bgra(
+    fn render_page_bgra_impl(
         &mut self,
         handle: i32,
         page_index: i32,
         dpi: f64,
         highlight_json: Option<&[u8]>,
+        invert: bool,
     ) -> Result<(i32, i32, i32, f64, f64, *mut u8), i32> {
         let pdfium = self.pdfium()?;
         let doc_ptr = self.documents.get_doc_ptr(handle).ok_or_else(|| {
@@ -1469,7 +1470,7 @@ impl PdfEngine {
         let buf_size = (dest_height as usize) * (stride as usize);
         let buf = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_size) };
 
-        if self.config.render_inverted {
+        if invert && self.config.render_inverted {
             self.invert_page_colors(buf, dest_width, dest_height, stride);
         }
 
@@ -1487,6 +1488,26 @@ impl PdfEngine {
             (w_pts as f64, h_pts as f64)
         };
         Ok((dest_width, dest_height, stride, out_w, out_h, buf_ptr))
+    }
+
+    pub fn render_page_bgra(
+        &mut self,
+        handle: i32,
+        page_index: i32,
+        dpi: f64,
+        highlight_json: Option<&[u8]>,
+    ) -> Result<(i32, i32, i32, f64, f64, *mut u8), i32> {
+        self.render_page_bgra_impl(handle, page_index, dpi, highlight_json, true)
+    }
+
+    pub fn render_page_bgra_no_invert(
+        &mut self,
+        handle: i32,
+        page_index: i32,
+        dpi: f64,
+        highlight_json: Option<&[u8]>,
+    ) -> Result<(i32, i32, i32, f64, f64, *mut u8), i32> {
+        self.render_page_bgra_impl(handle, page_index, dpi, highlight_json, false)
     }
 
     pub fn render_page_to_buffer(

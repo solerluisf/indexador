@@ -357,6 +357,47 @@ pub unsafe extern "C" fn pdf_render_page_bgra(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pdf_render_page_bgra_no_invert(
+    handle: i32,
+    page_index: i32,
+    dpi: f64,
+    highlight_json: *const u8,
+    out_width: *mut i32,
+    out_height: *mut i32,
+    out_stride: *mut i32,
+    out_width_pts: *mut f64,
+    out_height_pts: *mut f64,
+    out_pixels: *mut *mut u8,
+) -> i32 {
+    if out_width.is_null() || out_height.is_null() || out_stride.is_null()
+        || out_width_pts.is_null() || out_height_pts.is_null() || out_pixels.is_null()
+    {
+        return ERR_NULL_PTR;
+    }
+    let hj: Option<&[u8]> = if !highlight_json.is_null() {
+        match unsafe { cstr_to_str(highlight_json as *const std::ffi::c_char) } {
+            Ok(s) => Some(s.as_bytes()),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    ffi_try(|| {
+        let (w, h, stride, w_pts, h_pts, pixels) =
+            with_engine_mut(|eng| eng.render_page_bgra_no_invert(handle, page_index, dpi, hj))?;
+        unsafe {
+            *out_width = w;
+            *out_height = h;
+            *out_stride = stride;
+            *out_width_pts = w_pts;
+            *out_height_pts = h_pts;
+            *out_pixels = pixels;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pdf_render_page_to_buffer(
     handle: i32,
     page_index: i32,

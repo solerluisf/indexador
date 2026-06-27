@@ -1,7 +1,6 @@
-<Page x:Class="PdfExplorer.Views.IndexTab"
+<UserControl x:Class="PdfExplorer.Views.IndexTab"
       xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-      Title="Index Creation"
       Background="{DynamicResource PageBackground}" Foreground="{DynamicResource PageForeground}">
     <Grid Margin="10">
         <Grid.RowDefinitions>
@@ -59,4 +58,4 @@
                     Click="OnCancel" IsEnabled="False" />
         </StackPanel>
     </Grid>
-</Page>
+</UserControl>

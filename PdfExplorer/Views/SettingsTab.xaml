@@ -1,7 +1,6 @@
-<Page x:Class="PdfExplorer.Views.SettingsTab"
+<UserControl x:Class="PdfExplorer.Views.SettingsTab"
       xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-      Title="Settings"
       Background="{DynamicResource PageBackground}" Foreground="{DynamicResource PageForeground}">
     <ScrollViewer Margin="10">
         <StackPanel>
@@ -108,4 +107,4 @@
 
         </StackPanel>
     </ScrollViewer>
-</Page>
+</UserControl>

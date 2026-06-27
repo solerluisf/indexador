@@ -13,6 +13,10 @@
     <LangVersion>14</LangVersion>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <RustProfile Condition="'$(Configuration)'=='Release'">--release</RustProfile>
+  </PropertyGroup>
+
   <ItemGroup>
     <Content Include="..\target\$(Configuration)\pdf_extractor_capi.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -31,19 +35,19 @@
   <!-- Compile Rust artifacts before building the C# project -->
   <Target Name="CompileRustDll" BeforeTargets="BeforeBuild">
     <Exec
-      Command="cargo build -p pdf_extractor_capi --target-dir target"
+      Command="cargo build -p pdf_extractor_capi $(RustProfile) --target-dir target"
       WorkingDirectory="$(MSBuildProjectDirectory)\.."
       ConsoleToMSBuild="true"
       StandardOutputImportance="low"
       Condition="Exists('$(MSBuildProjectDirectory)\..\pdf_extractor_capi\Cargo.toml')" />
     <Exec
-      Command="cargo build -p pdf_extractor --bin pdf_worker --target-dir target"
+      Command="cargo build -p pdf_extractor --bin pdf_worker $(RustProfile) --target-dir target"
       WorkingDirectory="$(MSBuildProjectDirectory)\.."
       ConsoleToMSBuild="true"
       StandardOutputImportance="low"
       Condition="Exists('$(MSBuildProjectDirectory)\..\pdf_extractor\Cargo.toml')" />
     <Exec
-      Command="cargo build -p pdf_extractor --bin tesseract_worker --target-dir target"
+      Command="cargo build -p pdf_extractor --bin tesseract_worker $(RustProfile) --target-dir target"
       WorkingDirectory="$(MSBuildProjectDirectory)\.."
       ConsoleToMSBuild="true"
       StandardOutputImportance="low"

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use std::collections::HashMap;
 use std::path::Path;
 #[cfg_attr(not(test), allow(unused_imports))]
 use std::path::PathBuf;
@@ -68,6 +69,11 @@ impl JobStore {
         conn.execute_batch("ALTER TABLE jobs ADD COLUMN language TEXT;").ok();
         conn.execute_batch("ALTER TABLE jobs ADD COLUMN file_modified INTEGER;").ok();
         conn.execute_batch("ALTER TABLE jobs ADD COLUMN file_size INTEGER;").ok();
+
+        // Deduplication support
+        conn.execute_batch("ALTER TABLE jobs ADD COLUMN duplicate_of INTEGER;").ok();
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_jobs_checksum ON jobs(checksum);").ok();
+
         Ok(())
     }
 
@@ -465,6 +471,66 @@ impl JobStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Look up the original (non-duplicate) job for a given checksum.
+    /// Returns `(original_id, original_path)` if an indexed original exists.
+    /// Uses the `idx_jobs_checksum` index — O(log n).
+    pub fn find_original_by_checksum(&self, checksum: &str) -> Result<Option<(i64, String)>> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        match conn.query_row(
+            "SELECT id, path FROM jobs
+             WHERE checksum = ?1
+               AND duplicate_of IS NULL
+               AND status = 'done'
+             LIMIT 1",
+            rusqlite::params![checksum],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Mark a job as a duplicate of another already-indexed job.
+    /// Skips Tantivy indexing — the document is recorded as `done` with a
+    /// `duplicate_of` pointer so it won't be reprocessed.
+    pub fn mark_duplicate(&self, id: i64, original_id: i64, ocr_flag: bool, checksum: &str) -> Result<()> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        conn.execute(
+            "UPDATE jobs SET status = 'done', ocr_flag = ?1, checksum = ?2,
+             duplicate_of = ?3 WHERE id = ?4",
+            rusqlite::params![ocr_flag as i32, checksum, original_id, id],
+        )
+        .context("Failed to mark job as duplicate")?;
+        Ok(())
+    }
+
+    /// Load all indexed checksums into a HashMap for fast in-memory dedup.
+    /// Used by DedupFilter at pipeline startup.
+    /// Only loads original documents (duplicate_of IS NULL).
+    pub fn load_checksum_map(&self) -> Result<HashMap<String, (i64, String)>> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        let mut stmt = conn
+            .prepare("SELECT checksum, id, path FROM jobs WHERE duplicate_of IS NULL AND status = 'done' AND checksum != ''")
+            .context("Failed to prepare checksum map query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .context("Failed to query checksum map")?;
+        let mut map = HashMap::new();
+        for row in rows {
+            if let Ok((checksum, id, path)) = row {
+                map.insert(checksum, (id, path));
+            }
+        }
+        Ok(map)
     }
 
     /// Load all known file paths + metadata into a sorted Vec for in-memory

@@ -6,9 +6,10 @@ using PdfExplorer.Services;
 
 namespace PdfExplorer.Views;
 
-public partial class IndexTab : Page
+public partial class IndexTab : UserControl
 {
     private readonly PdfEngine _engine;
+    private uint? _selectedCollId;
 
     public IndexTab()
     {
@@ -27,7 +28,16 @@ public partial class IndexTab : Page
     private void LoadCollections()
     {
         CollectionList.ItemsSource = _engine.Collections;
-        ProblematicExpander.Visibility = Visibility.Collapsed;
+        if (_selectedCollId.HasValue)
+        {
+            var coll = _engine.Collections.FirstOrDefault(c => c.Id == _selectedCollId.Value);
+            if (coll is not null)
+                CollectionList.SelectedItem = coll;
+        }
+        else
+        {
+            ProblematicExpander.Visibility = Visibility.Collapsed;
+        }
     }
 
     private async void OnCollectionChanged(object sender, SelectionChangedEventArgs e)
@@ -37,7 +47,12 @@ public partial class IndexTab : Page
         StatusLabel.Content = "Ready";
 
         if (CollectionList.SelectedItem is not Models.CollectionInfo coll)
+        {
+            _selectedCollId = null;
             return;
+        }
+
+        _selectedCollId = (uint)coll.Id;
 
         try
         {

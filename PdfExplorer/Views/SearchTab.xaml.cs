@@ -14,7 +14,7 @@ using PdfExplorer.ViewModels;
 
 namespace PdfExplorer.Views;
 
-public partial class SearchTab : Page, IPdfRenderingService
+public partial class SearchTab : UserControl, IPdfRenderingService
 {
     private readonly PdfEngine _engine;
     private readonly IViewerMediator _viewerMediator;
@@ -82,7 +82,12 @@ public partial class SearchTab : Page, IPdfRenderingService
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         CollectionFilter.ItemsSource = _engine.Collections;
-        CollectionFilter.SelectedIndex = -1;
+        if (_selectedCollId.HasValue)
+        {
+            var coll = _engine.Collections.FirstOrDefault(c => c.Id == _selectedCollId.Value);
+            if (coll is not null)
+                CollectionFilter.SelectedItem = coll;
+        }
     }
 
     private void OnCollectionFilterChanged(object sender, SelectionChangedEventArgs e)

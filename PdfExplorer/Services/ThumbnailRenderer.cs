@@ -25,7 +25,7 @@ public sealed class ThumbnailRenderer : IDisposable
     private static extern int pdf_document_page_count(int handle);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-    private static extern int pdf_render_page_bgra(
+    private static extern int pdf_render_page_bgra_no_invert(
         int handle,
         int pageIndex,
         double dpi,
@@ -78,7 +78,7 @@ public sealed class ThumbnailRenderer : IDisposable
 
                             double dpi = 25.0;
 
-                            var rc = pdf_render_page_bgra(
+                            var rc = pdf_render_page_bgra_no_invert(
                                 docHandle, 0, dpi, null,
                                 out var w, out var h, out var stride,
                                 out var wPts, out var hPts, out var pixels);
