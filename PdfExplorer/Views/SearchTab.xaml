@@ -135,18 +135,18 @@
             <Label Grid.Column="0" Content="Collection:" VerticalAlignment="Center"/>
             <ComboBox Grid.Column="1" x:Name="CollectionFilter" Width="180" Height="28"
                       DisplayMemberPath="Label" SelectedValuePath="Id"
-                      SelectionChanged="OnCollectionFilterChanged" />
+                      SelectionChanged="OnCollectionFilterChanged" VerticalContentAlignment="Center"/>
 
             <Label Grid.Column="2" Content="Search:" VerticalAlignment="Center" Margin="10,0,0,0"/>
             <TextBox Grid.Column="3" x:Name="SearchBox" Height="28" IsEnabled="False"
-                     KeyDown="OnSearchBoxKeyDown"/>
+                     KeyDown="OnSearchBoxKeyDown" VerticalContentAlignment="Center"/>
             <ComboBox Grid.Column="4" x:Name="SearchModeCombo" Height="28" SelectedIndex="0"
-                      SelectionChanged="OnSearchModeChanged">
+                      SelectionChanged="OnSearchModeChanged" VerticalContentAlignment="Center">
                 <ComboBoxItem Content="Auto phrase"/>
                 <ComboBoxItem Content="Boolean phrase"/>
             </ComboBox>
             <Button Grid.Column="5" x:Name="SearchButton" Content="Search" Height="28" Margin="5,0,0,0"
-                    Click="OnSearchClick" IsEnabled="False"/>
+                    Click="OnSearchClick" IsEnabled="False" VerticalContentAlignment="Center"/>
 
             <StackPanel Grid.Column="6" Orientation="Horizontal" Margin="10,0,0,0">
                 <Button x:Name="PrevPage" Content="◀◀" Width="30" Height="28"
@@ -165,7 +165,7 @@
             <Separator Grid.Column="7" Width="1" Height="20" Margin="4,0" Background="{DynamicResource SeparatorBackground}"/>
             <Label Grid.Column="8" Content="Zoom:" VerticalAlignment="Center" Margin="4,0,0,0"/>
             <ComboBox Grid.Column="9" x:Name="ZoomCombo" Width="75" Height="28"
-                      SelectedIndex="3" SelectionChanged="OnZoomChanged">
+                      SelectedIndex="3" SelectionChanged="OnZoomChanged" VerticalContentAlignment="Center">
                 <ComboBoxItem Content="50%"/>
                 <ComboBoxItem Content="75%"/>
                 <ComboBoxItem Content="100%"/>
