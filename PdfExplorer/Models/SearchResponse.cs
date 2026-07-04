@@ -7,7 +7,9 @@ public record SearchResult(
     [property: JsonPropertyName("score")] double Score,
     [property: JsonPropertyName("path")] string Path,
     [property: JsonPropertyName("snippet")] string Snippet,
-    [property: JsonPropertyName("collection_id")] long? CollectionId
+    [property: JsonPropertyName("collection_id")] long? CollectionId,
+    [property: JsonPropertyName("matched_terms")] IReadOnlyList<string>? MatchedTerms,
+    [property: JsonPropertyName("phrase_groups")] IReadOnlyList<IReadOnlyList<string>>? PhraseGroups
 )
 {
     public string FileName => System.IO.Path.GetFileName(Path);

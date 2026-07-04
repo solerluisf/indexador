@@ -81,12 +81,15 @@ pub fn raw_to_rich(
             positions: Vec::new(),
             doc_id: doc_id.map(|id| id as i64),
             doc_address: Some(addr),
+            matched_terms: Vec::new(),
+            phrase_groups: Vec::new(),
         }
     }).collect()
 }
 
 pub fn default_enrichers() -> EnricherCoordinator {
     EnricherCoordinator::new(vec![
+        Box::new(crate::search::enrichers::term_collector::TermCollectorEnricher),
         Box::new(crate::search::enrichers::snippet::SnippetEnricher),
     ]).unwrap()
 }

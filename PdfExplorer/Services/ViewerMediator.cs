@@ -59,9 +59,9 @@ public sealed class ViewerMediator : IViewerMediator
 
     // ── Positions ─────────────────────────────────────────────────
 
-    public async Task<List<WordPosition>> FetchPositionsAsync(PdfEngine engine, uint collId, long docId, string query)
+    public async Task<List<WordPosition>> FetchPositionsAsync(PdfEngine engine, uint collId, long docId, List<string> matchedTerms, List<List<string>> phraseGroups)
     {
-        var positions = await Task.Run(() => engine.GetTermPositions(collId, docId, query));
+        var positions = await Task.Run(() => engine.GetTermPositions(collId, docId, matchedTerms, phraseGroups));
         var before = positions.Count;
         positions = positions
             .OrderBy(p => p.Page)
@@ -73,7 +73,7 @@ public sealed class ViewerMediator : IViewerMediator
         return positions;
     }
 
-    public void SetPositions(List<WordPosition> positions, INavigationMediator navMediator, string? query = null, bool isBooleanMode = false)
+    public void SetPositions(List<WordPosition> positions, INavigationMediator navMediator, List<string>? matchedTerms = null, bool isBooleanMode = false)
     {
         _positions = positions ?? new List<WordPosition>();
 
@@ -105,7 +105,7 @@ public sealed class ViewerMediator : IViewerMediator
             _positionsDebugText = string.Empty;
         }
 
-        navMediator.SetContext(_positions, _matchingPages, query, isBooleanMode);
+        navMediator.SetContext(_positions, _matchingPages, matchedTerms, isBooleanMode);
 
         StateChanged?.Invoke(this, new ViewerStateChangedEventArgs
         {

@@ -21,6 +21,8 @@ pub struct SearchResult {
     pub snippet: Option<String>,
     pub positions: Vec<PagePosition>,
     pub doc_id: Option<i64>,
+    pub matched_terms: Vec<String>,
+    pub phrase_groups: Vec<Vec<String>>,
 }
 
 pub struct JsonResponseBuilder;
@@ -44,6 +46,8 @@ impl JsonResponseBuilder {
             snippet: r.snippet,
             positions: r.positions,
             doc_id: r.doc_id,
+            matched_terms: r.matched_terms,
+            phrase_groups: r.phrase_groups,
         }).collect();
 
         SearchResponse {

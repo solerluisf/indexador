@@ -57,6 +57,16 @@ impl IndexerMetrics {
 
 impl SearchIndex {
     pub fn new(index_path: &Path) -> Result<Self> {
+        // Remove any stale writer lock files left from a previous crashed
+        // writer.  On Windows a 0-byte .tantivy-writer.lock can prevent new
+        // segment files from being created (ERROR_ACCESS_DENIED).
+        for lock in [".tantivy-writer.lock", ".tantivy-meta.lock"] {
+            let p = index_path.join(lock);
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+
         let index = if index_path.join("meta.json").exists() {
             Index::open_in_dir(index_path).context("Failed to open existing index")?
         } else {

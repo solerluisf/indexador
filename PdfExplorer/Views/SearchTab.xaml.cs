@@ -664,12 +664,16 @@ public partial class SearchTab : UserControl, IPdfRenderingService
 
             // Fetch term positions
             List<WordPosition> positions;
-            if (result.CollectionId.HasValue)
+            var matchedTerms = result.MatchedTerms?.ToList() ?? new List<string>();
+            var phraseGroups = result.PhraseGroups?
+                .Select(g => g.ToList())
+                .ToList() ?? new List<List<string>>();
+            if (result.CollectionId.HasValue && matchedTerms.Count > 0)
             {
                 try
                 {
                     positions = await _viewerMediator.FetchPositionsAsync(
-                        _engine, (uint)result.CollectionId.Value, result.Id, _searchMediator.LastQuery);
+                        _engine, (uint)result.CollectionId.Value, result.Id, matchedTerms, phraseGroups);
                     Log($"Fetch positions: {sw.Elapsed.TotalMilliseconds:F0}ms, count={positions.Count}");
                 }
                 catch (Exception ex)
@@ -680,11 +684,11 @@ public partial class SearchTab : UserControl, IPdfRenderingService
             }
             else
             {
-                Log("No collection ID available - cannot fetch indexed positions");
+                Log("No collection ID or matched terms available - cannot fetch indexed positions");
                 positions = new List<WordPosition>();
             }
 
-            _viewerMediator.SetPositions(positions, _navigationMediator, _searchMediator.LastQuery, isBooleanMode: SearchModeCombo.SelectedIndex == 1);
+            _viewerMediator.SetPositions(positions, _navigationMediator, matchedTerms, isBooleanMode: SearchModeCombo.SelectedIndex == 1);
 
             _viewerMediator.OpenDocument(pdfBytes, result.Path);
             int pageCount = _viewerMediator.Renderer.GetPageCount();

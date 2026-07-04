@@ -27,8 +27,8 @@ public interface IViewerMediator
     void OpenDocument(byte[] pdfBytes, string path);
     void CloseDocument();
 
-    Task<List<WordPosition>> FetchPositionsAsync(PdfEngine engine, uint collId, long docId, string query);
-    void SetPositions(List<WordPosition> positions, INavigationMediator navMediator, string? query = null, bool isBooleanMode = false);
+    Task<List<WordPosition>> FetchPositionsAsync(PdfEngine engine, uint collId, long docId, List<string> matchedTerms, List<List<string>> phraseGroups);
+    void SetPositions(List<WordPosition> positions, INavigationMediator navMediator, List<string>? matchedTerms = null, bool isBooleanMode = false);
 
     void BuildPageViewModels();
 

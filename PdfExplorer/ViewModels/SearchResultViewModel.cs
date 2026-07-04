@@ -30,6 +30,8 @@ public sealed class SearchResultViewModel : INotifyPropertyChanged
     public long? CollectionId => _model.CollectionId;
     public string FileName => _model.FileName;
     public string FolderPath => _model.FolderPath;
+    public IReadOnlyList<string>? MatchedTerms => _model.MatchedTerms;
+    public IReadOnlyList<IReadOnlyList<string>>? PhraseGroups => _model.PhraseGroups;
 
     // ── Observable thumbnail ──────────────────────────────────────
 

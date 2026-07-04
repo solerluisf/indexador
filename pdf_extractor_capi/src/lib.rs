@@ -104,18 +104,26 @@ pub unsafe extern "C" fn pdf_snippet(
 // pdf_get_term_positions
 // ---------------------------------------------------------------------------
 
+#[derive(serde::Deserialize)]
+struct PositionQueryInput {
+    matched_terms: Vec<String>,
+    phrase_groups: Vec<Vec<String>>,
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pdf_get_term_positions(
     coll_id: u32,
     doc_id: i64,
-    term: *const c_char,
+    input_json: *const c_char,
     out_json: *mut c_char,
     out_len: *mut u32,
 ) -> i32 {
     ffi_try_with(
         || {
-            let t = unsafe { cstr_to_str(term)? };
-            with_engine(|eng| eng.get_term_positions(coll_id, doc_id, t))
+            let json = unsafe { cstr_to_str(input_json)? };
+            let input: PositionQueryInput = serde_json::from_str(json)
+                .map_err(|_| { set_error("Invalid position query JSON".into()); ERR_INVALID_PARAM })?;
+            with_engine(|eng| eng.get_term_positions(coll_id, doc_id, &input.matched_terms, &input.phrase_groups))
         },
         |s| unsafe { write_to_buffer(s.as_bytes(), out_json, out_len) },
     )
@@ -1730,13 +1738,13 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         reset_state();
         let mut buf = [0u8; 128];
         let mut len = 128u32;
-        let term = CString::new("hello").unwrap();
-        let rc = unsafe { pdf_get_term_positions(0, 1, term.as_ptr(), buf.as_mut_ptr() as *mut c_char, &mut len) };
+        let input = CString::new(r#"{"matched_terms":["hello"],"phrase_groups":[["hello"]]}"#).unwrap();
+        let rc = unsafe { pdf_get_term_positions(0, 1, input.as_ptr(), buf.as_mut_ptr() as *mut c_char, &mut len) };
         assert_eq!(rc, ERR_NOT_INIT);
     }
 
     #[test]
-    fn test_get_term_positions_null_term() {
+    fn test_get_term_positions_null_input() {
         reset_state();
         let mut buf = [0u8; 128];
         let mut len = 128u32;
@@ -1776,8 +1784,8 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
 
         let mut buf = [0u8; 4096];
         let mut len = 4096u32;
-        let term = CString::new("hello").unwrap();
-        let rc = unsafe { pdf_get_term_positions(0, 1, term.as_ptr(), buf.as_mut_ptr() as *mut c_char, &mut len) };
+        let input = CString::new(r#"{"matched_terms":["hello"],"phrase_groups":[["hello"]]}"#).unwrap();
+        let rc = unsafe { pdf_get_term_positions(0, 1, input.as_ptr(), buf.as_mut_ptr() as *mut c_char, &mut len) };
         assert_eq!(rc, 0);
         let result = std::str::from_utf8(&buf[..len as usize]).unwrap();
         let v: serde_json::Value = serde_json::from_str(result).unwrap();
@@ -1786,7 +1794,7 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
     }
 
     #[test]
-    fn test_get_term_positions_phrase_filter_individual_words() {
+    fn test_get_term_positions_phrase_match_consecutive() {
         reset_state();
         let (db, idx) = setup_temp_index();
         let db_c = CString::new(db.clone()).unwrap();
@@ -1835,8 +1843,10 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
 
         let mut buf = [0u8; 4096];
         let mut len = 4096u32;
-        let term = CString::new("machine learning").unwrap();
-        let rc = unsafe { pdf_get_term_positions(0, 1, term.as_ptr(), buf.as_mut_ptr() as *mut c_char, &mut len) };
+        let input = CString::new(
+            r#"{"matched_terms":["machine","learning"],"phrase_groups":[["machine","learning"]]}"#
+        ).unwrap();
+        let rc = unsafe { pdf_get_term_positions(0, 1, input.as_ptr(), buf.as_mut_ptr() as *mut c_char, &mut len) };
         assert_eq!(rc, 0);
         let result = std::str::from_utf8(&buf[..len as usize]).unwrap();
         let v: serde_json::Value = serde_json::from_str(result).unwrap();
@@ -1871,8 +1881,8 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
 
         let mut buf = [0u8; 4096];
         let mut len = 4096u32;
-        let term = CString::new("nonexistent").unwrap();
-        let rc = unsafe { pdf_get_term_positions(0, 1, term.as_ptr(), buf.as_mut_ptr() as *mut c_char, &mut len) };
+        let input = CString::new(r#"{"matched_terms":["nonexistent"],"phrase_groups":[["nonexistent"]]}"#).unwrap();
+        let rc = unsafe { pdf_get_term_positions(0, 1, input.as_ptr(), buf.as_mut_ptr() as *mut c_char, &mut len) };
         assert_eq!(rc, 0);
         let result = std::str::from_utf8(&buf[..len as usize]).unwrap();
         let v: serde_json::Value = serde_json::from_str(result).unwrap();
@@ -1895,8 +1905,8 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
 
         let mut buf = [0u8; 4096];
         let mut len = 4096u32;
-        let term = CString::new("hello").unwrap();
-        let rc = unsafe { pdf_get_term_positions(0, 999, term.as_ptr(), buf.as_mut_ptr() as *mut c_char, &mut len) };
+        let input = CString::new(r#"{"matched_terms":["hello"],"phrase_groups":[["hello"]]}"#).unwrap();
+        let rc = unsafe { pdf_get_term_positions(0, 999, input.as_ptr(), buf.as_mut_ptr() as *mut c_char, &mut len) };
         assert_eq!(rc, 0);
         let result = std::str::from_utf8(&buf[..len as usize]).unwrap();
         let v: serde_json::Value = serde_json::from_str(result).unwrap();

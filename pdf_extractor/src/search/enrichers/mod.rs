@@ -1,5 +1,6 @@
 pub mod snippet;
 pub mod positions;
+pub mod term_collector;
 
 use std::collections::VecDeque;
 use std::any::TypeId;

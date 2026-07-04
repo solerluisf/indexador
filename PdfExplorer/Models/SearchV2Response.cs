@@ -59,7 +59,9 @@ public record SearchV2Result(
     [property: JsonPropertyName("score")] double Score,
     [property: JsonPropertyName("path")] string Path,
     [property: JsonPropertyName("snippet")] string? Snippet,
-    [property: JsonPropertyName("positions")] IReadOnlyList<PagePositionV2>? Positions
+    [property: JsonPropertyName("positions")] IReadOnlyList<PagePositionV2>? Positions,
+    [property: JsonPropertyName("matched_terms")] IReadOnlyList<string>? MatchedTerms,
+    [property: JsonPropertyName("phrase_groups")] IReadOnlyList<IReadOnlyList<string>>? PhraseGroups
 );
 
 public record PagePositionV2(

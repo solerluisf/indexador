@@ -53,6 +53,8 @@ pub struct RichResult {
     pub positions: Vec<PagePosition>,
     pub doc_id: Option<i64>,
     pub doc_address: Option<tantivy::DocAddress>,
+    pub matched_terms: Vec<String>,
+    pub phrase_groups: Vec<Vec<String>>,
 }
 
 #[derive(Serialize)]

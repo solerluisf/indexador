@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -381,14 +381,22 @@ impl PdfEngine {
         SearchPipeline::new(ctx, builder, Box::new(TantivyEngine), default_enrichers())
     }
 
-    fn search_input(&self, query: &str, limit: u32, offset: u32, settings: &SearchSettings) -> SearchInput {
+    fn search_input(&self, query: &str, limit: u32, offset: u32, settings: &SearchSettings, strategy: SearchStrategy) -> SearchInput {
         SearchInput {
             query_str: query.to_string(),
             field: None,
             limit: limit as usize,
             offset: offset as usize,
             path_filter: settings.path_filter.clone(),
-            strategy: SearchStrategy::AutoPhrase,
+            strategy,
+        }
+    }
+
+    fn resolve_strategy(&self, settings: &SearchSettings) -> SearchStrategy {
+        if settings.boolean_mode || settings.boolean_query.is_some() {
+            SearchStrategy::BooleanPhrase
+        } else {
+            SearchStrategy::AutoPhrase
         }
     }
 
@@ -435,8 +443,9 @@ impl PdfEngine {
         coll_id: Option<i64>,
         settings: &SearchSettings,
     ) -> Result<(Vec<serde_json::Value>, u64), i32> {
+        let strategy = self.resolve_strategy(settings);
         let pipeline = self.build_pipeline(search_index, settings);
-        let input = self.search_input(query, limit, offset, settings);
+        let input = self.search_input(query, limit, offset, settings, strategy);
 
         let response: SearchResponse = pipeline.execute_to_response(&input)
             .map_err(|e| { set_error(format!("Search failed: {}", e)); ERR_GENERAL })?;
@@ -447,6 +456,8 @@ impl PdfEngine {
                 "score": r.score,
                 "path": r.path,
                 "snippet": r.snippet.as_deref().unwrap_or(""),
+                "matched_terms": r.matched_terms,
+                "phrase_groups": r.phrase_groups,
             });
             if let Some(cid) = coll_id {
                 entry["collection_id"] = serde_json::json!(cid);
@@ -509,13 +520,19 @@ impl PdfEngine {
             _ => Box::new(AutoPhraseQueryBuilder),
         };
 
+        let search_strategy = if strategy == "boolean_phrase" {
+            SearchStrategy::BooleanPhrase
+        } else {
+            SearchStrategy::AutoPhrase
+        };
+
         let input = SearchInput {
             query_str: query_str.to_string(),
             field: None,
             limit,
             offset,
             path_filter,
-            strategy: SearchStrategy::AutoPhrase,
+            strategy: search_strategy,
         };
 
         let pipeline = SearchPipeline::new(ctx, builder, Box::new(TantivyEngine), default_enrichers());
@@ -1064,7 +1081,8 @@ impl PdfEngine {
         &self,
         coll_id: u32,
         doc_id: i64,
-        term: &str,
+        matched_terms: &[String],
+        phrase_groups: &[Vec<String>],
     ) -> Result<String, i32> {
         let collection = if coll_id != 0 {
             Some(self.get_collection(coll_id as i64)?)
@@ -1083,10 +1101,6 @@ impl PdfEngine {
             Err(_) => return Ok("[]".to_string()),
         };
 
-        let stripped: String = term.trim_matches('"').to_string();
-        let is_phrase = !self.config.boolean_mode && is_search_phrase(&stripped);
-        let words: Vec<&str> = stripped.split_whitespace().collect();
-
         // Load (or retrieve from cache) the full position list for this document.
         let all = {
             let cache_key = (doc_id, index_path.to_string_lossy().to_string());
@@ -1100,91 +1114,77 @@ impl PdfEngine {
             }
         };
 
-        let all_positions: Vec<pdf_extractor::positions::StoredPosition> = if is_phrase {
-            // Phrase query: return only positions forming the exact consecutive phrase
-            let by_offset: std::collections::HashMap<usize, &pdf_extractor::positions::StoredPosition> =
-                all.iter().map(|p| (p.word_offset, p)).collect();
+        if matched_terms.is_empty() || phrase_groups.is_empty() {
+            return Ok("[]".to_string());
+        }
 
-            let term_offsets: Vec<std::collections::HashSet<usize>> = words.iter().map(|word| {
-                all.iter()
-                    .filter(|p| p.word_text.to_lowercase() == word.to_lowercase())
-                    .map(|p| p.word_offset)
-                    .collect()
-            }).collect();
+        // Build a lookup: for each position, the lowercased word text
+        let all_lower: Vec<String> = all.iter().map(|p| p.word_text.to_lowercase()).collect();
 
-            let mut matched_offsets = std::collections::HashSet::new();
-            for &start in &term_offsets[0] {
-                let mut ok = true;
-                for i in 1..words.len() {
-                    let expected = start + i;
-                    if !term_offsets[i].contains(&expected) {
-                        ok = false;
-                        break;
-                    }
-                    if by_offset.get(&start).zip(by_offset.get(&expected))
-                        .map_or(true, |(a, b)| a.page != b.page)
-                    {
-                        ok = false;
-                        break;
+        let mut all_positions = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for group in phrase_groups {
+            match group.len() {
+                0 => continue,
+                1 => {
+                    // Single term: simple filter
+                    let term = &group[0].to_lowercase();
+                    for (i, pos) in all.iter().enumerate() {
+                        if all_lower[i] == *term {
+                            let key = (pos.page, (pos.x_min * 100.0) as i32, (pos.y_min * 100.0) as i32);
+                            if seen.insert(key) {
+                                all_positions.push(pos.clone());
+                            }
+                        }
                     }
                 }
-                if ok {
-                    for i in 0..words.len() {
-                        matched_offsets.insert(start + i);
-                    }
-                }
-            }
+                _ => {
+                    // Multi-term: consecutive-offset matching
+                    let group_lower: Vec<String> = group.iter().map(|t| t.to_lowercase()).collect();
+                    let first_term = &group_lower[0];
+                    let rest = &group_lower[1..];
 
-            all.into_iter()
-                .filter(|p| matched_offsets.contains(&p.word_offset))
-                .collect()
-        } else if stripped.split_whitespace().count() > 1 {
-            // Boolean query with operators: support quoted phrases + standalone terms
-            let (quoted_phrases, standalone_terms) = parse_phrases_and_terms(term);
+                    for (i, pos) in all.iter().enumerate() {
+                        if all_lower[i] != *first_term {
+                            continue;
+                        }
 
-            if quoted_phrases.is_empty() {
-                // Simple case: only standalone terms
-                all.into_iter()
-                    .filter(|p| standalone_terms.iter().any(|t| p.word_text.to_lowercase() == *t))
-                    .collect()
-            } else {
-                // Mixed: quoted phrases + standalone terms
-                let mut matched_offsets = HashSet::new();
+                        // Check if remaining terms exist at consecutive offsets
+                        let mut found = true;
+                        for (j, next_term) in rest.iter().enumerate() {
+                            let expected_offset = pos.word_offset + j + 1;
+                            let exists = all.iter().any(|p| {
+                                p.page == pos.page
+                                && p.word_offset == expected_offset
+                                && p.word_text.to_lowercase() == *next_term
+                            });
+                            if !exists {
+                                found = false;
+                                break;
+                            }
+                        }
 
-                for phrase in &quoted_phrases {
-                    let offsets = get_phrase_match_offsets(&all, phrase);
-                    matched_offsets.extend(offsets);
-                }
-
-                for pos in &all {
-                    if standalone_terms.iter().any(|t| pos.word_text.to_lowercase() == *t) {
-                        matched_offsets.insert(pos.word_offset);
-                    }
-                }
-
-                all.into_iter()
-                    .filter(|p| matched_offsets.contains(&p.word_offset))
-                    .collect()
-            }
-        } else {
-            // Single-word query: filter in-memory from cached data
-            let mut seen = std::collections::HashSet::new();
-            let mut positions = Vec::new();
-            let word = words.first().copied().unwrap_or("");
-            if !word.is_empty() {
-                let term_lower = word.to_lowercase();
-                for pos in &all {
-                    let lower = pos.word_text.to_lowercase();
-                    if lower == term_lower {
-                        let key = (pos.page, (pos.x_min * 100.0) as i32, (pos.y_min * 100.0) as i32);
-                        if seen.insert(key) {
-                            positions.push(pos.clone());
+                        if found {
+                            // Include all positions in this phrase group
+                            for j in 0..group.len() {
+                                let target_offset = pos.word_offset + j;
+                                if let Some(match_pos) = all.iter().find(|p| {
+                                    p.page == pos.page && p.word_offset == target_offset
+                                }) {
+                                    let key = (match_pos.page,
+                                        (match_pos.x_min * 100.0) as i32,
+                                        (match_pos.y_min * 100.0) as i32);
+                                    if seen.insert(key) {
+                                        all_positions.push(match_pos.clone());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            positions
-        };
+        }
 
         let json_entries: Vec<serde_json::Value> = all_positions.iter().map(|sp| {
             serde_json::json!({
@@ -1733,135 +1733,4 @@ pub struct SearchSettings {
     pub boolean_mode: bool,
 }
 
-/// Retorna true si `s` es una consulta multi-palabra sin operadores booleanos,
-/// donde la intención es búsqueda de frase exacta (auto-phrase).
-fn is_search_phrase(s: &str) -> bool {
-    let t = s.trim();
-    if !t.contains(' ') {
-        return false;
-    }
-    if t.contains('"') || t.contains('(') || t.contains(')')
-        || t.contains('+') || t.contains('-')
-    {
-        return false;
-    }
-    !t.split_whitespace().any(|w| {
-        w.eq_ignore_ascii_case("AND")
-            || w.eq_ignore_ascii_case("OR")
-            || w.eq_ignore_ascii_case("NOT")
-    })
-}
 
-/// Extrae frases entrecomilladas y términos sueltos (sin operadores) del query original.
-/// Ej: `"machine learning" AND "signal processing"`
-///     → phrases = ["machine learning", "signal processing"], standalone = []
-/// Ej: `machine AND learning`
-///     → phrases = [], standalone = ["machine", "learning"]
-fn parse_phrases_and_terms(query: &str) -> (Vec<String>, Vec<String>) {
-    let mut phrases: Vec<String> = Vec::new();
-    let mut standalone: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-
-    for ch in query.chars() {
-        match ch {
-            '"' => {
-                if in_quote {
-                    let phrase = current.trim().to_string();
-                    if !phrase.is_empty() {
-                        if phrase.contains(' ') {
-                            phrases.push(phrase);
-                        } else {
-                            standalone.push(phrase);
-                        }
-                    }
-                    current.clear();
-                    in_quote = false;
-                } else {
-                    in_quote = true;
-                }
-            }
-            ' ' | '\t' if !in_quote => {
-                if !current.is_empty() {
-                    let t = current.trim().to_string();
-                    if !t.is_empty()
-                        && !t.eq_ignore_ascii_case("AND")
-                        && !t.eq_ignore_ascii_case("OR")
-                        && !t.eq_ignore_ascii_case("NOT")
-                    {
-                        standalone.push(t.to_lowercase());
-                    }
-                    current.clear();
-                }
-            }
-            _ => {
-                current.push(ch);
-            }
-        }
-    }
-
-    // Last token
-    if !current.is_empty() {
-        let t = current.trim().to_string();
-        if !t.is_empty()
-            && !t.eq_ignore_ascii_case("AND")
-            && !t.eq_ignore_ascii_case("OR")
-            && !t.eq_ignore_ascii_case("NOT")
-        {
-            standalone.push(t.to_lowercase());
-        }
-    }
-
-    // Deduplicate standalone terms
-    let mut seen = HashSet::new();
-    standalone.retain(|t| seen.insert(t.clone()));
-
-    (phrases, standalone)
-}
-
-/// Dado un slice de todas las posiciones del documento y una frase (query multi-palabra
-/// sin operadores), retorna los `word_offset` que forman la frase exacta
-/// (consecutivos y en la misma página).
-fn get_phrase_match_offsets(
-    all: &[pdf_extractor::positions::StoredPosition],
-    phrase: &str,
-) -> HashSet<usize> {
-    let phrase_words: Vec<&str> = phrase.split_whitespace().collect();
-    if phrase_words.len() < 2 {
-        return HashSet::new();
-    }
-
-    let by_offset: HashMap<usize, &pdf_extractor::positions::StoredPosition> =
-        all.iter().map(|p| (p.word_offset, p)).collect();
-
-    let term_offsets: Vec<HashSet<usize>> = phrase_words.iter().map(|word| {
-        all.iter()
-            .filter(|p| p.word_text.to_lowercase() == word.to_lowercase())
-            .map(|p| p.word_offset)
-            .collect()
-    }).collect();
-
-    let mut matched = HashSet::new();
-    for &start in &term_offsets[0] {
-        let mut ok = true;
-        for i in 1..phrase_words.len() {
-            let expected = start + i;
-            if !term_offsets[i].contains(&expected) {
-                ok = false;
-                break;
-            }
-            if by_offset.get(&start).zip(by_offset.get(&expected))
-                .map_or(true, |(a, b)| a.page != b.page)
-            {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            for i in 0..phrase_words.len() {
-                matched.insert(start + i);
-            }
-        }
-    }
-    matched
-}

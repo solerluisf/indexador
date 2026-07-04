@@ -17,7 +17,7 @@ public interface INavigationMediator
     bool CanGoNextPosition { get; }
     bool CanGoPrevPosition { get; }
 
-    void SetContext(IReadOnlyList<WordPosition> positions, IReadOnlyList<int> matchingPages, string? query = null, bool isBooleanMode = false);
+    void SetContext(IReadOnlyList<WordPosition> positions, IReadOnlyList<int> matchingPages, IReadOnlyList<string>? matchedTerms = null, bool isBooleanMode = false);
     bool GotoNextMatch();
     bool GotoPrevMatch();
     bool GotoNextPosition();

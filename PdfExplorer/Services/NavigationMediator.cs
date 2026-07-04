@@ -40,15 +40,14 @@ public sealed class NavigationMediator : INavigationMediator
     public bool CanGoNextPosition => _phraseStarts.Count > 0 && (CurrentPhraseIndex < _phraseStarts.Count - 1 || _phraseStarts.Count == 1);
     public bool CanGoPrevPosition => _phraseStarts.Count > 0 && (CurrentPhraseIndex > 0 || _phraseStarts.Count == 1);
 
-    public void SetContext(IReadOnlyList<WordPosition> positions, IReadOnlyList<int> matchingPages, string? query = null, bool isBooleanMode = false)
+    public void SetContext(IReadOnlyList<WordPosition> positions, IReadOnlyList<int> matchingPages, IReadOnlyList<string>? matchedTerms = null, bool isBooleanMode = false)
     {
         _positions = positions ?? Array.Empty<WordPosition>();
         _matchingPages = matchingPages ?? Array.Empty<int>();
         _matchingPagesList = matchingPages is List<int> list ? list : matchingPages?.ToList() ?? new List<int>();
         _totalMatchPages = _matchingPages.Count;
 
-        bool hasQuotedPhrases = query != null && query.IndexOf('"') >= 0;
-        bool shouldGroupByPhrase = (!isBooleanMode && IsPhraseQuery(query)) || hasQuotedPhrases;
+        bool shouldGroupByPhrase = matchedTerms is { Count: > 1 };
         _phraseStarts = shouldGroupByPhrase ? BuildPhraseStarts(_positions) : BuildPositionsAsPhrases(_positions);
     }
 
@@ -241,20 +240,6 @@ public sealed class NavigationMediator : INavigationMediator
             starts.Add(i);
         return starts;
     }
-
-    private static bool IsPhraseQuery(string? query)
-    {
-        if (string.IsNullOrWhiteSpace(query))
-            return false;
-        var trimmed = query.Trim();
-        if (!trimmed.Contains(' '))
-            return false;
-        if (trimmed.Contains('"') || trimmed.Contains('(') || trimmed.Contains(')')
-            || trimmed.Contains('+') || trimmed.Contains('-'))
-            return false;
-        return !trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries).Any(w =>
-            w.Equals("AND", StringComparison.OrdinalIgnoreCase)
-            || w.Equals("OR", StringComparison.OrdinalIgnoreCase)
-            || w.Equals("NOT", StringComparison.OrdinalIgnoreCase));
-    }
 }
+
+

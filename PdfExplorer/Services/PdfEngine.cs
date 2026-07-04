@@ -123,7 +123,7 @@ public sealed class PdfEngine : IDisposable
     private static extern int pdf_search_all(byte[] query, uint limit, uint offset, byte[] outJson, ref uint outLen);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-    private static extern int pdf_get_term_positions(uint collId, long docId, byte[] term, byte[] outJson, ref uint outLen);
+    private static extern int pdf_get_term_positions(uint collId, long docId, byte[] inputJson, byte[] outJson, ref uint outLen);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern void pdf_free_string(IntPtr ptr);
@@ -175,10 +175,11 @@ public sealed class PdfEngine : IDisposable
         return result;
     }
 
-    public List<WordPosition> GetTermPositions(uint collId, long docId, string term)
+    public List<WordPosition> GetTermPositions(uint collId, long docId, List<string> matchedTerms, List<List<string>> phraseGroups)
     {
-        Log($"Calling GetTermPositions(collId={collId}, docId={docId}, term='{term}')");
-        var json = CallBuf((buf, ref len) => pdf_get_term_positions(collId, docId, Utf8(term), buf, ref len));
+        var input = JsonSerializer.Serialize(new { matched_terms = matchedTerms, phrase_groups = phraseGroups });
+        Log($"Calling GetTermPositions(collId={collId}, docId={docId}, terms={matchedTerms.Count})");
+        var json = CallBuf((buf, ref len) => pdf_get_term_positions(collId, docId, Utf8(input), buf, ref len));
         var result = JsonSerializer.Deserialize<List<WordPosition>>(json) ?? new List<WordPosition>();
         Log($"GetTermPositions returned: {result.Count} positions");
         return result;
