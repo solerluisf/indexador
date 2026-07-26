@@ -260,7 +260,7 @@ impl PositionStore {
         ) {
             Ok(blob) => {
                 let payload = Self::strip_header(&blob)?;
-                let decompressed = zstd::bulk::decompress(payload, 64 * 1024 * 1024)
+                let decompressed = zstd::stream::decode_all(payload)
                     .map_err(|e| anyhow::anyhow!("zstd decompression failed: {}", e))?;
                 let positions: Vec<StoredPosition> =
                     bincode::deserialize(&decompressed)
@@ -293,7 +293,7 @@ impl PositionStore {
             })?;
 
         let payload = Self::strip_header(&blob)?;
-        let decompressed = zstd::bulk::decompress(payload, 64 * 1024 * 1024)
+        let decompressed = zstd::stream::decode_all(payload)
             .map_err(|e| anyhow::anyhow!("zstd decompression failed: {}", e))?;
 
         bincode::deserialize(&decompressed)
