@@ -661,6 +661,32 @@ impl JobStore {
         )
         .context("Failed to query job language")
     }
+
+    /// Delete a job row by file path.
+    pub fn delete_by_path(&self, path: &str) -> Result<()> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        conn.execute("DELETE FROM jobs WHERE path = ?1", rusqlite::params![path])
+            .context("Failed to delete job by path")?;
+        Ok(())
+    }
+
+    /// Load all file paths from the jobs table (used for orphan detection).
+    pub fn load_all_paths(&self) -> Result<Vec<String>> {
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        let mut stmt = conn
+            .prepare("SELECT path FROM jobs ORDER BY path")
+            .context("Failed to prepare load_all_paths query")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("Failed to query all paths")?;
+        let mut paths = Vec::new();
+        for row in rows {
+            if let Ok(p) = row {
+                paths.push(p);
+            }
+        }
+        Ok(paths)
+    }
 }
 
 pub fn compute_checksum(data: &[u8]) -> String {

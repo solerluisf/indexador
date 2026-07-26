@@ -882,6 +882,7 @@ fn run_extraction_process(
                 // pipe buffer — drain them so they aren't silently lost.
                 let (recovered_ok, recovered_err) =
                     drain_crash_frames(&mut stdout_reader, &path_map, result_tx, jobs, metrics);
+                files_ok += recovered_ok as u64;
                 files_err += recovered_err as u64;
                 let msg = format!(
                     "[extraction] worker stdin write failed on '{}' — drained {} success + {} error frames from buffer",
@@ -973,17 +974,17 @@ fn run_extraction_process(
                         files_err += 1;
                     }
                 }
-            let batch_elapsed = batch_start.elapsed();
-            total_batch_time += batch_elapsed;
-            let mem = proc_mon::working_set_mib(pid);
-            report_process(process_cb, &thread_name, pid, "running", mem, "");
-            log_msg(log_cb, &format!(
-                "[extraction] {} batch {}: {} docs in {:.3}s (total: {} ok, {} err, uptime {})",
-                thread_name, batch_count, files_ok + files_err,
-                batch_elapsed.as_secs_f64(),
-                files_ok, files_err, format_uptime(worker_start.elapsed()),
-            ));
         }
+        let batch_elapsed = batch_start.elapsed();
+        total_batch_time += batch_elapsed;
+        let mem = proc_mon::working_set_mib(pid);
+        report_process(process_cb, &thread_name, pid, "running", mem, "");
+        log_msg(log_cb, &format!(
+            "[extraction] {} batch {}: {} docs in {:.3}s (total: {} ok, {} err, uptime {})",
+            thread_name, batch_count, files_ok + files_err,
+            batch_elapsed.as_secs_f64(),
+            files_ok, files_err, format_uptime(worker_start.elapsed()),
+        ));
     }
 
     // --- cleanup ---
@@ -1549,6 +1550,79 @@ impl Actor for IndexerActor {
     }
 }
 
+/// Remove entries from the Tantivy index and position store for PDFs
+/// that are in the jobs database but no longer exist on disk.
+/// Returns the number of orphaned documents removed.
+pub fn remove_orphans(
+    jobs: &JobStore,
+    dir: &Path,
+    indexer: &Indexer,
+    log_cb: Option<extern "C" fn(*const u8, u32)>,
+) -> Result<u64> {
+    use walkdir::WalkDir;
+
+    // 1. Collect all PDF paths that currently exist on disk
+    let disk_paths: HashSet<String> = WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false)
+        })
+        .map(|e| e.path().to_string_lossy().to_string())
+        .collect();
+
+    // 2. Load all paths from the jobs database
+    let db_paths: HashSet<String> = jobs.load_all_paths()?.into_iter().collect();
+
+    // 3. Find orphans: in DB but not on disk
+    let orphans: Vec<String> = db_paths.difference(&disk_paths).cloned().collect();
+
+    if orphans.is_empty() {
+        log_msg(log_cb, "[pipeline] no orphaned documents found");
+        return Ok(0);
+    }
+
+    let count = orphans.len() as u64;
+    log_msg(log_cb, &format!(
+        "[pipeline] found {} orphaned documents, removing...", count
+    ));
+
+    // 4. Delete each orphan from Tantivy, positions, and jobs
+    for path in &orphans {
+        let doc_id = match jobs.get_id_by_path(path)? {
+            Some(id) => id,
+            None => {
+                log_msg(log_cb, &format!(
+                    "[pipeline] orphan '{}' has no doc_id, skipping", path
+                ));
+                continue;
+            }
+        };
+
+        if let Err(e) = indexer.delete_document(doc_id, path) {
+            log_msg(log_cb, &format!(
+                "[pipeline] failed to delete '{}' from index: {}", path, e
+            ));
+        }
+
+        if let Err(e) = jobs.delete_by_path(path) {
+            log_msg(log_cb, &format!(
+                "[pipeline] failed to delete job '{}': {}", path, e
+            ));
+        }
+    }
+
+    log_msg(log_cb, &format!(
+        "[pipeline] removed {} orphaned documents", count
+    ));
+    Ok(count)
+}
+
 /// Orchestrates the entire extraction pipeline:
 /// 1. Scans directory, creates channels
 /// 2. Spawns ScannerActor, WorkerPoolActor, IndexerActor
@@ -1634,6 +1708,31 @@ impl PipelineOrchestrator {
 
         scan_directory(&self.jobs, &self.input)?;
         let scan_elapsed = pipeline_start.elapsed();
+        log_msg(self.config.log_cb, &format!(
+            "[pipeline] scan_directory took {:.3}s",
+            scan_elapsed.as_secs_f64()
+        ));
+
+        // Remove orphaned documents (in DB but no longer on disk)
+        if let Some(ref indexer) = self.indexer {
+            let orphan_start = Instant::now();
+            match remove_orphans(&self.jobs, &self.input, indexer, self.config.log_cb) {
+                Ok(n) => {
+                    if n > 0 {
+                        log_msg(self.config.log_cb, &format!(
+                            "[pipeline] remove_orphans removed {} docs in {:.3}s",
+                            n, orphan_start.elapsed().as_secs_f64()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    log_msg(self.config.log_cb, &format!(
+                        "[pipeline] remove_orphans failed: {} — continuing", e
+                    ));
+                }
+            }
+        }
+
         let pending = self.jobs.count_pending()?;
         if pending == 0 {
             log_msg(self.config.log_cb, "[pipeline] no pending jobs");
@@ -1641,8 +1740,8 @@ impl PipelineOrchestrator {
         }
 
         log_msg(self.config.log_cb, &format!(
-            "[pipeline] scan_directory took {:.3}s, {} pending",
-            scan_elapsed.as_secs_f64(), pending
+            "[pipeline] {} jobs pending, starting extraction",
+            pending
         ));
 
         self.config.worker_path

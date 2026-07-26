@@ -265,30 +265,28 @@ public sealed class PdfEngine : IDisposable
     public async Task<int> IndexCollectionAsync(uint collId, bool ocr, bool noIndex,
         IProgress<(long current, long total)>? progress, CancellationToken ct)
     {
-        Log($"Calling IndexCollectionAsync(collId={collId}, ocr={ocr}, noIndex={noIndex})");
+        Log($"IndexCollectionAsync(collId={collId}, ocr={ocr}, noIndex={noIndex})");
         _indexingCollId = collId;
-        using var reg = ct.Register(() => { if (_indexingCollId.HasValue) pdf_cancel_indexing(_indexingCollId.Value); });
         var flags = (ocr ? 1u : 0u) | (noIndex ? 2u : 0u);
 
-        _progressCb = new ProgressCallback((current, total) =>
+        var cb = new ProgressCallback((current, total) =>
         {
             progress?.Report(((long)current, (long)total));
-            if (ct.IsCancellationRequested && _indexingCollId.HasValue)
-                pdf_cancel_indexing(_indexingCollId.Value);
+            if (ct.IsCancellationRequested)
+                pdf_cancel_indexing(collId);
         });
 
-        _progressCbHandle = GCHandle.Alloc(_progressCb);
+        var cbHandle = GCHandle.Alloc(cb);
+        using var reg = ct.Register(() => pdf_cancel_indexing(collId));
+
         try
         {
-            var progressCb = Marshal.GetFunctionPointerForDelegate(_progressCb);
-            var rc = await Task.Run(() => pdf_index_collection(collId, flags, progressCb));
-            return rc;
+            var cbPtr = Marshal.GetFunctionPointerForDelegate(cb);
+            return await Task.Run(() => pdf_index_collection(collId, flags, cbPtr));
         }
         finally
         {
-            _progressCbHandle.Value.Free();
-            _progressCbHandle = null;
-            _progressCb = null;
+            cbHandle.Free();
             _indexingCollId = null;
             Log($"IndexCollectionAsync completed");
         }
@@ -296,9 +294,6 @@ public sealed class PdfEngine : IDisposable
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void ProgressCallback(ulong current, ulong total);
-
-    private ProgressCallback? _progressCb;
-    private GCHandle? _progressCbHandle;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void LogCallback(IntPtr msg, uint len);
@@ -348,14 +343,7 @@ public sealed class PdfEngine : IDisposable
             return;
         }
 
-        if (_logCbHandle.HasValue)
-        {
-            _logCbHandle.Value.Free();
-            _logCbHandle = null;
-        }
-        _logCb = null;
-
-        _logCb = (msgPtr, len) =>
+        LogCallback newCb = (msgPtr, len) =>
         {
             try
             {
@@ -369,9 +357,16 @@ public sealed class PdfEngine : IDisposable
                 // crashing the native worker thread.
             }
         };
-        _logCbHandle = GCHandle.Alloc(_logCb);
-        var fnPtr = Marshal.GetFunctionPointerForDelegate(_logCb);
+        var newHandle = GCHandle.Alloc(newCb);
+        var fnPtr = Marshal.GetFunctionPointerForDelegate(newCb);
         pdf_set_log_callback(fnPtr);
+
+        // Native code now uses the new pointer — safe to release the old one.
+        if (_logCbHandle.HasValue)
+            _logCbHandle.Value.Free();
+
+        _logCb = newCb;
+        _logCbHandle = newHandle;
     }
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -393,14 +388,7 @@ public sealed class PdfEngine : IDisposable
             return;
         }
 
-        if (_procCbHandle.HasValue)
-        {
-            _procCbHandle.Value.Free();
-            _procCbHandle = null;
-        }
-        _procCb = null;
-
-        _procCb = (msgPtr, len) =>
+        LogCallback newCb = (msgPtr, len) =>
         {
             try
             {
@@ -413,9 +401,16 @@ public sealed class PdfEngine : IDisposable
                 // Swallow exceptions to avoid crashing the native worker thread.
             }
         };
-        _procCbHandle = GCHandle.Alloc(_procCb);
-        var fnPtr = Marshal.GetFunctionPointerForDelegate(_procCb);
+        var newHandle = GCHandle.Alloc(newCb);
+        var fnPtr = Marshal.GetFunctionPointerForDelegate(newCb);
         pdf_set_process_callback(fnPtr);
+
+        // Native code now uses the new pointer — safe to release the old one.
+        if (_procCbHandle.HasValue)
+            _procCbHandle.Value.Free();
+
+        _procCb = newCb;
+        _procCbHandle = newHandle;
     }
 
     public void CancelIndexing()

@@ -693,6 +693,15 @@ impl SearchIndex {
         Ok(true)
     }
 
+    /// Delete a document by exact path match (uses a term query on the path field).
+    pub fn delete_by_exact_path(&self, path: &str) -> Result<bool> {
+        let term = Term::from_field_text(self.path_field, path);
+        let mut writer = self.writer()?;
+        writer.delete_term(term);
+        writer.commit()?;
+        Ok(true)
+    }
+
     /// Execute a boolean query where each clause is an independent text query
     /// combined with MUST / SHOULD / MUST_NOT semantics.
     pub fn search_boolean(
@@ -844,7 +853,7 @@ impl Indexer {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn index_document(&self, id: i64, path: &str, text: &str) -> Result<()> {
         let mut writer = self.search_index.writer()?;
         self.search_index.add_document(&mut writer, id, path, text)?;
@@ -867,6 +876,15 @@ impl Indexer {
     pub fn store_word_positions(&self, doc_id: i64, positions: &[(usize, crate::extractor::WordPosition)]) -> Result<()> {
         let store = self.position_store.lock().unwrap();
         store.store_positions(doc_id, positions)?;
+        Ok(())
+    }
+
+    /// Delete a document from the Tantivy index and its positions from SQLite.
+    /// The caller is responsible for removing the job entry from `jobs.db`.
+    pub fn delete_document(&self, doc_id: i64, path: &str) -> Result<()> {
+        self.search_index.delete_by_exact_path(path)?;
+        let store = self.position_store.lock().unwrap();
+        store.delete_doc(doc_id)?;
         Ok(())
     }
 }

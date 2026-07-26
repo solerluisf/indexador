@@ -605,7 +605,7 @@ public sealed class DllIntegrationTests : IClassFixture<TestPdfFixture>, IDispos
     public void Phrase_auto_quote_term_positions_return_nonempty()
     {
         var doc = GetDoc("machine learning", "test_phrase_extra");
-        var positions = _fixture.Engine.GetTermPositions(_fixture.CollectionId, doc.Id, "machine learning");
+        var positions = _fixture.Engine.GetTermPositions(_fixture.CollectionId, doc.Id, new List<string> { "machine learning" }, new List<List<string>>());
         Assert.NotEmpty(positions);
     }
 
@@ -934,7 +934,7 @@ public sealed class DllIntegrationTests : IClassFixture<TestPdfFixture>, IDispos
         var doc = GetDoc("pattern", "test_repeat");
 
         var enginePositions = _fixture.Engine.GetTermPositions(
-            _fixture.CollectionId, doc.Id, "pattern");
+            _fixture.CollectionId, doc.Id, new List<string> { "pattern" }, new List<List<string>>());
 
         var rawPositions = GetSqlitePositions(
             _fixture.CollectionId, doc.Id, "pattern");
@@ -956,7 +956,7 @@ public sealed class DllIntegrationTests : IClassFixture<TestPdfFixture>, IDispos
         var doc = GetDoc("vector", "test_phrase.pdf");
 
         var enginePositions = _fixture.Engine.GetTermPositions(
-            _fixture.CollectionId, doc.Id, "vector");
+            _fixture.CollectionId, doc.Id, new List<string> { "vector" }, new List<List<string>>());
 
         var rawPositions = GetSqlitePositions(
             _fixture.CollectionId, doc.Id, "vector");

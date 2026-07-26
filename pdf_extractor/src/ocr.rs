@@ -143,6 +143,14 @@ impl Drop for WorkerProcess {
     fn drop(&mut self) {
         let _ = writeln!(self.stdin, "EXIT");
         let _ = self.stdin.flush();
+        // Polite wait with timeout to avoid hanging on shutdown.
+        for _ in 0..50 {
+            if self.child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
         // Drain any stderr the worker wrote (e.g. Tesseract warnings/errors).
         if let Some(ref mut stderr) = self.stderr {

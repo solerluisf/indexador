@@ -236,7 +236,7 @@ unsafe fn extract_text_and_positions(
                         let avg_w = total_width / char_count_in_page as f64;
                         let vert_gap = (bottom - prev_bottom).abs();
                         let horiz_gap = left - prev_right;
-                        if vert_gap > avg_h * 0.7 || horiz_gap.abs() > avg_w * 1.5 {
+                        if vert_gap > avg_h * 0.7 || horiz_gap > avg_w * 1.5 {
                             let page_num = (page_idx + 1) as u32;
                             if is_single_token(&current_word) {
                                 word_positions.push(WordPosition {
@@ -371,16 +371,7 @@ pub fn extract_pdf(path: &Path) -> Result<ExtractionResult> {
     };
     if doc.is_null() {
         let err = unsafe { (pdfium.FPDF_GetLastError)() };
-        if err == pdfium::FPDF_ERR_FILE || err == pdfium::FPDF_ERR_FORMAT {
-            anyhow::bail!("Failed to load PDF: {}", pdfium::error_str(err));
-        }
-        return Ok(ExtractionResult {
-            text: String::new(),
-            ocr_flag: true,
-            word_positions: Vec::new(),
-            page_count: 0,
-            extraction_ms: extract_start.elapsed().as_millis() as u64,
-        });
+        anyhow::bail!("Failed to load PDF from memory: {}", pdfium::error_str(err));
     }
 
     let result = unsafe { extract_text_and_positions(pdfium, doc) };

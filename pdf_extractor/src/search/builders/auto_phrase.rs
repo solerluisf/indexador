@@ -10,6 +10,7 @@ pub struct AutoPhraseQueryBuilder;
 
 impl QueryBuilder for AutoPhraseQueryBuilder {
     fn build(&self, ctx: &SearchContext, input: &SearchInput) -> Result<Box<dyn Query>, SearchError> {
+        check_bare_operator(&input.query_str)?;
         parse_query_auto_phrase(&ctx.index, &input.query_str, ctx.content_field)
             .map_err(SearchError::from)
     }
@@ -37,4 +38,22 @@ pub fn parse_query_auto_phrase(
         query_str.to_string()
     };
     qp.parse_query(&adjusted).context("Failed to parse search query")
+}
+
+fn check_bare_operator(query: &str) -> Result<(), SearchError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(SearchError::ParseError("Query is empty".to_string()));
+    }
+    let lower = trimmed.to_lowercase();
+    match lower.as_str() {
+        "+" | "-" => {
+            return Err(SearchError::ParseError(format!(
+                "'{}' operator requires a term to perform the search",
+                lower
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
 }

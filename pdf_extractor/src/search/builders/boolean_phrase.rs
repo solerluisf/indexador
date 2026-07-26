@@ -8,6 +8,7 @@ pub struct BooleanPhraseQueryBuilder;
 
 impl QueryBuilder for BooleanPhraseQueryBuilder {
     fn build(&self, ctx: &SearchContext, input: &SearchInput) -> Result<Box<dyn Query>, SearchError> {
+        check_bare_operator(&input.query_str)?;
         let mut qp = QueryParser::for_index(&ctx.index, vec![ctx.content_field]);
         qp.set_conjunction_by_default();
         let adjusted = if is_bare_multiword(&input.query_str) {
@@ -41,4 +42,22 @@ fn is_bare_multiword(s: &str) -> bool {
             || w.eq_ignore_ascii_case("OR")
             || w.eq_ignore_ascii_case("NOT")
     })
+}
+
+fn check_bare_operator(query: &str) -> Result<(), SearchError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(SearchError::ParseError("Query is empty".to_string()));
+    }
+    let lower = trimmed.to_lowercase();
+    match lower.as_str() {
+        "+" | "-" => {
+            return Err(SearchError::ParseError(format!(
+                "'{}' operator requires a term to perform the search",
+                lower
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
 }
