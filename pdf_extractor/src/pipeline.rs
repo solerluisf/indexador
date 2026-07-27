@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::bounded;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1080,26 +1079,14 @@ fn format_uptime(d: Duration) -> String {
 }
 
 /// Global log file — when set, all `log_msg` output is also written here.
-static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
-
 /// Set the global pipeline log file path. Creates/appends to the file.
 /// All subsequent `log_msg` calls will write to this file.
-pub fn set_pipeline_log_path(path: &Path) -> Result<()> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open pipeline log file: {}", path.display()))?;
-    let lock = LOG_FILE.get_or_init(|| Mutex::new(None));
-    *lock.lock().unwrap() = Some(file);
+pub fn set_pipeline_log_path(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 /// Close the global pipeline log file if open.
 pub fn close_pipeline_log() {
-    if let Some(lock) = LOG_FILE.get() {
-        *lock.lock().unwrap() = None;
-    }
 }
 
 /// Send a log message to the optional C callback, falling back to stderr.
@@ -1112,14 +1099,6 @@ fn log_msg(log_cb: Option<extern "C" fn(*const u8, u32)>, msg: &str) {
             cb(bytes.as_ptr(), bytes.len() as u32);
         }
         None => eprintln!("{}", msg),
-    }
-    if let Some(lock) = LOG_FILE.get() {
-        if let Ok(mut guard) = lock.lock() {
-            if let Some(ref mut file) = *guard {
-                let _ = writeln!(file, "{}", msg);
-                let _ = file.flush();
-            }
-        }
     }
 }
 

@@ -1,5 +1,4 @@
 using System;
-using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -8,18 +7,8 @@ namespace PdfExplorer.Services.Input;
 
 public static class ScrollBehavior
 {
-    private static readonly string LogPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "PdfExplorer", "ScrollBehavior.log");
-
     private static void Log(string msg)
     {
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(LogPath));
-            File.AppendAllText(LogPath, $"{DateTime.Now:HH:mm:ss.fff} {msg}{Environment.NewLine}");
-        }
-        catch { }
     }
 
     public static readonly DependencyProperty EnableMouseDragProperty =
