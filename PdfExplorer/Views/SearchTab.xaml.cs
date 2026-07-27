@@ -9,6 +9,7 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using PdfExplorer.Models;
 using PdfExplorer.Services;
+using PdfExplorer.Services.Input;
 using PdfExplorer.ViewModels;
 
 
@@ -64,6 +65,7 @@ public partial class SearchTab : UserControl, IPdfRenderingService
     {
         Log("Constructor start");
         InitializeComponent();
+        InputService.Instance.DragDelta += OnScrollDragDelta;
         _engine = App.Engine;
         _viewerMediator = new ViewerMediator();
         _viewerMediator.StateChanged += OnViewerStateChanged;
@@ -547,6 +549,11 @@ public partial class SearchTab : UserControl, IPdfRenderingService
             PageScroller.ScrollToVerticalOffset(strategy(offset, viewH, maxH));
             e.Handled = true;
         }
+    }
+
+    private void OnScrollDragDelta(object? sender, DragInfo e)
+    {
+        PageScroller.ScrollToVerticalOffset(PageScroller.VerticalOffset - e.DeltaY * 2);
     }
 
     private async void OnSearchClick(object sender, RoutedEventArgs e)
