@@ -1,7 +1,9 @@
 using System;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
+using System.Windows.Media;
 
 namespace PdfExplorer.Services.Input;
 
@@ -89,7 +91,7 @@ public static class ScrollBehavior
     private static void OnMouseEnter(object sender, MouseEventArgs e)
     {
         if (sender is ScrollViewer sv && Mouse.Captured != sv)
-            sv.Cursor = Cursors.Hand;
+            sv.Cursor = IsOverScrollBar(sv, e.GetPosition(sv)) ? null : Cursors.Hand;
     }
 
     private static void OnMouseLeave(object sender, MouseEventArgs e)
@@ -118,6 +120,11 @@ public static class ScrollBehavior
     private static void OnPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         if (sender is not ScrollViewer sv) return;
+
+        // Let the native ScrollBar handle clicks on its thumb/track/repeat
+        // buttons.  Capturing here would steal the drag from the scrollbar.
+        if (IsOverScrollBar(sv, e.GetPosition(sv)))
+            return;
 
         sv.Cursor = Cursors.ScrollAll;
         sv.SetValue(IsDraggingProperty, true);
@@ -164,7 +171,9 @@ public static class ScrollBehavior
         }
         else if (sv.IsMouseOver)
         {
-            sv.Cursor = Cursors.Hand;
+            // Only show the grab cursor over the content; leave the scrollbar
+            // free to use its own cursor/interaction.
+            sv.Cursor = IsOverScrollBar(sv, e.GetPosition(sv)) ? null : Cursors.Hand;
         }
     }
 
@@ -187,5 +196,31 @@ public static class ScrollBehavior
         {
             Position = new Point(0, (double)sv.GetValue(TotalDeltaProperty)),
         });
+    }
+
+    /// <summary>
+    /// Hit-test whether <paramref name="pt"/> (relative to <paramref name="sv"/>)
+    /// currently lies over the <see cref="ScrollBar"/> of this <see cref="ScrollViewer"/>.
+    /// </summary>
+    /// <remarks>
+    /// The drag-scroll feature must not interfere with the native scrollbar:
+    /// when the pointer is over the bar we neither capture the click nor force
+    /// the grab cursor, so the user can still drag the thumb or click the
+    /// track/repeat buttons.
+    /// </remarks>
+    private static bool IsOverScrollBar(ScrollViewer sv, Point pt)
+    {
+        if (double.IsNaN(pt.X) || double.IsNaN(pt.Y))
+            return false;
+
+        var hitResult = VisualTreeHelper.HitTest(sv, pt);
+        DependencyObject? current = hitResult?.VisualHit;
+        while (current is not null && !ReferenceEquals(current, sv))
+        {
+            if (current is ScrollBar)
+                return true;
+            current = VisualTreeHelper.GetParent(current);
+        }
+        return false;
     }
 }

@@ -1,4 +1,5 @@
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -150,6 +151,19 @@ public sealed class ThumbnailRenderer : IDisposable
     private static string ThumbCacheDir =>
         Path.Combine(Path.GetTempPath(), "PdfExplorer", "ThumbCache");
 
+    /// <summary>
+    /// Magic header written at the start of every disk-cached thumbnail so the
+    /// loader can distinguish the current format from stale entries produced
+    /// by older render paths.  Before this header existed, thumbnails could be
+    /// cached while the PDF-inversion (dark theme) render path was active,
+    /// leaving permanently dark thumbnails on disk.  Bumping
+    /// <see cref="ThumbCacheFormatVersion"/> invalidates those entries so they
+    /// are re-rendered with the theme-independent thumbnail path.
+    /// </summary>
+    private static readonly byte[] ThumbCacheMagic = { (byte)'P', (byte)'X', (byte)'T', (byte)'1' };
+
+    private const int ThumbCacheFormatVersion = 2;
+
     public static string GetThumbCachePath(string pdfPath) =>
         Path.Combine(ThumbCacheDir, ComputeCacheKey(pdfPath) + ".thumb");
 
@@ -162,6 +176,8 @@ public sealed class ThumbnailRenderer : IDisposable
             using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write))
             using (var bw = new BinaryWriter(fs))
             {
+                bw.Write(ThumbCacheMagic);
+                bw.Write(ThumbCacheFormatVersion);
                 bw.Write(raw.Width);
                 bw.Write(raw.Height);
                 bw.Write(raw.Stride);
@@ -182,6 +198,24 @@ public sealed class ThumbnailRenderer : IDisposable
             if (!File.Exists(cachePath)) return null;
             using var fs = new FileStream(cachePath, FileMode.Open, FileAccess.Read, FileShare.Read);
             using var br = new BinaryReader(fs);
+
+            // Validate the header.  Any file missing it, or carrying an older
+            // format version, was produced by a different render path (most
+            // importantly the theme-inverting one that left dark thumbnails).
+            // Drop it and let the caller re-render with the current path.
+            var magic = br.ReadBytes(ThumbCacheMagic.Length);
+            if (magic.Length != ThumbCacheMagic.Length || !magic.SequenceEqual(ThumbCacheMagic))
+            {
+                TryDeleteStaleCache(cachePath);
+                return null;
+            }
+            int version = br.ReadInt32();
+            if (version != ThumbCacheFormatVersion)
+            {
+                TryDeleteStaleCache(cachePath);
+                return null;
+            }
+
             int w = br.ReadInt32();
             int h = br.ReadInt32();
             int stride = br.ReadInt32();
@@ -193,6 +227,16 @@ public sealed class ThumbnailRenderer : IDisposable
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Best-effort removal of an obsolete thumbnail cache file so it doesn't
+    /// linger on disk once it has been superseded by a fresh render.
+    /// </summary>
+    private static void TryDeleteStaleCache(string cachePath)
+    {
+        try { if (File.Exists(cachePath)) File.Delete(cachePath); }
+        catch { /* best-effort; the entry will simply be re-rendered */ }
     }
 
     public void Dispose()
