@@ -473,6 +473,32 @@ impl JobStore {
         }
     }
 
+    /// Resolve multiple paths to their `(id, path)` pairs in a single query.
+    /// Paths not present in the DB are silently skipped.
+    pub fn get_ids_by_paths(&self, paths: &[String]) -> Result<Vec<(i64, String)>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.pool.get().context("Failed to get DB connection")?;
+        let placeholders = paths.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, path FROM jobs WHERE path IN ({})", placeholders);
+        let mut stmt = conn
+            .prepare(&sql)
+            .context("Failed to prepare get_ids_by_paths query")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(paths.iter().map(String::as_str)), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("Failed to query path ids")?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok((id, path)) = row {
+                out.push((id, path));
+            }
+        }
+        Ok(out)
+    }
+
     /// Look up the original (non-duplicate) job for a given checksum.
     /// Returns `(original_id, original_path)` if an indexed original exists.
     /// Uses the `idx_jobs_checksum` index — O(log n).
@@ -667,6 +693,21 @@ impl JobStore {
         let conn = self.pool.get().context("Failed to get DB connection")?;
         conn.execute("DELETE FROM jobs WHERE path = ?1", rusqlite::params![path])
             .context("Failed to delete job by path")?;
+        Ok(())
+    }
+
+    /// Delete multiple job rows by file path in a single transaction.
+    pub fn delete_by_paths(&self, paths: &[&str]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.pool.get().context("Failed to get DB connection")?;
+        let tx = conn.transaction().context("Failed to begin job delete transaction")?;
+        for path in paths {
+            tx.execute("DELETE FROM jobs WHERE path = ?1", rusqlite::params![path])
+                .context("Failed to delete job in batch")?;
+        }
+        tx.commit().context("Failed to commit job batch delete")?;
         Ok(())
     }
 

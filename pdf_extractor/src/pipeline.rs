@@ -1571,29 +1571,35 @@ pub fn remove_orphans(
         "[pipeline] found {} orphaned documents, removing...", count
     ));
 
-    // 4. Delete each orphan from Tantivy, positions, and jobs
-    for path in &orphans {
-        let doc_id = match jobs.get_id_by_path(path)? {
-            Some(id) => id,
-            None => {
-                log_msg(log_cb, &format!(
-                    "[pipeline] orphan '{}' has no doc_id, skipping", path
-                ));
-                continue;
-            }
-        };
+    // 4. Resolve doc_ids for all orphans in one query, then delete in a
+    //    single Tantivy commit + single SQLite transaction (batching avoids
+    //    O(N) writer opens / commits which freezes on large collections).
+    let orphan_rows = jobs.get_ids_by_paths(&orphans)?;
 
-        if let Err(e) = indexer.delete_document(doc_id, path) {
-            log_msg(log_cb, &format!(
-                "[pipeline] failed to delete '{}' from index: {}", path, e
-            ));
-        }
+    let (orphan_ids, orphan_paths): (Vec<i64>, Vec<String>) = orphan_rows.into_iter().unzip();
 
-        if let Err(e) = jobs.delete_by_path(path) {
-            log_msg(log_cb, &format!(
-                "[pipeline] failed to delete job '{}': {}", path, e
-            ));
-        }
+    if orphan_ids.is_empty() {
+        log_msg(log_cb, "[pipeline] no orphaned documents had a doc_id, skipping deletion");
+        return Ok(0);
+    }
+
+    let path_refs: Vec<&str> = orphan_paths.iter().map(String::as_str).collect();
+    let docs: Vec<(i64, &str)> = orphan_ids
+        .iter()
+        .copied()
+        .zip(path_refs.iter().copied())
+        .collect();
+
+    if let Err(e) = indexer.delete_documents(&docs) {
+        log_msg(log_cb, &format!(
+            "[pipeline] failed to delete orphaned documents from index: {}", e
+        ));
+    }
+
+    if let Err(e) = jobs.delete_by_paths(&path_refs) {
+        log_msg(log_cb, &format!(
+            "[pipeline] failed to delete orphaned jobs: {}", e
+        ));
     }
 
     log_msg(log_cb, &format!(
@@ -3199,5 +3205,74 @@ mod tests {
         eprintln!("  Total:    {:.3}s", flush_elapsed.as_secs_f64());
         eprintln!("  Per doc:  {:.3}s", flush_elapsed.as_secs_f64() / N as f64);
         eprintln!("  Docs/s:   {:.1}", N as f64 / flush_elapsed.as_secs_f64());
+    }
+
+    // ── Re-index after moving files reproduces a freeze (see issue) ──
+    //
+    // The hypothesis is that `remove_orphans` (in pipeline.rs `run()`) holds the
+    // Tantivy writer lock — or that opening a writer per orphan is pathological
+    // — and that re-indexing after files were moved locks up the pipeline.
+    //
+    // This test reuses a *persistent* jobs DB (like the real app) across two
+    // indexing passes, so the "move" actually produces orphaned DB rows that
+    // `remove_orphans` must clean up.
+
+    fn run_full_pipeline(books: &PathBuf, indexer: &Arc<Indexer>, jobs: Arc<JobStore>, worker_path: &Path) {
+        let metrics = Arc::new(Metrics::new());
+        scan_directory(&jobs, books).unwrap();
+
+        let config = PipelineConfig {
+            worker_path: Some(worker_path.to_path_buf()),
+            num_extract_workers: Some(2),
+            ..Default::default()
+        };
+
+        let result = run_pipeline(jobs, metrics, books, Some(Arc::clone(indexer)), config);
+        if let Err(ref e) = result {
+            eprintln!("[move-reindex] run_pipeline error: {}", e);
+        }
+        assert!(result.is_ok(), "pipeline should succeed");
+    }
+
+    #[test]
+    fn test_reindex_after_move_scales_many_files() {
+        let Some(worker) = find_worker_binary() else {
+            eprintln!("skipped: worker binary not found");
+            return;
+        };
+        if !is_pdfium_available() {
+            eprintln!("skipped: pdfium.dll not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let books = root.join("books");
+        std::fs::create_dir_all(&books).unwrap();
+
+        const N: usize = 800;
+        for i in 0..N {
+            make_test_pdf_at(&books.join(format!("f{i}.pdf")), &format!("content {i}"));
+        }
+
+        let index_path = root.join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let indexer = Arc::new(Indexer::new(&index_path).unwrap());
+        let jobs = Arc::new(JobStore::open(&root.join("jobs.db")).unwrap());
+
+        run_full_pipeline(&books, &indexer, Arc::clone(&jobs), &worker);
+
+        // Move ALL files to a subfolder — every path becomes an orphan.
+        let sub = books.join("moved");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..N {
+            std::fs::rename(books.join(format!("f{i}.pdf")), sub.join(format!("f{i}.pdf"))).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        run_full_pipeline(&books, &indexer, jobs, &worker);
+        let elapsed = start.elapsed();
+        eprintln!("[move-reindex] re-index of {} moved files took {:.2}s", N, elapsed.as_secs_f64());
+        assert!(elapsed < std::time::Duration::from_secs(30), "too slow: {:.2}s", elapsed.as_secs_f64());
     }
 }

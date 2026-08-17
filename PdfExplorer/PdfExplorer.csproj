@@ -17,6 +17,13 @@
     <RustProfile Condition="'$(Configuration)'=='Release'">--release</RustProfile>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <Optimize>true</Optimize>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
   <ItemGroup>
     <Content Include="..\target\$(Configuration)\pdf_extractor_capi.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

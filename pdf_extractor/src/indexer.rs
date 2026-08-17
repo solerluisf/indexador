@@ -702,6 +702,22 @@ impl SearchIndex {
         Ok(true)
     }
 
+    /// Delete multiple documents by exact path in a SINGLE writer session
+    /// (one lock acquisition, one commit). Dramatically faster than calling
+    /// `delete_by_exact_path` per path — O(1) commits vs O(N).
+    pub fn delete_by_exact_paths(&self, paths: &[&str]) -> Result<bool> {
+        if paths.is_empty() {
+            return Ok(false);
+        }
+        let mut writer = self.writer()?;
+        for path in paths {
+            let term = Term::from_field_text(self.path_field, path);
+            writer.delete_term(term);
+        }
+        writer.commit()?;
+        Ok(true)
+    }
+
     /// Execute a boolean query where each clause is an independent text query
     /// combined with MUST / SHOULD / MUST_NOT semantics.
     pub fn search_boolean(
@@ -885,6 +901,23 @@ impl Indexer {
         self.search_index.delete_by_exact_path(path)?;
         let store = self.position_store.lock().unwrap();
         store.delete_doc(doc_id)?;
+        Ok(())
+    }
+
+    /// Delete many documents in a single Tantivy commit and a single SQLite
+    /// transaction. Replaces the per-document `delete_document` loop, which is
+    /// pathological at scale (one writer open + commit per orphan).
+    pub fn delete_documents(&self, docs: &[(i64, &str)]) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        let paths: Vec<&str> = docs.iter().map(|(_, p)| *p).collect();
+        self.search_index.delete_by_exact_paths(&paths)?;
+
+        let store = self.position_store.lock().unwrap();
+        let mut store = store;
+        let doc_ids: Vec<i64> = docs.iter().map(|(id, _)| *id).collect();
+        store.delete_docs(&doc_ids)?;
         Ok(())
     }
 }

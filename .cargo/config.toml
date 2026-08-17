@@ -1,0 +1,3 @@
+[build]
+# 4-core / 8-thread machine — keep cores busy but leave headroom
+jobs = 8

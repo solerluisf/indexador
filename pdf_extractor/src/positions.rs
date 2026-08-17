@@ -251,6 +251,20 @@ impl PositionStore {
         Ok(())
     }
 
+    /// Delete positions for many doc_ids in a single transaction.
+    pub fn delete_docs(&mut self, doc_ids: &[i64]) -> Result<()> {
+        if doc_ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction().context("Failed to begin position delete transaction")?;
+        for id in doc_ids {
+            tx.execute("DELETE FROM doc_positions WHERE doc_id = ?1", rusqlite::params![id])
+                .context("Failed to delete positions in batch")?;
+        }
+        tx.commit().context("Failed to commit position batch delete")?;
+        Ok(())
+    }
+
     /// Count positions for a doc_id (useful for testing)
     pub fn count_positions(&self, doc_id: i64) -> Result<usize> {
         match self.conn.query_row(
